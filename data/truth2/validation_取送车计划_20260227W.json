@@ -1,0 +1,194 @@
+{
+  "StartStatus": [
+    {
+      "Line": "修2库内",
+      "Position": 3,
+      "RepairProcess": "段修",
+      "Type": "C70E",
+      "No": "1674048",
+      "Length": 14.3,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修2库内",
+      "Position": 2,
+      "RepairProcess": "段修",
+      "Type": "C70E",
+      "No": "1674610",
+      "Length": 14.3,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修1库内",
+      "Position": 1,
+      "RepairProcess": "段修",
+      "Type": "C70E",
+      "No": "1677710",
+      "Length": 14.3,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修3库内",
+      "Position": 1,
+      "RepairProcess": "段修",
+      "Type": "P70",
+      "No": "3803921",
+      "Length": 17.6,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修3库内",
+      "Position": 2,
+      "RepairProcess": "段修",
+      "Type": "P70",
+      "No": "3823509",
+      "Length": 17.6,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修3库内",
+      "Position": 3,
+      "RepairProcess": "段修",
+      "Type": "P70",
+      "No": "3831802",
+      "Length": 17.6,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修2库内",
+      "Position": 1,
+      "RepairProcess": "段修",
+      "Type": "C64K",
+      "No": "4873687",
+      "Length": 13.2,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修4库内",
+      "Position": 4,
+      "RepairProcess": "段修",
+      "Type": "C64K",
+      "No": "4971954",
+      "Length": 13.2,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修4库内",
+      "Position": 3,
+      "RepairProcess": "段修",
+      "Type": "C64K",
+      "No": "4972158",
+      "Length": 13.2,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修4库内",
+      "Position": 2,
+      "RepairProcess": "段修",
+      "Type": "C64K",
+      "No": "4972375",
+      "Length": 13.2,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修4库内",
+      "Position": 5,
+      "RepairProcess": "段修",
+      "Type": "X70",
+      "No": "5347746",
+      "Length": 13.2,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    },
+    {
+      "Line": "修4库内",
+      "Position": 1,
+      "RepairProcess": "段修",
+      "Type": "NX70AF",
+      "No": "5742474",
+      "Length": 14.3,
+      "IsHeavy": false,
+      "IsWeigh": false,
+      "IsClosedDoor": false,
+      "TargetLines": [
+        "存4线"
+      ]
+    }
+  ],
+  "TerminalLines": [
+    {
+      "Line": "修1库内",
+      "IsInspectionMode": false
+    },
+    {
+      "Line": "修2库内",
+      "IsInspectionMode": false
+    },
+    {
+      "Line": "修3库内",
+      "IsInspectionMode": false
+    },
+    {
+      "Line": "修4库内",
+      "IsInspectionMode": false
+    }
+  ],
+  "locoNode": {
+    "Line": "机库线",
+    "End": "North"
+  }
+}
