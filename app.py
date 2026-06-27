@@ -450,11 +450,12 @@ def _render_p10_result(
     metric_cols[5].metric("内部移动批次", summary_dict["generated_hook_count"])
     metric_cols[6].metric("接口操作数", summary_dict["generated_operation_count"])
     metric_cols[7].metric("硬违规接收", summary_dict["hard_physical_violation_accepted_count"])
-    remote_cols = st.columns(4)
+    remote_cols = st.columns(5)
     remote_cols[0].metric("求解策略", summary_dict.get("solve_strategy", "未知"))
     remote_cols[1].metric("远端跨区次数", summary_dict.get("remote_interaction_cross_count", 0))
-    remote_cols[2].metric("远端相关批次", summary_dict.get("remote_interaction_batch_count", 0))
-    remote_cols[3].metric("远端会话数", summary_dict.get("remote_interaction_session_count", 0))
+    remote_cols[2].metric("业务勾切换次数", summary_dict.get("remote_business_transition_count", 0))
+    remote_cols[3].metric("远端相关批次", summary_dict.get("remote_interaction_batch_count", 0))
+    remote_cols[4].metric("远端会话数", summary_dict.get("remote_interaction_session_count", 0))
     st.caption(
         "口径说明：业务挂摘勾数 = Get/Put 次数，用于和人工勾数比较；"
         "内部移动批次 = runtime 一次取放搬运分组；接口操作数 = Operations 条数，包含称重等非挂摘操作。"
@@ -467,6 +468,7 @@ def _render_p10_result(
         {"check": "weigh_operation_count", "value": action_counts.get("Weigh", 0)},
         {"check": "solve_strategy", "value": summary_dict.get("solve_strategy", "未知")},
         {"check": "remote_interaction_cross_count", "value": summary_dict.get("remote_interaction_cross_count", 0)},
+        {"check": "remote_business_transition_count", "value": summary_dict.get("remote_business_transition_count", 0)},
         {"check": "remote_interaction_batch_count", "value": summary_dict.get("remote_interaction_batch_count", 0)},
         {"check": "remote_interaction_session_count", "value": summary_dict.get("remote_interaction_session_count", 0)},
         {"check": "unknown_route_count", "value": summary_dict["unknown_route_count"]},
@@ -474,7 +476,7 @@ def _render_p10_result(
         {"check": "state_loop_count", "value": summary_dict["state_loop_count"]},
         {"check": "blocked_reason", "value": summary_dict["blocked_reason"] or "无"},
     ]
-    st.dataframe(guard_rows, use_container_width=True, hide_index=True)
+    st.dataframe(_stringify_value_column(guard_rows), width="stretch", hide_index=True)
     st.caption(f"runtime 输入文件：{runtime_input_path}")
     if summary_dict.get("response_path"):
         st.caption(f"接口响应文件：{summary_dict['response_path']}")
@@ -499,9 +501,9 @@ def _render_p10_result(
         hook_rows = _p10_hook_summary_rows(operation_rows)
         if hook_rows:
             st.markdown("**按内部移动批次汇总**")
-            st.dataframe(hook_rows, use_container_width=True, hide_index=True)
+            st.dataframe(hook_rows, width="stretch", hide_index=True)
             st.markdown("**接口操作序列 / 业务挂摘勾号**")
-            st.dataframe(_p10_operation_table_rows(operation_rows), use_container_width=True, hide_index=True)
+            st.dataframe(_p10_operation_table_rows(operation_rows), width="stretch", hide_index=True)
         else:
             st.info("当前没有生成操作。")
     elif view == "可视化回放":
@@ -518,6 +520,16 @@ def _p10_status_text(status: str) -> str:
         "blocked": "阻塞",
         "invalid_input": "输入错误",
     }.get(status, status)
+
+
+def _stringify_value_column(rows: list[dict]) -> list[dict]:
+    return [
+        {
+            **row,
+            "value": "" if row.get("value") is None else str(row.get("value")),
+        }
+        for row in rows
+    ]
 
 
 def _p10_format_blocked_reason(reason: str) -> str:
@@ -696,14 +708,14 @@ def _render_p10_replay(payload: dict, operation_rows, response: dict) -> None:
             {"label": "移动车辆", "value": " ".join(frame["move_cars"]) or "无"},
             {"label": "调车机后挂", "value": " ".join(frame["train_cars"]) or "无"},
         ]
-        st.dataframe(side_rows, use_container_width=True, hide_index=True)
+        st.dataframe(_stringify_value_column(side_rows), width="stretch", hide_index=True)
 
     state_rows = _p10_state_table_rows(
         frame["state"],
         highlighted_lines=set(frame["path"]) | {frame["source_line"], frame["target_line"]},
     )
     if state_rows:
-        st.dataframe(state_rows, use_container_width=True, hide_index=True)
+        st.dataframe(state_rows, width="stretch", hide_index=True)
 
 
 def _p10_build_replay_frames(payload: dict, operation_rows, response: dict) -> list[dict]:
@@ -1342,9 +1354,9 @@ def _render_p10_end_status(response: dict) -> None:
     for line, cars in sorted(grouped.items()):
         line_rows.append({"line": line, "carCount": len(cars), "cars": " ".join(cars)})
     st.markdown("**终态股道汇总**")
-    st.dataframe(line_rows, use_container_width=True, hide_index=True)
+    st.dataframe(line_rows, width="stretch", hide_index=True)
     st.markdown("**终态车辆位置**")
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _p10_end_status_rows(response: dict) -> list[dict[str, object]]:
@@ -1370,7 +1382,7 @@ def _render_p10_diagnostics(summary, candidate_rows, rejection_reasons) -> None:
     ]
     if reason_rows:
         st.markdown("**拒绝/阻塞原因分布**")
-        st.dataframe(reason_rows, use_container_width=True, hide_index=True)
+        st.dataframe(reason_rows, width="stretch", hide_index=True)
 
     candidate_dicts = [asdict(row) for row in candidate_rows]
     if not candidate_dicts:
@@ -1405,7 +1417,7 @@ def _render_p10_diagnostics(summary, candidate_rows, rejection_reasons) -> None:
         for row in filtered
     ]
     st.caption(f"当前显示 {len(display_rows)} / {len(candidate_dicts)} 条候选记录。")
-    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+    st.dataframe(display_rows, width="stretch", hide_index=True)
 
 
 def _p10_split_pipe(text: str) -> list[str]:
@@ -1542,14 +1554,14 @@ def _render_evaluation_dashboard() -> None:
 
     stage_rows = _build_eval_stage_summary_rows(dataset, rows)
     st.markdown("**阶段分布**")
-    st.dataframe(stage_rows, use_container_width=True, hide_index=True)
+    st.dataframe(stage_rows, width="stretch", hide_index=True)
 
     failed_distribution = dataset.get("failed_stage_distribution") or {}
     if failed_distribution:
         st.markdown("**失败阶段分布**")
         st.dataframe(
             [{"failedAt": key, "count": value} for key, value in sorted(failed_distribution.items())],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -1568,7 +1580,7 @@ def _render_evaluation_dashboard() -> None:
     )
     st.markdown("**案例明细**")
     st.caption(f"当前显示 {len(filtered_rows)} / {len(case_rows)} 个案例。")
-    st.dataframe(filtered_rows, use_container_width=True, hide_index=True)
+    st.dataframe(filtered_rows, width="stretch", hide_index=True)
     st.download_button(
         "下载当前明细 CSV",
         data=_rows_to_csv(filtered_rows),
@@ -1815,12 +1827,12 @@ def _render_workflow_demo(
     st.progress(_workflow_progress_value(stage_index=stage_index, stage_count=workflow.stage_count))
     st.dataframe(
         _build_workflow_stage_rows(workflow),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.dataframe(
         _build_workflow_transition_rows(workflow),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     stage = workflow.stages[stage_index]
@@ -1861,7 +1873,7 @@ def _render_workflow_demo(
             }
             for hook in view.hook_plan
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1932,7 +1944,7 @@ def _render_step(view, step_index: int, *, vehicle_display_metadata: dict[str, d
     with detail_tabs[0]:
         rows = _build_step_state_rows(step.track_map, vehicle_meta)
         if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.dataframe(rows, width="stretch", hide_index=True)
         else:
             st.caption("当前无需要关注的股道状态。")
     with detail_tabs[1]:
@@ -1942,7 +1954,7 @@ def _render_step(view, step_index: int, *, vehicle_display_metadata: dict[str, d
     with detail_tabs[3]:
         rows = _build_distance_breakdown_rows(step.hook)
         if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.dataframe(rows, width="stretch", hide_index=True)
         else:
             st.caption("初始状态无路径距离构成。")
 
@@ -2640,7 +2652,7 @@ def _render_vehicle_detail_panel(step, view, vehicle_display_metadata: dict[str,
                 }
                 for vehicle_no in step.hook.vehicle_nos
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -2657,7 +2669,7 @@ def _render_vehicle_detail_panel(step, view, vehicle_display_metadata: dict[str,
                 }
                 for vehicle_no, spot_code in step.spot_assignments.items()
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     if step.work_position_assignments:
@@ -2675,7 +2687,7 @@ def _render_vehicle_detail_panel(step, view, vehicle_display_metadata: dict[str,
                 }
                 for vehicle_no, item in step.work_position_assignments.items()
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     elif view.final_spot_assignments:
@@ -2688,7 +2700,7 @@ def _render_vehicle_detail_panel(step, view, vehicle_display_metadata: dict[str,
                 }
                 for vehicle_no, spot_code in view.final_spot_assignments.items()
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     elif view.final_work_position_assignments:
@@ -2706,7 +2718,7 @@ def _render_vehicle_detail_panel(step, view, vehicle_display_metadata: dict[str,
                 }
                 for vehicle_no, item in view.final_work_position_assignments.items()
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 

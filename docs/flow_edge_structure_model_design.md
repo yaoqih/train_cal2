@@ -5572,7 +5572,7 @@ improved_secondary_metric_count >= 2
 | 警冲标/岔区可通过不可停车 | `StationResourceGraph`, `GlobalGate` | `ResourceRequest -> ResourceDelta -> Gate` | `fouling_point_storage_accepted = 0` |
 | 走行线禁止停放 | `StationResourceGraph`, `ResourceDelta` | `Candidate -> ResourceDelta -> Gate` | `running_line_storage_accepted = 0` |
 | 称重只在机库称重位 | `SPECIAL_REPAIR_PROCESS`, `LocoCarryState`, `ResourceDelta` | `SpecialProcess -> Candidate -> Gate` | `weighing_location_violation_accepted = 0` |
-| 单钩称重最多 1 辆 | `SPECIAL_REPAIR_PROCESS`, `AcceptRejectGate` | `ContractDelta -> Gate` | `weighing_multi_vehicle_hook_accepted = 0` |
+| 单钩可挂多辆称重车，但只完成尾部最后一辆 | `SPECIAL_REPAIR_PROCESS`, `AcceptRejectGate` | `ContractDelta -> Gate` | `weighing_only_tail_vehicle_marked_complete = 0` |
 | 称重车必须在编组最后 | `ordered carry segments`, `ContractDelta` | `CarryState -> ContractDelta -> Gate` | `weighing_tail_order_violation_accepted = 0` |
 | 关门车顺位 | `LocoCarryState`, `ResourceDelta`, `AcceptRejectGate` | `CarryState -> ResourceDelta -> Gate` | `close_door_order_violation_accepted = 0` |
 | 重车牵引折算 | `ResourceRequest`, `ResourceDelta` | `Candidate -> ResourceDelta -> Gate` | `traction_over_limit_accepted = 0`; 重车按 4 辆折算 |
@@ -5738,352 +5738,35 @@ manual_temp_buffer_use_count
 
 ---
 
-## 23. 阶段1-5 实施记录
+## 23. 实施和验证入口
 
-当前已经完成的是研究/旁路实现，不是生产求解器强制接管。
-
-也就是说：
+本设计文档只保留目标结构、验收标准和结构之间的连接关系，不再记录多轮运行历史。当前 runtime 结果、人工计划差距、R1-R6 状态和下一步结构工作统一见：
 
 ```text
-已完成:
-  能从 StartStatus 建 FlowGraph。
-  能给动作打 ContractDelta。
-  能用 AcceptRejectGate 判断硬违反。
-  能构建 DepotSlotGraph / DepotSwapDelta。
-  能构建 ordered carry segments 并证明 enum-only carry 不安全。
-
-未完成:
-  尚未把 hard gate 接入 runtime move generator。
-  尚未把 DepotSlotGraph 接入 runtime TargetContract 排序。
-  尚未做 baseline solver vs compressed solver 的真实 A/B。
+docs/P10_人工差距结构诊断.md
+artifacts/current_truth2_eval/
 ```
 
-实现文件：
-
-```text
-src/fzed_shunting/workflow/phase1_v2/flow_graph.py
-src/fzed_shunting/workflow/phase1_v2/contract_delta.py
-src/fzed_shunting/workflow/phase1_v2/depot_slot_graph.py
-src/fzed_shunting/workflow/phase1_v2/carry_state.py
-scripts/validate_flow_edge_foundation_experiments.py
-```
-
-验证文件：
-
-```text
-tests/workflow/test_phase1_v2_flow_graph.py
-tests/workflow/test_phase1_v2_contract_resource_carry.py
-```
-
-当前 `truth2_force` gate：
-
-```text
-case_count = 113
-vehicle_count = 9506
-movable_vehicle_count = 5757
-
-Stage 1:
-  effective_contract_coverage = 98.3%
-  residual_vehicle_ratio = 1.7%
-  mixed_source_vehicle_count = 2589
-  mixed_source_contract_coverage = 98.69%
-  gate = passed
-
-Stage 2:
-  contract_delta_probe_count = 813
-  fulfills_contract_count = 702
-  mode = synthetic_probe_observation_only
-  gate = passed
-
-Stage 3:
-  hard_violation_probe_count = 111
-  mode = hard_gate_probe_only_not_runtime_filter
-  gate = passed
-
-Stage 4:
-  cases_with_same_track_swap_pressure = 110 / 113
-  strict_slot_block_count_order_approximation = 911
-  requires_depot_slot_graph = true
-  gate = passed
-
-Stage 5:
-  carry_order_risk_case_count = 112 / 113
-  adjacent_target_switch_count = 1040
-  enum_only_compression_allowed = false
-  ordered_carry_segments_required = true
-  gate = passed
-```
-
-执行命令：
+当前验证入口：
 
 ```bash
-rtk pytest tests/workflow/test_phase1_v2_flow_graph.py tests/workflow/test_phase1_v2_contract_resource_carry.py -q
-rtk python scripts/validate_flow_edge_foundation_experiments.py --sets truth2_force --output artifacts/flow_edge_foundation_experiments.json
+rtk python3 scripts/generate_physical_runtime_trace.py --root . --output-dir artifacts/current_truth2_eval --max-hooks 300 --check
 ```
 
-下一步接 runtime 的顺序：
+用于判断方案是否真正接近人工的核心指标：
+
+| 指标 | 来源 | 用途 |
+|---|---|---|
+| `business_get_put_hook_count` | `case_summary.csv` | 总业务勾数，和人工计划勾数对比 |
+| `remote_business_transition_count` | `case_summary.csv` | 远端/非远端业务勾切换次数，衡量远端来回调车 |
+| `manual_vs_solver_case_compare.csv` | 当前 artifact | 人工勾数、远端勾数、远端 session 对比 |
+| `structural_repair_acceptance.csv` | 当前 artifact | R1-R6 当前是否通过 |
+| `structure_work_audit.csv` | 当前 artifact | 六个结构工作的细粒度失败原因 |
+
+严谨结论仍然是：
 
 ```text
-1. 在 move generator 后、候选排序前接 ContractDelta 旁路 trace。
-2. 只记录 selected / rejected candidate 的 delta，不先过滤。
-3. 当 0310W、0103W 等人工错误模式能稳定标 hard violation 后，再打开 hard gate。
-4. DepotSlotGraph 先进入 TargetContractSelector 排序，不直接改 replay。
-5. loco_carry 保留 ordered sequence，4 值状态只作为资源标签。
-```
-
----
-
-## 24. P0-P9 与 H1-H5 结构化 rollout 验证记录
-
-本节记录的是文档级结构方案的实施性验证，不等同于已经完成生产求解器。
-
-验证脚本：
-
-```text
-scripts/validate_phase_gates.py
-scripts/generate_p0_p4_trace.py
-scripts/generate_p5_candidate_trace.py
-scripts/generate_p6_resource_trace.py
-scripts/generate_p7_delta_trace.py
-scripts/generate_p8_optimization_trace.py
-scripts/generate_p9_state_update_trace.py
-scripts/generate_rollout_trace.py
-```
-
-主要产物：
-
-```text
-artifacts/phase_gate_audit/
-artifacts/p0_p4_trace/
-artifacts/p5_candidate_trace/
-artifacts/p6_resource_trace/
-artifacts/p7_delta_trace/
-artifacts/p8_optimization_trace/
-artifacts/p9_state_update_trace/
-artifacts/rollout_audit/
-```
-
-### 24.1 单步 P0-P9 结构审计结论
-
-最新审计命令：
-
-```bash
-rtk python scripts/validate_phase_gates.py --phase-trace artifacts/p0_p4_trace/phase_gate_records.csv --action-trace artifacts/p0_p4_trace/action_trace_records.csv --candidate-trace artifacts/p5_candidate_trace/candidate_trace_records.csv --resource-trace artifacts/p6_resource_trace/resource_trace_records.csv --delta-trace artifacts/p7_delta_trace/delta_trace_records.csv --optimization-trace artifacts/p8_optimization_trace/optimization_trace_records.csv --state-update-trace artifacts/p9_state_update_trace/state_update_trace_records.csv --check --output-dir artifacts/phase_gate_audit
-```
-
-结果：
-
-| 项 | 结果 |
-|---|---:|
-| manual_case_count | 118 |
-| truth_case_count | 113 |
-| matched_case_count | 107 |
-| p1_passed_case_count | 113 |
-| process_failed_row_count | 0 |
-| process_blocked_row_count | 48 |
-| action/candidate/resource/delta/optimization/state_update failed records | 0 |
-
-`process_blocked_row_count = 48` 来自 6 个 truth2 案例缺人工计划基线：
-
-```text
-0130W, 0209W, 0209Z, 0212Z, 0225Z, 0325Z
-```
-
-结论：P0-P9 的单步结构字段、候选、资源、delta、优化和状态更新 trace 可以通过审计；但这只证明单步闭环，不证明整案完成。
-
-### 24.2 多步结构化 rollout 结论
-
-`generate_rollout_trace.py` 把 P5-P9 串成多步结构化 rollout：读取 `truth2` 初始车辆状态，按 H 阶段选择候选，执行车辆所在股道的状态突变，记录每步候选、资源、hard gate、状态签名、累计勾数和人工软上界。
-
-它仍然不是完整物理路径求解器，尚未证明道岔路径、联线时间窗、调车机走行、端别、精确台位、携带顺序都可执行。
-
-最新结果：
-
-| 项 | 结果 |
-|---|---:|
-| truth_case_count | 113 |
-| matched_case_count | 107 |
-| completed_case_count | 107 |
-| blocked_case_count | 6 |
-| missing_manual_case_count | 6 |
-| total_hook_soft_pass_count | 105 |
-| phase_hook_soft_pass_case_count | 97 |
-| hard_violation_count | 0 |
-| state_loop_count | 0 |
-| rollout_gap_record_count | 23 |
-
-可证明部分：
-
-```text
-107 / 107 个有人工计划基线的 truth2 案例完成终态。
-hard_violation_count = 0。
-state_loop_count = 0。
-105 / 107 个匹配案例总勾数不超过人工计划软上界。
-97 / 107 个匹配案例 H 阶段勾数不超过人工计划阶段软上界。
-```
-
-不可证明或未达部分：
-
-```text
-6 个 truth2 案例缺人工计划基线，不能做严格人工对照。
-2 个匹配案例总勾数超过人工计划软上界：0306W, 0327W。
-10 个匹配案例存在阶段级超界。
-当前 rollout 是结构化状态突变，不是完整 runtime route solver。
-```
-
-### 24.3 剩余 gap 的结构归因
-
-`artifacts/rollout_audit/rollout_gap_audit.csv` 是下一步结构标准和实现的入口。
-
-当前 gap bucket：
-
-| failure_bucket | 数量 | 含义 | 下一步结构 |
-|---|---:|---|---|
-| `manual_baseline_missing` | 6 | truth2 缺可对照人工计划 | 补人工计划匹配或建立无人工基线验收标准 |
-| `LOW_SIGNAL_PHASE_CONTRACT_TOO_COMPRESSED` | 9 | 低信号/短链阶段合同过于压缩，H2/H4/H5 分母和动作边界不稳定 | `RepairInboundVariant + PhaseGate` 要量化保守路径 |
-| `FRONT_SERVICE_BATCHING_BELOW_MANUAL` | 4 | H1 前段服务仍按 source-target 批次，缺少人工式混合携带 | H1 需要 receiver-aware co-carry batching |
-| `DEPOT_SLOT_SWAP_BATCHING_BELOW_MANUAL` | 2 | H4 大库 swap 仍不能完全达到人工摘解压缩水平 | `DepotSlotGraph/DepotSwapDelta` 要合并兼容 slot/band exchange |
-| `CASE_TOTAL_HOOK_OVER_MANUAL_SOFT_BOUND` | 2 | 整案总勾数仍超过人工计划软上界 | `ContractOptimizer` 必须降低总勾数或证明人工省略了同类义务 |
-
-因此，当前方案不能严谨地表述为“已经达到甚至超越人工”。
-
-当前可以严谨表述为：
-
-```text
-FlowEdge + EdgeContract + StationResourceGraph + HumanPhaseContract 的结构方向已经能在匹配案例上形成可解闭环；
-P0-P9 单步结构审计通过；
-结构化 rollout 在 107 个匹配案例上终态完成；
-但要达到“全面不高于人工、甚至超越人工”，还必须补齐 H1 合批、低信号阶段合同、大库 slot/band swap 压缩、缺人工计划基线和完整物理路径求解器。
-```
-
-### 24.4 下一步实施顺序
-
-优先级不是继续写抽象文档，而是逐个关闭 `rollout_gap_audit.csv`：
-
-1. 低信号/短链路径：把 `MIXED_SIGNAL_REPAIR` 的 H2/H4/H5 阶段边界、允许动作和勾数上界固定下来。
-2. H1 前段合批：实现同 receiver、同方向、可同携带的 co-carry batching，目标关闭 `FRONT_SERVICE_BATCHING_BELOW_MANUAL`。
-3. H4 大库 swap 压缩：让 `DepotSlotGraph/DepotSwapDelta` 合并兼容库线和库外衔接位，目标关闭 `DEPOT_SLOT_SWAP_BATCHING_BELOW_MANUAL`。
-4. 缺人工计划基线：处理 `0130W, 0209W, 0209Z, 0212Z, 0225Z, 0325Z`，否则全量 truth2 不能严格人工对照。
-5. 接入真实 runtime route solver：把当前结构化状态突变升级为含路径、端别、联线、调车机位置、携带顺序的可执行钩计划。
-
-### 24.5 P10 剩余结构定量验收
-
-本节不再讨论“结构是否听起来合理”，只验收剩余结构是否真正把 P10 物理运行时的阻塞清掉。
-
-新增验证脚本：
-
-```text
-scripts/generate_physical_runtime_trace.py
-scripts/validate_remaining_structure_acceptance.py
-```
-
-主要产物：
-
-```text
-artifacts/physical_runtime_trace/
-artifacts/remaining_structure_acceptance/
-```
-
-执行命令：
-
-```bash
-rtk python scripts/generate_physical_runtime_trace.py --output-dir artifacts/physical_runtime_trace --check
-rtk python scripts/validate_remaining_structure_acceptance.py --output-dir artifacts/remaining_structure_acceptance
-```
-
-当前 P10 物理运行时结果：
-
-| 项 | 结果 |
-|---|---:|
-| truth_case_count | 113 |
-| completed_case_count | 3 |
-| blocked_case_count | 110 |
-| total_initial_unsatisfied_vehicle_count | 5821 |
-| total_final_unsatisfied_vehicle_count | 2542 |
-| generated_hook_count | 1847 |
-| generated_operation_count | 3700 |
-| hard_physical_violation_accepted_count | 0 |
-| unknown_route_count | 0 |
-| state_loop_count | 0 |
-
-这说明 P10 骨架已经能做到：
-
-```text
-接口输入可读取。
-路径图当前无 unknown route。
-硬物理违反不会被接受。
-状态没有循环。
-```
-
-但它还不能证明可解，因为只完成 3 / 113 个案例。
-
-#### 24.5.1 剩余结构验收表
-
-最终验收硬门槛：
-
-```text
-每个结构对应 gap_record_count = 0。
-每个结构对应 gap_case_count = 0。
-completed_case_count = truth_case_count。
-total_final_unsatisfied_vehicle_count = 0。
-hard_physical_violation_accepted_count = 0。
-unknown_route_count = 0。
-state_loop_count = 0。
-```
-
-当前结果：
-
-| 结构 | 当前状态 | gap records | gap cases | 验收上限 | 当前主要失败指标 | 下一步动作 |
-|---|---|---:|---:|---:|---|---|
-| `DepotSlotGraph + SpotSwapDelta` | failed | 2035 | 107 | 0 | `depot_slot_failure_count = 78`; slot/spot gap 未清零 | 建 slot occupancy graph、出库释放位、swap delta，入库前必须先证明目标位可释放 |
-| `CapacityAwareCandidateGenerator + ReleaseMoveSearch` | failed | 1307 | 104 | 0 | 目标线容量不足未清零 | 加 target-capacity lookahead、release candidate、合法拆批 |
-| `StagingSearch + CarryOrderPlanner` | failed | 1214 | 105 | 0 | 同线换位仍无 staging 搜索 | 生成临停路径和 ordered carry/drop segments |
-| `SourceBlockerRelocationSearch` | failed | 525 | 46 | 0 | 源线前端阻挡未清零 | 生成 blocker relocation 或 co-carry 候选 |
-| `OrderedSpotAllocator` | failed | 481 | 61 | 0 | `target_position_collision_inside_batch = 481` | 强制台位批次必须逐车分配合法有序 spot |
-| `P10 PhysicalValidator Runtime Gate` | failed | 0 | 0 | 0 | `completed_case_count = 3 / 113`; `final_unsatisfied = 2542` | 所有候选必须过 validator，并完成全量案例 |
-
-因此，当前不能说“剩下结构已经完成”。严谨结论是：
-
-```text
-剩下结构的验收框架已经建立；
-每个结构都有明确 gap bucket、记录数、案例数和验收阈值；
-但 6 个剩余结构当前全部未通过定量验收。
-```
-
-#### 24.5.2 结构完成后如何证明“全部可解”
-
-如果以下条件全部成立：
-
-```text
-DepotSlotGraph + SpotSwapDelta gap records = 0。
-CapacityAwareCandidateGenerator + ReleaseMoveSearch gap records = 0。
-StagingSearch + CarryOrderPlanner gap records = 0。
-SourceBlockerRelocationSearch gap records = 0。
-OrderedSpotAllocator gap records = 0。
-P10 final_unsatisfied_vehicle_count = 0。
-P10 hard_physical_violation_accepted_count = 0。
-P10 unknown_route_count = 0。
-P10 state_loop_count = 0。
-P10 completed_case_count = 113。
-```
-
-则可以证明：
-
-```text
-在当前接口、主数据、truth2 样本和业务规则覆盖范围内，求解器具备物理可执行的全量可解性。
-```
-
-但“达到甚至超越人工”还要额外满足：
-
-```text
-107 个有人工计划基线的匹配案例，总勾数不超过人工计划软上界。
-H1-H5 阶段勾数不超过人工阶段软上界。
-缺人工计划基线的 6 个案例要么补齐基线，要么建立无人工基线的独立验收上界。
-```
-
-也就是说：
-
-```text
-P10 剩余结构清零 = 证明可解。
-P10 清零 + P8 勾数对照通过 = 才能证明达到或超过人工。
+P10 物理合法性通过，不等于 P0-P10 结构全部达标。
+只有 R1-R6 通过、113 案完成、硬物理违规为 0、业务勾数和远端切换指标达到人工计划基准后，
+才能说当前求解器达到甚至超过人工。
 ```
