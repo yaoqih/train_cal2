@@ -2315,7 +2315,7 @@ DEPOT_DIGEST_CONTRACT
   > LOW_CONFIDENCE_REPAIR_CONTRACT
 ```
 
-这和普通阶段顺序不一样。
+这和普通人工阶段顺序不一样。
 
 原因：
 
@@ -4414,6 +4414,1276 @@ rejected_contract_delta_with_reason
 
 ---
 
+## 20A. 结构级审计标准：每个结构如何判定达标
+
+本章是本方案的文档级验收口径。它不是结构名词解释，而是用来判断本方案是否真的具备达到甚至超越人工的量化标准。
+
+方案是否可行，不能主要靠最终案例是否跑出类似人工计划的序列来证明。最终案例对照只能证明端到端效果，不能替代结构审计。
+
+真正的可行性应先看本方案提出的每个关键结构在每个求解过程里是否达标：
+
+```text
+输入足够明确
+输出足够明确
+职责边界清楚
+局部决策逻辑成立
+硬约束可判定
+失败条件可识别
+性能上不会把求解拖垮
+能解释人工案例中的结构价值
+指标可量化、可复现、可失败定位
+```
+
+只有这些结构逐项达标，端到端案例对照才有意义。
+
+人工案例研究文档只提供人工结构基准，例如存4释放、机接、修库摘解、库回、大库 swap、功能线和调棚服务。本文档负责把这些人工基准转成方案结构标准。
+
+### 20A.1 审计结论分级
+
+| 等级 | 名称 | 含义 | 是否可声称达到人工 | 是否可声称超越人工 |
+|---|---|---|---|---|
+| L0 | 概念设想 | 有方向，但缺业务闭环和证据链 | 否 | 否 |
+| L1 | 结构方案 | 识别了主要业务结构，能解释为什么这样建模 | 否 | 否 |
+| L2 | 结构可审计方案 | 覆盖主业务流、硬约束、异常族，并列出关键结构输入输出和失败边界 | 否，只能说具备实现基础 | 否 |
+| L3 | 结构可行方案 | 每个关键结构都有可实现逻辑、性能边界和局部验收标准 | 可以说具备达到人工的结构条件 | 否，只能说存在超越空间 |
+| L4 | 集成可验证方案 | 关键结构通过局部验证，并有端到端案例对照 | 可以 | 在多指标支配人工时才可以 |
+
+本文档的目标是达到 L3，并为 L4 的集成验证提供审计标准。
+
+### 20A.2 业务覆盖标准
+
+方案必须能解释完整链路：
+
+```text
+存5/外场接车
+  -> 信息判定
+  -> 预修/调棚/功能线/存车整理
+  -> 大库入库前组织
+  -> 存4北释放
+  -> 机接
+  -> 修1-修4库内摘解/对位
+  -> 大库出库到存4北
+  -> 尾项收束
+```
+
+必须明确这些对象在结构中的角色：
+
+| 对象 | 文档必须说明 |
+|---|---|
+| 存4北 | 既是出段集结线，也是大库入库释放口，存在双向争抢 |
+| 存4南 | 只能临停，不能当正式出段终点 |
+| 预修/机棚 | 是预修能力，不是普通尾项 |
+| 调棚 | 同时有调梁工位和预修尽头位，是复合线路 |
+| 洗/油/抛/轮 | 是功能线/运营线，有服务完成语义 |
+| 修1-修4库内 | 是大库作业线，涉及台位、出入库 swap 和摘解顺序 |
+| 修1-修4库外 | 是进出库衔接，不等同库内检修 |
+| 机库/机区 | 涉及机车位置、称重、缓冲、承接端别 |
+| 联6/联7 | 是全局门控，不属于某一个局部流程 |
+| 存1/存2/存3/存5 | 是存车整理和组流空间，不是低级 residual |
+
+如果方案只解释“预修到大库”或“存4到大库”，但不能解释功能线、调棚、存车整理、库内出库、尾项收束，则不能通过文档级审核。
+
+### 20A.2A 量化验收口径
+
+本章所有标准分三层：
+
+| 层级 | 含义 | 结论 |
+|---|---|---|
+| 硬门槛 | 触发即失败，不能被少钩或可解性抵消 | 不通过 |
+| 达到人工线 | 结构能力不弱于人工基准，允许钩数不一定更优 | 可声称具备达到人工的结构条件 |
+| 超越人工线 | 在达到人工线之上，多指标支配人工或显著减少搜索/返工 | 可声称具备超越人工空间 |
+
+量化口径必须按三种粒度输出：
+
+| 粒度 | 必须输出 |
+|---|---|
+| step 级 | 当前 FlowGraph、target_contract、intent、candidate_count、ContractDelta、ResourceDelta、AcceptReject 结果 |
+| case 级 | 覆盖率、residual 比例、硬违规数量、人工关键结构识别结果、钩数、运行时间、失败桶 |
+| batch 级 | 通过案例数、失败分布、P50/P90/P95 运行时间、平均 residual、平均候选数量、结构漏识别率 |
+
+最低 trace 字段：
+
+```text
+case_id
+step_index
+vehicle_count
+movable_vehicle_count
+active_contract_count
+effective_contract_coverage
+residual_vehicle_ratio
+target_contract
+target_contract_reason
+structural_intent
+candidate_family_count
+candidate_count
+resource_request_count
+contract_delta_summary
+resource_delta_summary
+accepted
+reject_reason
+failure_bucket
+hook_count_so_far
+runtime_millis
+```
+
+禁止用定性话术替代指标。例如：
+
+```text
+不能只写：能识别大部分主体流。
+必须写：effective_contract_coverage >= 95%，residual_vehicle_ratio <= 5%。
+
+不能只写：候选被结构约束。
+必须写：candidate_family_count <= 8，forbidden_candidate_to_scoring_count = 0。
+
+不能只写：资源冲突可解释。
+必须写：resource_delta_coverage = 100%，hard_resource_violation_accepted_count = 0。
+```
+
+### 20A.2B 分过程量化验收矩阵
+
+这个矩阵是本章的核心。它要求每个结构不仅“存在”，而且在每个求解过程里达到可测门槛。
+
+| 过程 | 参与结构 | 硬门槛 | 达到人工线 | 超越人工线 | 失败桶 |
+|---|---|---|---|---|---|
+| P0 在线证据边界 | `OnlineObservable / OfflineLabelOnly`, `FlowGraphBuilder` | `offline_label_used_online_count = 0`; `unknown_status_source_count = 0`; `online_status_reason_coverage = 100%` | 12 个代表案例 status reason 覆盖 100%；低信号案例必须输出 confidence 和 contradiction | 在人工动作发生前识别存4、库位、联7、端别冲突，`pre_action_conflict_detection_rate >= 90%` | `EVIDENCE_LEAKAGE`, `STATUS_REASON_MISSING` |
+| P1 车辆分类 | `FlowClassify`, `NoMoveVehicle`, `ResidualItem` | 12 个代表案例 `effective_contract_coverage >= 90%`; `residual_vehicle_ratio <= 10%`; `no_move_blocks_key_resource_count = 0` | `truth2_force` 研究目标 `effective_contract_coverage >= 95%`; `residual_vehicle_ratio <= 5%`; residual reason 覆盖 100% | `residual_vehicle_ratio <= 3%`; 非修库主体族覆盖率 `>= 95%`; no-move 避免无效动车有可量化收益 | `FLOW_CLASSIFY_LOW_COVERAGE`, `RESIDUAL_OVERFLOW`, `NO_MOVE_FALSE_SATISFIED` |
+| P2 建边与身份稳定 | `FlowGraph`, `FlowEdge`, `EdgeKey`, `FlowSubject`, `FlowPort`, `FlowReceiver` | `subject_overlap_count = 0`; support edge `owner_edge_id_coverage = 100%`; edge identity drift 无理由漂移 `= 0` | 主体业务流都能输出 `subject / via_port / to_receiver / status / evidence`; edge identity 稳定率 `>= 95%` | 能提前识别 SEED/FORMING 主流并保护关键口；高价值主流漏识别率 `<= 2%` | `EDGE_MISIDENTIFIED`, `EDGE_ID_DRIFT`, `SUBJECT_OVERLAP` |
+| P3 状态与合同生成 | `FlowEdgeStatus`, `EdgeContract`, `ContractTemplate`, `StationFlowContract`, `RepairInboundVariant` | `illegal_status_transition_count = 0`; 低置信主动跨 `ACCEPTED` 次数 `= 0`; `ACCEPTED` 后 protection 激活率 `= 100%` | `0117Z / 0310W / 0103W / 0213W / 0306W` 对应 variant 识别正确；每个 active edge 合同条款完整率 100% | late 存4、直接入库、库内消化均不被强套长链；异常变体误判率 `<= 5%` | `STATUS_GUARD_BROKEN`, `CONTRACT_TEMPLATE_MISSING`, `VARIANT_MISCLASSIFIED` |
+| P4 目标合同与结构意图 | `TargetContractSelector`, `StructuralIntentBuilder`, `Blocker`, `Obligation`, `Protection` | `target_contract_reason_coverage = 100%`; 后边界合同被低优先级合同破坏次数 `= 0`; hard obligation 被跳过次数 `= 0` | `PORT_READY` 优先机接/入库，`DIGESTING` 优先摘解/消化，`DEPOT_SLOT` 被占优先释放出库 | target 选择能量化释放资源收益；被选合同的下游解锁合同数不低于人工同阶段动作 | `TARGET_CONTRACT_WRONG`, `INTENT_WRONG`, `HARD_OBLIGATION_SKIPPED` |
+| P5 候选生成 | `WorkPatternTemplateSelector`, `EdgeBoundedCandidateGenerator`, `ResourceRequest` | `forbidden_candidate_to_scoring_count = 0`; `candidate_family_count <= 8`; `planlet_horizon <= 3`; `resource_request_coverage = 100%` | 必须候选族存在率 100%，例如 `PORT_READY` 有 `MACHINE_ACCEPT / DEPOT_ENTRY`，`DIGESTING` 有 `DEPOT_DETACH` | 相比无边界候选，候选数量下降 `>= 50%`，且必需候选不丢失 | `CANDIDATE_MISSING`, `CANDIDATE_UNBOUNDED`, `RESOURCE_REQUEST_MISSING` |
+| P6 资源仲裁 | `StationResourceGraph`, `StationResource`, `CUN4_NORTH_BUFFER`, `DepotSlotGraph`, `GlobalGate`, `LocoPosition`, `LocoCarryState`, `WaitForGraph` | `hard_resource_violation_accepted_count = 0`; `depot_slot_request_coverage = 100%`; `gate_conflict_accepted_count = 0`; `enum_only_carry_enabled = false` | 存4北四态识别 100%；大库入库必须输出 slot/band 或 swap status；联6/联7 必须输出 gate slot 申请结果 | `deadlock_cycle_detected_coverage = 100%`; 合法 break action 输出率 100%；swap 早识别率 `>= 95%` | `RESOURCE_CONFLICT_ACCEPTED`, `DEPOT_SWAP_MISSING`, `GATE_CONFLICT`, `DIRTY_CARRY` |
+| P7 Delta 与硬门 | `EdgeDelta`, `ContractDelta`, `ResourceDelta`, `AcceptRejectGate` | `hard_clause_accepted_count = 0`; `resource_violation_accepted_count = 0`; `delta_required_field_coverage = 100%`; `why_reject_coverage = 100%` | 人工关键动作能被解释为正 delta；人工错误模式能被解释为 reject delta | 算法动作可不同于人工，但 `contract_gain >= human_same_phase_gain`，且 dominated accepted rate `= 0` | `CONTRACT_DELTA_SIM_WRONG`, `GATE_TOO_LOOSE`, `GATE_TOO_STRICT` |
+| P8 同结构少钩 | `ContractOptimizer`, `LocalTieBreakSearch`, `hook_count` | 只允许同 contract、同 intent、同结构等级比较；`search_scope_violation_count = 0`; `local_branch_count <= 64` | 标准链钩数 `<= manual_hook_count * 1.05`; 短链/直接入库 `<= manual_hook_count + 1` | 同结构价值下钩数低于人工，或钩数相同但道岔/空驶/存4污染/库位冲突更少 | `LOCAL_SEARCH_DOMINATED`, `HOOK_OVERRIDES_STRUCTURE`, `SEARCH_SCOPE_EXPANDED` |
+| P9 状态更新与 trace | `State Update`, `FlowGraph Rebuild`, `Trace`, `failure_bucket` | 每步后 rebuild 覆盖 100%；车辆守恒 `= 100%`; `failure_bucket_coverage = 100%`; `trace_missing_count = 0` | 每个失败能定位到一个主失败桶和最多两个辅助失败桶 | 失败定位可直接指向可修结构，重复未知失败率 `<= 2%` | `TRACE_MISSING`, `STATE_INCONSISTENT`, `FAILURE_UNCLASSIFIED` |
+| P10 全量压测 | 全部结构 | `hard_violation_count = 0`; `final_target_satisfied = true`; 单案 `runtime <= 300s` | 代表案例族全部通过；`truth2_force` 覆盖率和 residual 达到 P1 研究目标 | 多指标支配人工：少钩、少空驶、少污染、少 swap 冲突中至少 2 项优于人工 | `CASE_FAILED`, `RUNTIME_EXCEEDED`, `END_TO_END_REGRESSION` |
+
+注意：P10 不能替代 P0-P9。一个案例最终跑通，但中间结构指标失败，仍然不能证明方案可行。
+
+### 20A.2C 指标公式
+
+为避免“覆盖率”“稳定”“可解释”变成定性说法，本文档统一使用以下公式。
+
+车辆口径：
+
+```text
+vehicle_count = 当前案例车辆总数
+movable_vehicle_count = 目标未满足或虽已在目标线但阻塞关键资源的车辆数
+no_move_vehicle_count = 已满足目标且不阻塞关键资源的车辆数
+contracted_movable_vehicle_count = 被非 RESIDUAL 主体合同覆盖的需动车数
+residual_movable_vehicle_count = 被 RESIDUAL 覆盖的需动车数
+```
+
+覆盖率：
+
+```text
+gross_contract_coverage =
+  contracted_vehicle_count / vehicle_count
+
+effective_contract_coverage =
+  contracted_movable_vehicle_count / max(1, movable_vehicle_count)
+
+residual_vehicle_ratio =
+  residual_movable_vehicle_count / max(1, movable_vehicle_count)
+
+no_move_false_satisfied_rate =
+  no_move_blocks_key_resource_count / max(1, no_move_vehicle_count)
+```
+
+识别与状态：
+
+```text
+online_status_reason_coverage =
+  status_with_online_reason_count / max(1, active_status_count)
+
+edge_identity_stability =
+  1 - unexplained_edge_id_change_count / max(1, edge_identity_observation_count)
+
+contract_clause_completeness =
+  contracts_with_required_clauses_count / max(1, active_contract_count)
+
+variant_accuracy_on_representative_cases =
+  correctly_classified_variant_case_count / representative_variant_case_count
+```
+
+候选与搜索：
+
+```text
+necessary_candidate_recall =
+  generated_required_candidate_family_count / required_candidate_family_count
+
+candidate_prune_rate =
+  1 - bounded_candidate_count / max(1, raw_candidate_count)
+
+forbidden_candidate_leak_rate =
+  forbidden_candidate_to_scoring_count / max(1, bounded_candidate_count)
+
+dominated_accepted_rate =
+  dominated_accepted_candidate_count / max(1, accepted_candidate_count)
+```
+
+资源与 delta：
+
+```text
+resource_request_coverage =
+  candidates_with_resource_request_count / max(1, generated_candidate_count)
+
+resource_delta_coverage =
+  candidates_with_resource_delta_count / max(1, simulated_candidate_count)
+
+delta_required_field_coverage =
+  deltas_with_required_fields_count / max(1, simulated_candidate_count)
+
+why_reject_coverage =
+  rejected_candidates_with_reason_count / max(1, rejected_candidate_count)
+```
+
+trace 与失败：
+
+```text
+trace_field_coverage =
+  present_required_trace_field_count / required_trace_field_count
+
+failure_bucket_coverage =
+  classified_failure_count / max(1, failure_count)
+
+unknown_failure_repeat_rate =
+  repeated_unknown_failure_count / max(1, failure_count)
+```
+
+硬门槛统一要求：
+
+```text
+offline_label_used_online_count = 0
+hard_clause_accepted_count = 0
+hard_resource_violation_accepted_count = 0
+illegal_status_transition_count = 0
+subject_overlap_count = 0
+search_scope_violation_count = 0
+trace_missing_count = 0
+```
+
+### 20A.2D 结构 x 过程量化验收表
+
+这张表把每个结构放回它参与的求解过程。审核时不能只看某个结构“有没有定义”，必须看它在对应过程里是否输出了可测指标。
+
+| 结构 | 过程 | 必须输出 | 硬门槛 | 达到人工线 | 超越人工线 |
+|---|---|---|---|---|---|
+| `OnlineObservable / OfflineLabelOnly` | P0 | online feature list、offline label list、status_source | `offline_label_used_online_count = 0` | `online_status_reason_coverage = 100%` | 低信号案例仍能输出 confidence/contradiction，缺失原因覆盖 100% |
+| `FlowGraphBuilder` | P0/P9 | feature extraction summary、build reason、rebuild diff | `unknown_status_source_count = 0` | 代表案例集 rebuild 成功率 100% | 单步 rebuild 后可直接定位新增/消失 edge 原因，unknown diff `<= 2%` |
+| `FlowClassify` | P1 | contract family per movable vehicle、reason、priority conflict | 代表案例 `effective_contract_coverage >= 90%` | `truth2_force effective_contract_coverage >= 95%` | `effective_contract_coverage >= 97%` 且非修库主体族覆盖率 `>= 95%` |
+| `NoMoveVehicle` | P1 | no-move reason、blocked resource check | `no_move_blocks_key_resource_count = 0` | `no_move_false_satisfied_rate = 0` | 避免无效动车有 case 级 hook saving 或候选减少证据 |
+| `ResidualItem` | P1/P9 | suspected_role、reason_unbound、expiry_condition、max_age | `residual_vehicle_ratio <= 10%` | 研究目标 `residual_vehicle_ratio <= 5%`; residual reason 覆盖 100% | `residual_vehicle_ratio <= 3%`; residual 平均生命周期不超过 3 次 rebuild |
+| `FlowGraph` | P2/P9 | active_edges、contract_groups、residuals、contradictions | `subject_overlap_count = 0` | 主体业务流输出完整率 100% | 能提前暴露并发冲突，pre-action conflict detection `>= 90%` |
+| `FlowEdge` | P2/P3 | edge_key、subject、from_area、via_port、to_receiver、status、evidence | active edge 必填字段覆盖 100% | 人工关键结构 edge 识别率 100% | 高价值主流漏识别率 `<= 2%` |
+| `EdgeKey` | P2/P9 | edge identity history、change reason | 无理由 identity drift `= 0` | `edge_identity_stability >= 95%` | `edge_identity_stability >= 98%` |
+| `FlowSubject` | P2/P5 | subject role、vehicle order、seed/forming/bound | 同车 active primary subject 重叠 `= 0` | subject role 覆盖 100% | 在 FORMING 阶段提前生成保护或清口 intent 的比例 `>= 90%` |
+| `FlowPort` | P2/P6 | port role、health、blocking vehicles | dirty/blocked port 直接跨越 `= 0` | 存4北、联线、修库入口 health 覆盖 100% | 关键口污染提前一步识别率 `>= 90%` |
+| `FlowReceiver` | P2/P6 | receiver capacity、digest_state、pending obligations | receiver capacity unknown 下强行 accept `= 0` | 修库、预修、调棚、功能线 receiver state 覆盖 100% | 入接收端后新增返工 obligation 比人工少 |
+| `FlowEdgeStatus` | P3/P9 | status、entry_reason、guard_result、confidence | `illegal_status_transition_count = 0`; 低置信跨 `ACCEPTED` `= 0` | 代表案例 status path 可解释率 100% | late/short/direct case 不倒退补长链，误判率 `<= 5%` |
+| `EdgeContract` | P3/P7 | must_progress、must_not_break、must_finish_before_done、forbidden_moves | `contract_clause_completeness = 100%` | 人工核心承诺都能表达为条款 | 短期少钩破坏后续结构的候选拒绝率 100% |
+| `ContractTemplate` | P3 | template family、required clauses、scope | 主体合同族 template 缺失 `= 0` | 9 个合同族都有模板 | 非修库主体族同样输出 delta 和 resource request |
+| `StationFlowContract` | P1/P3/P4 | active contract set、family count、priority hints | `REPAIR_INBOUND` 之外主体流全部 residual 失败 | 主体合同族覆盖率 `>= 95%` | 多合同并发能输出资源等待和解锁收益 |
+| `RepairInboundVariant` | P3/P4 | variant、allowed_shortcuts、forbidden_moves | 标准链/短链/消化链混淆导致硬边界错误 `= 0` | `0117Z / 0310W / 0103W / 0213W / 0306W` variant 正确 | 代表变体准确率 100%，全量异常变体误判率 `<= 5%` |
+| `Blocker` | P4/P5 | blocker type、blocked clause、clear intent | hard blocker ignored `= 0` | blocker reason 覆盖 100% | blocker 清理优先级能解释解锁资源数或减少债务数 |
+| `Obligation` | P4/P7/P9 | owner、type、lifecycle、completion condition | hard obligation skipped `= 0` | obligation lifecycle 覆盖 100% | 清债顺序不弱于人工同阶段动作 |
+| `Protection` | P3/P7 | active_from_status、break_violation、release_condition | active protection broken accepted `= 0` | `ACCEPTED` 后 protection 激活率 100% | 对短期少钩破坏保护的候选拒绝率 100% |
+| `TargetContractSelector` | P4 | selected contract、rank reason、suppressed contracts | `target_contract_reason_coverage = 100%`; hard priority inversion `= 0` | `PORT_READY`、`DIGESTING`、slot release 等高优先合同选择正确 | 被选合同下游解锁合同数不低于人工同阶段动作 |
+| `StructuralIntentBuilder` | P4/P5 | intent、source clauses、forbidden intents | intent 无合同来源 `= 0` | intent 与 target contract 匹配率 100% | intent 使候选族减少且不丢必要候选 |
+| `WorkPatternTemplateSelector` | P5 | template list、template reason、applicability | pattern 绕过 contract/resource gate `= 0` | 每个 intent 可用模板数 `1..6` | 同 intent 下模板覆盖人工动作族，且不复刻固定钩序 |
+| `EdgeBoundedCandidateGenerator` | P5 | candidate families、candidate count、forbidden filter | `forbidden_candidate_to_scoring_count = 0`; `planlet_horizon <= 3` | `necessary_candidate_recall = 100%`; `candidate_family_count <= 8` | 相比 raw candidate `candidate_prune_rate >= 50%` |
+| `ResourceRequest` | P5/P6 | requested_resources、blocked_resources、request reason | `resource_request_coverage = 100%` | 关键资源申请覆盖 100% | 资源不可得候选进入 delta 前拦截率 100% |
+| `StationResourceGraph` | P6 | occupied_by、requested_by、waiting contracts、release_condition | `hard_resource_violation_accepted_count = 0` | 所有关键资源占用/等待/释放字段覆盖 100% | 能输出资源解锁收益，支持 target contract 排序 |
+| `CUN4_NORTH_BUFFER` | P6/P7 | direction_mode、dirty_reason、clear_intent | `MIXED_DIRTY` 直接机接/释放 `= 0` | 四态识别覆盖 100% | 存4污染提前一步识别率 `>= 90%`，清口钩数不高于人工 |
+| `DepotSlotGraph / DepotSwapDelta` | P6/P7 | slot/band state、blocked_by、released_slot、reserved_slot、swap status | `DEPOT_SLOT_SWAP_VIOLATION accepted = 0`; slot request 覆盖 100% | 入库动作 swap status 覆盖 100% | slot blocked 早识别率 `>= 95%`，swap 冲突少于人工 |
+| `GlobalGate` | P6 | gate slot request、occupied_by、waiting contracts | gate conflict accepted `= 0` | 联6/联7 跨门动作 request 覆盖 100% | gate 等待和切换次数不高于人工 |
+| `LocoPosition` | P4/P6/P8 | track、side、accessible_end、distance_to_target_contract | unknown loco position 下执行需端别动作 `= 0` | 目标合同选择距离/端别字段覆盖 100% | 同结构下空驶距离不高于人工 |
+| `LocoCarryState / ordered carry segments` | P6/P8 | carry_state、ordered segments、detachable_from_tail | `enum_only_carry_enabled = false`; invalid detach accepted `= 0` | carry action ordered segment 覆盖 100% | 错误端别/脏携带导致返工 `= 0`，同结构少钩不弱于人工 |
+| `WaitForGraph / DeadlockDetection` | P6/P9 | cycle、break_contract、break_action_family | cycle ignored `= 0` | synthetic/resource cycle 检测覆盖 100% | 合法 break action 输出率 100%，break hook cost 不高于人工经验动作 |
+| `EdgeDelta` | P7 | before/after edge、good/bad changes、violations | edge hard violation accepted `= 0` | 边状态变化解释字段覆盖 100% | 明显破坏边结构动作在合同评分前拦截率 100% |
+| `ContractDelta` | P7 | satisfied/reduced/broken/added clauses、why_accept/why_reject | hard clause accepted `= 0`; required fields 覆盖 100% | 人工关键动作正 delta 识别率 100% | `contract_gain >= human_same_phase_gain`，dominated accepted `= 0` |
+| `ResourceDelta` | P7 | requested/acquired/released/blocked/violations | resource violation accepted `= 0`; coverage 100% | 关键资源变化解释覆盖 100% | 提前发现等待和让步动作，死锁前置暴露率 `>= 95%` |
+| `AcceptRejectGate` | P7 | accept/reject、hard reasons、dominance reason | hard violation accepted `= 0`; why_reject 覆盖 100% | 人工安全边界候选放行/拒绝一致 | 短期少钩长期返工候选拒绝率 100% |
+| `ContractOptimizer / hook_count` | P8 | structure rank、hook_count、dominance comparison | hook 覆盖结构硬约束 `= 0` | 标准链 `<= manual_hook_count * 1.05`; 短链 `<= manual_hook_count + 1` | 同结构价值下钩数低于人工或其他成本至少 2 项更优 |
+| `LocalTieBreakSearch` | P8 | horizon、branch count、tie-break reason | `search_scope_violation_count = 0`; `local_branch_count <= 64` | 只在同 contract、同 intent、同结构等级内比较 | P50 局部搜索候选数比无界搜索减少 `>= 50%` |
+| `Trace / failure_bucket` | P9/P10 | required fields、primary failure bucket、secondary buckets | `trace_missing_count = 0`; `failure_bucket_coverage = 100%` | 每个失败能定位到一个主失败桶和最多两个辅助桶 | 重复 unknown failure rate `<= 2%` |
+
+### 20A.2E 过程通过条件
+
+每个过程必须同时满足“字段完整、硬门槛、人工线、性能线”四类条件。
+
+| 过程 | 字段完整 | 硬门槛 | 人工线 | 性能线 |
+|---|---|---|---|---|
+| P0 | status_source、online_reason 覆盖 100% | offline label 使用 0 | 代表案例 status 可解释 100% | 单次识别不触发候选搜索 |
+| P1 | 每辆需动车有 class reason | residual <= 10% | residual <= 5%，coverage >= 95% | 车辆级线性分类 |
+| P2 | active edge 必填字段覆盖 100% | subject overlap 0 | edge stability >= 95% | 构图近线性 |
+| P3 | 合同条款完整率 100% | illegal transition 0 | 代表变体识别 100% | 合同模板数量有限 |
+| P4 | target reason 覆盖 100% | hard obligation skip 0 | 高优先合同选择正确 | active contract 排序 |
+| P5 | candidate/resource request 覆盖 100% | forbidden leak 0 | necessary candidate recall 100% | family <= 8，horizon <= 3 |
+| P6 | resource state 覆盖 100% | resource violation accepted 0 | slot/gate/carry 全覆盖 | resource graph 局部判断 |
+| P7 | delta/reject reason 覆盖 100% | hard accepted 0 | 人工关键动作 delta 可解释 | 单候选或短 planlet 模拟 |
+| P8 | tie-break reason 覆盖 100% | scope violation 0 | 钩数不弱于人工容忍线 | local_branch_count <= 64 |
+| P9 | trace/failure bucket 覆盖 100% | state inconsistent 0 | 失败可定位 | 不回扫全局计划 |
+| P10 | case summary 覆盖 100% | hard violation 0，runtime <= 300s | 代表案例族全部通过 | batch P95 runtime <= 300s |
+
+### 20A.3 结构标准总表
+
+这张表是结构索引，不是完整验收标准。完整验收必须同时看 20A.2B 的过程矩阵。
+
+任一关键结构不达标，都不能用最终案例偶然跑通来替代。
+
+| 结构 | 必须解决的问题 | 达到人工的最低标准 | 超越人工的结构标准 | 否决条件 |
+|---|---|---|---|---|
+| `FlowGraphBuilder` | 从当前现场稳定识别全站业务流 | 只用当前状态、目标、修程、资源、机车位置和已执行动作生成 `FlowGraph` | 能比人工更早暴露并发流之间的冲突 | 用未来人工动作反推在线 status |
+| `OnlineObservable / OfflineLabelOnly` | 区分在线输入和离线标签 | 在线只用当前现场和已执行动作，人工未来动作只作评估标签 | 防止信息泄漏，使方案可真实上线 | 用人工计划未来动作决定当前状态 |
+| `FlowGraph` | 保存全站 active edge、residual、证据和矛盾 | 同时表达入库、出库、预修、调棚、功能线、存车整理 | 提前发现多业务流互相阻塞 | 只保存修库主链 |
+| `FlowClassify` | 把车辆归入主体合同族 | 主体车流不掉入 residual，研究目标 `effective_contract_coverage >= 95%` | 稳定区分不动车、当前主流、下一轮候选和功能未完成车 | 用 `NO_MOVE` 虚增覆盖率，或 residual 承接主体车流 |
+| `NoMoveVehicle` | 区分真正不动车和被忽略动车 | 已达目标且不阻塞资源才可归入 no-move | 避免无意义动车，减少钩数 | 用 no-move 掩盖未建模主体车流 |
+| `ResidualItem` | 暂存低证据边角车 | 有 suspected_role、reason、expiry_condition、max_age | 能快速归边、转 support、转 blocker 或降噪 | residual 永久存在且不影响决策 |
+| `FlowEdge` | 表达一条业务流的身份、状态和接收端 | 能解释组织、存4释放、机接、修库摘解、库回 | subject 未完全成形时提前保护关键口 | edge 身份漂移或多条边抢同一 subject |
+| `EdgeKey` | 稳定表达业务边身份 | 同一业务流在车辆集合变化时身份不漂移 | 支撑跨步追踪和失败复盘 | 每步重新命名导致合同断裂 |
+| `FlowSubject` | 表达 subject 从 seed 到 forming 到 bound 的生命周期 | 能区分主流种子、成形主流、已绑定主流 | 提前保护未完全成形但高价值的主流 | 一开始就要求 subject 完全确定 |
+| `FlowPort` | 表达关键口角色和健康度 | 存4、联线、修库入口等口能判断 usable、dirty、blocked | 提前清口或选择替代口 | port 只是线路名，无健康度 |
+| `FlowReceiver` | 表达接收端能力和消化状态 | 修库、预修、调棚、功能线能判断能否接收和是否欠债 | 减少进入接收端后的返工 | 接收端只看目标线容量 |
+| `FlowEdgeStatus` | 表达业务流推进位置 | `PORT_READY / ACCEPTED / DIGESTING / DONE` 有在线进入条件 | 避免人工隐式阶段误判 | 低置信主动跨 `ACCEPTED` |
+| `EdgeContract` | 定义当前必须履约和不能破坏的条款 | 能表达存4口、机接保护、修库债务 | 把人工经验固化为可判定硬边界 | 合同条款由阶段名或评分黑箱替代 |
+| `ContractTemplate` | 把合同族转成可复用条款 | 每个合同族有 must_progress、must_not_break、forbidden_moves | 让人工经验可复用、可比较 | 只有自然语言描述，没有可审计条款 |
+| `StationFlowContract` | 覆盖全站合同族 | 覆盖入库、出库、预修、调棚、功能线、存车整理、机区、特殊工艺、尾项 | 多合同并发时能进入资源仲裁 | 只覆盖 `REPAIR_INBOUND` |
+| `RepairInboundVariant` | 区分入库结构变体 | 支撑完整链、late 存4、直接入库、低信号、库内消化 | 不把短链强拉成长链，不把无机接消化误收尾 | 所有入库都套标准长链 |
+| `Blocker / Obligation / Protection` | 表达挡点、债务和保护 | 能解释清存4、清机区、修库摘解未完 | 能选择最值得先清的 blocker | 机接后主列、释放口、修库债务无硬保护 |
+| `EdgeDelta / EdgeViolation` | 判断候选动作对边状态的影响 | 能识别 status progress、subject split/merge、硬违反 | 在合同前就剔除明显破坏边结构的动作 | 只看目标线变化，不看边结构破坏 |
+| `TargetContractSelector` | 选择当前最该履约的合同 | 后边界、硬债务、关键资源优先于早期组织 | 按资源释放价值和硬时序选择，比人工计划更少返工 | 黑箱评分决定主合同 |
+| `StructuralIntentBuilder` | 把合同下一步转成结构目标 | 先决定开入口、清资源口、机接、消化、收束等意图 | 用结构意图裁剪候选空间 | 直接从 pattern 或搜索决定动作 |
+| `WorkPatternTemplateSelector` | 调用人工经验模板 | 只在 contract 和 intent 之后生成候选边界 | 保留人工套路但不复刻钩序 | pattern 成为事实主控 |
+| `EdgeBoundedCandidateGenerator` | 生成受边、合同、资源约束的候选 | 不生成跨硬边界或明显违约候选 | 前置缩小搜索空间，减少错误候选污染 | 先生成全量动作再靠评分补救 |
+| `ResourceRequest` | 候选动作先申请资源 | 申请存4北、gate、库位、机车位置、携带状态后才进入 delta | 在候选生成阶段过滤资源不可能动作 | 资源到执行后才发现冲突 |
+| `ContractDeltaSimulator / ContractDelta` | 判断候选是否履约 | 输出 satisfied、reduced、broken、added、why_accept、why_reject | 允许不同于人工计划，但合同增益不低于人工动作 | hard clause 被 hook_count 抵消 |
+| `StationResourceGraph` | 仲裁共享资源 | 存4北、联6/联7、大库 slot、功能线、机车位置都显式申请释放 | 发现人工未显式记录的等待、抢占和让步顺序 | 资源冲突只靠合同评分或搜索处理 |
+| `StationResource` | 定义资源容量、方向、占用者、等待者和释放条件 | 每类共享资源都能说明谁占用、谁等待、何时释放 | 让资源等待可排序、可让步 | 资源只是散规则 |
+| `CUN4_NORTH_BUFFER` | 处理存4北双向争抢 | 区分 `INBOUND_RELEASE / OUTBOUND_HOLD / MIXED_DIRTY / FREE` | 提前发现存4污染并少清口 | 存4北只当普通 via_port |
+| `DepotSlotGraph / DepotSwapDelta` | 处理大库 slot/band swap | 能判断入库目标位、出库释放位、stayer 锁定 | 明确先出哪辆、预留哪个 slot/band | 大库只用线级容量 |
+| `GlobalGate` | 处理联6/联7全局门控 | 跨门动作先申请 gate slot | 精确安排 gate slot，减少等待 | gate 冲突进入普通评分 |
+| `LocoPosition` | 表达机车所在线、端别和可达性 | 合同选择考虑空驶、端别、跨门要求 | 同结构下少空驶、少道岔 | 合同选择不看机车位置 |
+| `LocoCarryState / ordered carry segments` | 表达携带车列是否干净和可摘顺序 | 4 值枚举只作粗标签，保留有序段 | 稳定避免脏携带和错误端别 | enum-only 压缩上线 |
+| `ResourceDelta` | 判断候选动作对资源的影响 | 输出 requested、acquired、released、blocked、violations | 提前发现资源等待和合法让步动作 | 不输出资源变化或资源硬违反 |
+| `WaitForGraph / DeadlockDetection` | 发现合同和资源环形等待 | 输出 cycle、break_contract、合法让步动作族 | 系统化打破人工计划隐含死锁 | 只说“大家都在等” |
+| `AcceptRejectGate` | 最终硬门 | ContractDelta、ResourceDelta、硬约束同时合法才放行 | 稳定拒绝短期少钩但长期返工的动作 | 为可解性或少钩放行硬违反 |
+| `LocalTieBreakSearch` | 同结构等级内少钩 | 只在同一 contract、intent、模板边界内短 horizon 搜索 | 同结构价值下少钩、少空驶、少道岔 | 搜索自己发明主链或绕过合同 |
+| `Trace / failure_bucket` | 输出可审计证据链 | 失败能定位到分类、合同、候选、delta、资源、gate 或搜索 | 比人工计划更可复盘、更可改进 | 只输出成功/失败或总钩数 |
+
+### 20A.4 量化审核包
+
+进入方案审核时，必须提交以下 5 个数据包。缺任一数据包，只能评为 L2，不能评为 L3。
+
+| 数据包 | 内容 | 最低通过标准 |
+|---|---|---|
+| `process_metrics.csv` | 每个 case、每个 step 的 P0-P10 指标 | 必须覆盖 100% executed steps |
+| `structure_metrics.csv` | 每个结构在 20A.2D 中的输出字段、硬门槛、人工线、超越线 | 20A.2D 全部结构必须有记录 |
+| `hard_violation_report.csv` | 所有硬约束检查结果 | 所有 accepted action 的 hard violation 均为 0 |
+| `case_family_report.csv` | 标准链、late 存4、直接入库、库内消化、低信号、功能线/调棚重案例的结果 | 每类至少有代表案例；代表案例必须全部通过硬门槛 |
+| `failure_bucket_report.csv` | 失败桶分布、重复未知失败、对应结构 | `failure_bucket_coverage = 100%`，`unknown_failure_repeat_rate <= 2%` |
+
+每个数据包必须能追溯到原始 case、step、structure。不能只提供汇总均值。
+
+### 20A.5 硬约束量化表
+
+硬约束和优化目标必须分开。硬约束不能被少钩、路径短、评分高抵消。
+
+| 硬约束 | 结构承接 | step 级指标 | case 级通过线 |
+|---|---|---|---|
+| 最终目标满足 | `AcceptRejectGate`, `Trace` | `target_violation_after_move = 0` | `final_target_satisfied = true` |
+| 大库台位合法 | `DepotSlotGraph`, `DepotSwapDelta`, `ResourceDelta` | `depot_slot_violation_accepted = 0` | `depot_slot_valid = true` |
+| 牵引能力 | `ResourceRequest`, `ResourceDelta`, `AcceptRejectGate` | `traction_over_limit_accepted = 0` | `traction_valid = true` |
+| 关门车顺位 | `ContractTemplate`, `ResourceDelta`, `AcceptRejectGate` | `close_door_order_violation_accepted = 0` | `close_door_rule_valid = true` |
+| 称重规则 | `SPECIAL_REPAIR_PROCESS`, `ResourceDelta`, `AcceptRejectGate` | `weighing_rule_violation_accepted = 0` | `weighing_valid = true` |
+| 临停容量 | `StationResourceGraph`, `ResourceDelta` | `buffer_capacity_overflow_accepted = 0` | `temporary_buffer_valid = true` |
+| 运行干涉 | `LocoPosition`, `ResourceRequest`, `ResourceDelta` | `route_interference_accepted = 0` | `route_interference_valid = true` |
+| 走行线禁停 | `StationResourceGraph`, `GlobalGate`, `ResourceDelta` | `running_line_storage_accepted = 0` | `running_line_valid = true` |
+| 存4南非正式终点 | `CUN4_NORTH_BUFFER`, `StationResourceGraph`, `AcceptRejectGate` | `cun4_south_final_destination_accepted = 0` | `cun4_south_valid = true` |
+| 联6/联7门控 | `GlobalGate`, `ResourceRequest`, `ResourceDelta` | `gate_conflict_accepted = 0` | `global_gate_valid = true` |
+
+即使当前 `truth2` 中没有重车、关门车、称重车，也必须保留这些指标字段。没有样本时字段值为 `not_applicable`，不能删除字段。
+
+### 20A.6 性能预算
+
+业务文档要求求解时间限制为 5 分钟。结构审计必须证明复杂度没有从局部判断退化成全局排列。
+
+| 过程 | 核心结构 | 单 step 预算 | case 级预算 | 失效判定 |
+|---|---|---:|---:|---|
+| P0 | `FlowGraphBuilder` | 近线性特征提取 | P95 不超过总耗时 10% | 构图阶段做候选搜索 |
+| P1 | `FlowClassify` | `O(vehicle_count)` | P95 不超过总耗时 10% | 分类依赖车辆组合枚举 |
+| P2 | `FlowGraph / FlowEdge` | `O(vehicle_count + active_edge_count)` | active edge 无理由爆炸失败 | 每步全排列匹配 subject |
+| P3 | `EdgeContract` | `O(active_contract_count)` | 合同模板数量固定 | 合同生成依赖长计划搜索 |
+| P4 | `TargetContractSelector` | `O(active_contract_count log active_contract_count)` 或规则筛选 | P95 不超过总耗时 10% | 黑箱全局评分反复调参 |
+| P5 | `EdgeBoundedCandidateGenerator` | `candidate_family_count <= 8`, `planlet_horizon <= 3` | `necessary_candidate_recall = 100%` | raw candidate 未裁剪进入评分 |
+| P6 | `StationResourceGraph` | 资源申请/释放局部判断 | P95 不超过总耗时 15% | 资源仲裁变成路径全排列 |
+| P7 | `ContractDelta / ResourceDelta` | 单候选或短 planlet 模拟 | `delta_required_field_coverage = 100%` | delta 依赖全局 rollout |
+| P8 | `LocalTieBreakSearch` | `local_branch_count <= 64` | P95 不超过总耗时 20% | 搜索跨 contract 或跨 intent |
+| P9 | `Trace / Rebuild` | 只记录摘要和 diff | `trace_missing_count = 0` | trace 需要回扫全局计划才能解释 |
+| P10 | 全部结构 | 单案 `runtime <= 300s` | batch P95 `<= 300s` | 任一案例超 5 分钟且无降级策略 |
+
+超过预算时，不能用“后续优化”通过审核，必须指出是哪一个结构制造了搜索空间。
+
+### 20A.7 达到人工与超越人工的量化判定
+
+达到人工不是一句定性结论，而是以下布尔表达式：
+
+```text
+reached_human =
+  P0_passed
+  and P1_passed
+  and P2_passed
+  and P3_passed
+  and P4_passed
+  and P5_passed
+  and P6_passed
+  and P7_passed
+  and P8_reached_human
+  and P9_passed
+  and hard_violation_count = 0
+  and final_target_satisfied = true
+```
+
+其中：
+
+```text
+P8_reached_human =
+  standard_chain_hook_count <= manual_hook_count * 1.05
+  and short_or_direct_hook_count <= manual_hook_count + 1
+```
+
+超越人工必须先达到人工，再满足多指标支配：
+
+```text
+exceeded_human =
+  reached_human
+  and runtime <= 300s
+  and dominated_accepted_rate = 0
+  and (
+    hook_count < manual_hook_count
+    or (
+      hook_count <= manual_hook_count
+      and improved_secondary_metric_count >= 2
+    )
+  )
+```
+
+`improved_secondary_metric_count` 只从以下指标计数：
+
+| 指标 | 计入改进的条件 |
+|---|---|
+| 道岔次数 | `< manual_switch_count` |
+| 路径代价 | `< manual_path_cost` |
+| 机车空驶 | `< manual_loco_empty_distance` |
+| 存4污染 | `< manual_cun4_dirty_count` |
+| 大库进出次数 | `<= manual_depot_entry_exit_count` 且 swap 冲突更少 |
+| 大库 swap 冲突 | `< manual_depot_swap_conflict_count` |
+| 叉线/临停使用 | `< manual_temp_buffer_use_count` |
+| trace 可解释性 | `trace_field_coverage = 100%` 且 `failure_bucket_coverage = 100%` |
+
+没有对应人工基准的二级指标不能计入超越，只能作为辅助说明。
+
+### 20A.8 否决项
+
+出现以下任一问题，方案文档不能通过审核：
+
+| 否决项 | 原因 |
+|---|---|
+| 只覆盖修库主链，不覆盖全站主体流 | 业务覆盖不足 |
+| 把预修、调棚、功能线、存车整理大量放进 residual | 主体车流漏建模 |
+| 用未来人工计划动作作为在线判断条件 | 信息泄漏 |
+| 硬约束可被评分抵消 | 安全边界错误 |
+| 大库只用线级容量，不处理 slot/band swap | 大库模型不足 |
+| 存4北没有双向资源仲裁 | 主冲突点漏建模 |
+| 机车携带顺序被完全压缩成枚举 | 摘解合法性不足 |
+| 未定义关键结构输入输出 | 方案不可落地 |
+| 未定义结构性能边界 | 5 分钟求解不可判断 |
+| 候选生成无边界 | 搜索空间不可控 |
+| 没有低信号/异常案例处理 | 泛化能力不足 |
+| 没有失败分类 | 审核无法定位问题 |
+
+一句话标准：
+
+```text
+方案文档只有在同时说明“业务全覆盖、关键结构可实现、结构性能可控、硬约束不可破、资源冲突可解释”时，
+才有资格进入“方案可行性”的审核；
+只有在关键结构验证通过后，端到端结果再显示无硬违规且多指标支配人工时，
+才有资格声称“超越人工”。
+```
+
+---
+
+## 20B. 人工调车阶段模型审计
+
+业务文档中的大库要求不能直接固定成四个机械阶段。人工钩序显示，现场真正稳定的阶段边界不是“全部编组、全部拉出、全部放置、剩余到位”，而是围绕存4释放口、机接硬边界和修库消化形成的阶段链。
+
+基于 119 个人工调车作业单、4086 个有效钩序的复核，严格信号定义如下：
+
+```text
+存4口成形 = 存4/注意存4出现北头、代位、靠口等信号，但不是带辆数的北头摘。
+存4大释放 = 存4 - N 北头摘。
+标准机接 = 机 + N 接。
+修库消化 = 修1-修4 - / 摘 / 库外。
+库回收束 = 库回或库侧收束信号。
+```
+
+关键统计：
+
+| 信号 | 覆盖案例数 | 首次出现中位钩 | 首次相对位置中位数 | 说明 |
+|---|---:|---:|---:|---|
+| 存4口成形 | 106 | 18.5 | 0.55 | 中段开始靠存4，不等同最终释放 |
+| 存4大释放 | 104 | 25.0 | 0.77 | 标准链关键转折点 |
+| 标准机接 | 102 | 27.0 | 0.80 | 通常紧跟存4大释放 |
+| 修库接入/送入 | 111 | 20.0 | 0.62 | 常在释放前后穿插形成大库目标群 |
+| 修库消化 | 117 | 25.0 | 0.71 | 大库摘解不是尾项 |
+| 库回收束 | 76 | 36.0 | 1.00 | 多数为后段收束 |
+
+严格分类后：
+
+| 人工阶段族 | 案例数 | 中位钩数 | 含义 |
+|---|---:|---:|---|
+| 标准存4释放-机接-修库消化 | 97 | 36 | 稳定主链，适合完整阶段链 |
+| 修库消化但无标准存4释放 | 15 | 28 | 库内消化、直接承接、缺前段释放信号 |
+| 有存4释放但无标准机接 | 7 | 21 | 短链、低信号或直接处理 |
+
+因此，阶段模型应按人工逻辑定义为 `H1-H5`。`H` 表示 human-derived phase，不是新的求解过程；每个阶段内部仍然执行 P0-P9。
+
+```text
+H1 前段全站组织与服务处理
+H2 存4释放口成形与保护
+H3 存4大释放-机接硬边界
+H4 修库消化、库位和出入库冲突处理
+H5 尾项收束与库回
+```
+
+阶段数不是按业务文档文字拆出来的，而是按人工计划中的稳定边界拆出来的：
+
+| 判定依据 | 人工信号 | 为什么形成独立阶段 |
+|---|---|---|
+| 前段服务动作大量早于大库释放 | 功能线服务中位第 8 钩，机区第 12 钩，调棚/叉线第 14 钩，存车区第 17 钩 | 这些动作不是“大库前杂项”，而是在给主流、存4口、机车端别和缓冲资源塑形，因此需要 H1 |
+| 存4口成形早于存4大释放 | 存4口成形中位第 18.5 钩，存4大释放中位第 25 钩 | “靠口/代位/北头整理”和“带辆数北头摘”之间存在保护与清口过程，因此需要 H2 |
+| 存4大释放与机接是硬边界 | 存4大释放覆盖 104 案，标准机接覆盖 102 案，二者在标准链中连续出现 | 释放后主列状态改变，机接后保护条款生效，不能和普通编组混在同一阶段，因此需要 H3 |
+| 修库摘解不是尾项 | 修库消化覆盖 117 案，首次中位第 25 钩，常与机接前后穿插 | 大库 slot/band、stayer、swap、摘解顺序会决定是否可解，因此需要 H4 |
+| 库回只在主债务完成后出现 | 库回覆盖 76 案，首次相对位置中位数 1.00 | 库回是收束信号，不应提前触发，因此需要 H5 |
+
+所以，业务不是固定分成原先的 S1-S4。更准确的表达是：
+
+```text
+P0-P9 = 求解器内部过程轴，用来说明一次候选如何从状态、合同、资源、delta、gate、少钩搜索推进。
+H1-H5 = 人工调车业务阶段轴，用来说明当前人工计划结构处在前段组织、存4成形、释放机接、修库消化还是尾项收束。
+```
+
+两条轴相互正交：一个案例在 H3 阶段内仍然会执行 P0-P9；短链、库内消化或低信号案例可以合法跳过或压缩部分 H 阶段，但不能跳过对应的业务硬门和 trace 证明。
+
+### 20B.1 必须新增的阶段合同
+
+建议增加 `HumanPhaseContract / PhaseGate`，不替代 `FlowEdge`，只负责表达人工计划中的阶段边界、允许跳过和失败定位：
+
+```text
+HumanPhaseContract:
+  phase:
+    H1_FRONT_SERVICE_ORGANIZATION
+    H2_CUN4_PORT_SHAPING
+    H3_RELEASE_ACCEPT_BOUNDARY
+    H4_DEPOT_DIGEST_SLOT_RESOLUTION
+    H5_TAIL_CLOSEOUT
+  active_variant:
+    FULL_CHAIN_REPAIR
+    LATE_CUN4_REPAIR
+    DIRECT_REPAIR_ENTRY
+    MIXED_SIGNAL_REPAIR
+    DEPOT_DIGEST_ONLY
+  required_contracts
+  phase_entry_condition
+  phase_exit_condition
+  allowed_skip_condition
+  forbidden_moves
+  metrics
+```
+
+它不是新的 workflow 主控，而是阶段验收合同：
+
+```text
+FlowEdge 识别每条业务流。
+EdgeContract 定义每条流的履约。
+StationResourceGraph 仲裁资源。
+HumanPhaseContract 定义当前人工阶段、可跳过阶段和阶段硬门。
+```
+
+没有这个阶段合同，`TargetContractSelector` 可能会动态选择局部收益最高的合同，但无法证明：
+
+```text
+前段组织是否已经足够；
+存4口是否已经成形且受保护；
+存4大释放和机接是否作为硬边界被连续处理；
+修库消化是否完成；
+库回和尾项是否没有提前。
+```
+
+### 20B.2 人工阶段量化标准
+
+| 阶段 | 目标 | 参与结构 | 硬门槛 | 达到人工线 | 超越人工线 |
+|---|---|---|---|---|---|
+| H1 前段全站组织与服务处理 | 完成外场、预修、调棚、功能线、存车整理中的主体债务，并让大库主流具备 owner | `FlowClassify`, `StationFlowContract`, `YARD_REBALANCE`, `FUNCTION_LINE_SERVICE`, `PRE_REPAIR_STAGING`, `DISPATCH_SHED_QUEUE`, `LocoCarryState` | `effective_contract_coverage < 95%` 失败；`residual_vehicle_ratio > 5%` 失败；预修/调棚/功能线主体流 residual 失败 | `non_depot_progress_ratio >= 0.8`，目标 `>= 0.9`; 前段动作都有合同 owner | 前段钩数不高于人工计划同阶段；提前识别存4/联7/端别冲突率 `>= 90%` |
+| H2 存4释放口成形与保护 | 主流逐步靠存4，清理或保护存4北，准备最终大释放 | `CUN4_NORTH_BUFFER`, `FlowPort`, `Blocker`, `Protection`, `TargetContractSelector`, `StationResourceGraph` | `cun4_direction_conflict_accepted = 0`; dirty port 强行释放 `= 0`; `port_shape_reason_coverage = 100%` | 存4口成形识别率 `>= 95%`; 标准链中位靠口位置可解释；late 存4不回外场补链 | 存4污染次数少于人工，或同钩数下清口动作更少 |
+| H3 存4大释放-机接硬边界 | 执行 `存4 - N 北头摘 -> 机 + N 接` 或合法跳过/保守处理 | `RepairInboundVariant`, `FlowEdgeStatus`, `EdgeContract`, `Protection`, `ResourceRequest`, `AcceptRejectGate` | 标准链 `strict_release_candidate_recall = 100%`; `machine_accept_candidate_recall = 100%`; 低置信主动跨 `ACCEPTED = 0`; 机接后 protection broken accepted `= 0` | 标准链中 `release_accept_gap <= 2`，无资源原因时目标 `<= 1`; `0117Z/0310W` 不断链 | 在不破坏保护下减少释放前返工；late 存4和短链不强套标准长链 |
+| H4 修库消化、库位和出入库冲突处理 | 机接后或直接入库后完成修1-修4摘解、slot/band 合法性、必要出库腾位 | `DepotSlotGraph`, `DepotSwapDelta`, `DEPOT_OUTBOUND`, `REPAIR_INBOUND`, `Obligation`, `ResourceDelta`, `ordered carry segments` | `tail_before_primary_done_count = 0`; `depot_slot_violation_accepted = 0`; `swap_required_resolved_ratio < 100%` 失败；非法摘解 `= 0` | 修库消化债务完成率 `100%`; slot/band 或 area 满足率 `100%`; digest-only 不补存4长链 | 大库进出次数 `<= manual_depot_entry_exit_count`; swap 冲突少于人工 |
+| H5 尾项收束与库回 | 主合同完成后处理库回、机区、功能线、存车整理和剩余目标 | `TAIL_CLOSEOUT`, `LOCO_AREA_STAGING`, `FUNCTION_LINE_SERVICE`, `YARD_REBALANCE`, `SPECIAL_REPAIR_PROCESS`, `Trace` | `final_target_satisfied = true`; `hard_violation_count = 0`; 主体债务未完 closeout `= 0`; 关键 residual owner 不明失败 | `remaining_target_completion = 100%`; 所有尾项动作有 owner 和 why_accept | 总钩数不高于人工；若钩数相同，空驶/临停/叉线/存4污染至少 2 项更优 |
+
+### 20B.3 阶段进入和退出门
+
+阶段门必须是硬门，不能被 `hook_count` 或评分抵消。阶段不是全局固定 workflow；它是当前主合同族的业务位置。
+
+阶段边界不能写成固定钩号，因为人工计划中前段服务、修库接入、功能线处理会穿插出现。可执行边界必须写成 `PhaseGate` 谓词：
+
+```text
+entry_predicate    = 允许进入该阶段的最小条件
+active_predicate   = 当前动作仍属于该阶段的判定条件
+exit_predicate     = 允许离开该阶段的完成条件
+skip_predicate     = 允许合法跳过该阶段的变体条件
+fail_predicate     = 该阶段无法继续推进时的失败定位条件
+veto_predicate     = 任何情况下都不能接受的动作
+```
+
+每次阶段变化必须生成一条 `PhaseGateRecord`：
+
+```text
+PhaseGateRecord:
+  case_id
+  step_index
+  from_phase
+  to_phase
+  transition_type: enter | exit | skip | fail | stay
+  active_variant
+  predicate_values
+  consumed_contract_ids
+  created_contract_ids
+  carried_obligation_ids
+  blocked_contract_ids
+  evidence_ids
+  hook_count_in_phase
+  manual_phase_hook_count
+  reject_reason
+```
+
+最低硬门：
+
+```text
+phase_transition_trace_coverage = 100%
+accepted_without_phase_permission_count = 0
+phase_gate_bypass_count = 0
+phase_obligation_carryover_error_count = 0
+phase_regression_without_reason_count = 0
+```
+
+#### 20B.3A 五阶段明确边界
+
+| 阶段 | 进入边界 `entry_predicate` | 活跃边界 `active_predicate` | 退出边界 `exit_predicate` | 失败边界 `fail_predicate` | 一票否决 `veto_predicate` |
+|---|---|---|---|---|---|
+| H1 前段全站组织与服务处理 | `FlowClassify` 完成；`effective_contract_coverage >= 95%`；`residual_vehicle_ratio <= 5%`；存在非大库服务债务，或大库主流尚未达到 H2/H3/H4 高置信边界 | 当前 accepted 动作服务于 `YARD_REBALANCE / FUNCTION_LINE_SERVICE / PRE_REPAIR_STAGING / DISPATCH_SHED_QUEUE / LOCO_AREA_STAGING`，或为大库主流创建 owner、端别、缓冲、机车位置条件 | `non_depot_progress_ratio >= 0.8`，目标 `>= 0.9`；预修/调棚/功能线 hard obligation 未完成数 `= 0`；大库主流 owner 覆盖 `100%`；存4口资源状态可解释 | 非大库主体车无 owner；服务债务无法生成候选；机车端别/缓冲阻塞无 clear action；超过 `pre_depot_hook_count > 40` 且无 hard reason | 把预修/调棚/功能线未完成主体车直接塞入大库主组；把无 owner 车辆当尾项；为少钩破坏后续存4口 |
+| H2 存4释放口成形与保护 | H1 退出，或初始已高置信接近存4口；存在 `REPAIR_INBOUND` 主流；`CUN4_NORTH_BUFFER` 可观测；存4北 owner/blocker/direction 有 reason | 当前 accepted 动作清理、靠口、代位、保护或组织存4北释放口；动作必须减少 blocker、改善 port health 或保护 release subject | `cun4_port_shape_ready = true`；`port_shape_reason_coverage = 100%`；存4口 dirty blocker 已清理或有合法释放顺序；方向冲突 accepted `= 0`；release subject、车辆数、端别、保护合同已绑定 | 存4北状态未知；dirty blocker 无清理动作；方向冲突无法解除；release subject 无法稳定识别；低优先合同持续污染存4口 | 把存4北当普通存车线；`MIXED_DIRTY` 状态下强行释放/机接；`PORT_READY` 后回外场补长链，除非有 hard blocker reason |
+| H3 存4大释放-机接硬边界 | H2 退出且标准链/late 存4链成立；或已高置信处于 `PORT_READY`；必须能申请释放、机接、机车端别和 gate 资源 | 当前 accepted 动作只能服务 `strict_release`、`machine_accept`、必要短距离保护/等待；如果低信号，只能走保守候选，不能主动跨 `ACCEPTED` | 标准链：`strict_release_done = true` 且 `machine_accept_done = true`；`release_accept_gap <= 2`，无资源原因时目标 `<= 1`；`accepted_subject_id` 与 release subject 一致；机接后 protection 激活 `100%`；生成 H4 修库消化债务 | 释放候选或机接候选 recall 不足；机车端别未知；gate 不可用；接收端容量未知；低置信证据不足以跨 `ACCEPTED` | 低置信主动机接；机接后拆散保护主列；用少钩评分跳过 `ContractDelta/ResourceDelta`；释放后无 reason 长时间返回 H1/H2 |
+| H4 修库消化、库位和出入库冲突处理 | H3 退出；或 `DIRECT_REPAIR_ENTRY / DEPOT_DIGEST_ONLY` 成立；存在修库消化、入库、出库腾位、slot/band、stayer 或特殊工艺债务 | 当前 accepted 动作服务于 `REPAIR_INBOUND / DEPOT_OUTBOUND / DEPOT_SLOT / DEPOT_DIGEST / SPECIAL_REPAIR_PROCESS`，并能解释 slot、swap、stayer、端别、摘解顺序变化 | `depot_digest_complete = true`；`slot_or_area_satisfaction = 100%`；`swap_required_resolved_ratio = 100%`；`depot_slot_violation_accepted = 0`；`invalid_detach_count = 0`；主修库债务未完成数 `= 0` | slot/band 不满足且无 swap；stayer 锁定冲突；出库腾位无合法 break action；携带顺序不可摘；称重/顶送/对位缺硬约束解释 | 修库摘解未完成就库回；slot 未释放强行入库；移动 stayer；只按线容量满足而忽略台位、长度、厂修/段修规则 |
+| H5 尾项收束与库回 | H4 退出；或本案无大库/修库主债务且剩余动作只有 support contracts；所有 primary obligation 要么完成，要么有合法 no-op reason | 当前 accepted 动作只服务 `TAIL_CLOSEOUT / LOCO_AREA_STAGING / FUNCTION_LINE_SERVICE / YARD_REBALANCE` 中的剩余目标，不得新建无来源主合同 | `final_target_satisfied = true`；`remaining_target_completion = 100%`；`hard_violation_count = 0`；critical residual `= 0`；trace/failure bucket 覆盖 `100%` | 剩余目标不满足；residual owner 不明；库回后仍有主合同未完；尾项动作无法解释 owner | 主体债务未完 closeout；把 H4 失败伪装成尾项；库回后再无 reason 重开 H2/H3/H4 |
+
+#### 20B.3B 跳过和压缩边界
+
+跳过不是自由裁剪，而是 `skip_predicate` 通过后的阶段事件。每次跳过必须写入 `PhaseGateRecord.transition_type = skip`。
+
+| 跳过/压缩 | 明确条件 | 反例 |
+|---|---|---|
+| 跳过 H1 | 初始已经高置信处于 `PORT_READY / ACCEPTED / DIGESTING`，或 `DIRECT_REPAIR_ENTRY / DEPOT_DIGEST_ONLY` 成立；且 `non_depot_open_hard_obligation_count = 0` | 仍有预修、调棚、功能线主体债务未完成，却被塞进尾项 |
+| 跳过 H2 | `DEPOT_DIGEST_ONLY`、直接入库，或已处于 `PORT_READY` 之后；且不存在需要存4口成形的标准释放债务 | 标准链仍未形成存4释放口，却直接生成释放/机接 |
+| 跳过 H3 | `DEPOT_DIGEST_ONLY` 或 `DIRECT_REPAIR_ENTRY` 明确不需要标准机接；低信号案例只能跳过为保守路径，不能伪造 `ACCEPTED` | 标准链已经 `PORT_READY` 且机接资源可申请，却为少钩绕过机接保护 |
+| 压缩 H3/H4 | 近库侧直接入库案例中，机接/入库/消化在少量钩内连续发生；必须同时满足 H3 出口和 H4 入口对象创建 | 只有最终位置接近，但没有 slot、端别、摘解顺序证明 |
+| 跳过 H4 | 本轮无修库/大库主债务，或车辆初始已合法满足 slot/area 且无出入库冲突 | 只满足线路容量，不满足台位、长度、厂修/段修、stayer |
+| 跳过 H5 | 初始或 H4 退出时已 `final_target_satisfied = true` | 还有 residual、功能线服务或库回债务未解释 |
+
+#### 20B.3C 阶段重叠时的主阶段判定
+
+人工计划存在穿插动作，所以同一步可能同时有 support contract 和 primary contract。文档级标准采用主阶段判定：
+
+```text
+primary_phase =
+  最高优先级未完成硬边界阶段
+```
+
+优先级按业务硬边界而不是钩号：
+
+```text
+H3 存4大释放-机接硬边界
+  > H4 修库消化、库位和出入库冲突
+  > H2 存4释放口成形与保护
+  > H1 前段全站组织与服务处理
+  > H5 尾项收束与库回
+```
+
+解释：
+
+- 一旦进入 H3，释放和机接保护优先于继续做前段整理；前段动作只能作为 support contract，且不得破坏 `PORT_READY / ACCEPTED`。
+- 一旦进入 H4，修库 slot/swap/stayer/摘解债务优先于尾项；库回不能提前。
+- H5 只能在主债务完成后成为 primary phase。
+- 如果高优先级阶段因资源硬阻塞暂不能推进，可以接受 lower phase support action，但必须记录 `blocked_contract_ids` 和 `support_action_reason`。
+
+#### 20B.3D 代表案例边界落点
+
+| 案例 | 入口判定 | 边界路径 | 关键证明 |
+|---|---|---|---|
+| `0117Z` 标准完整链 | 从 H1 进入 | H1 -> H2 -> H3 -> H4 -> H5 | 第 32 钩存4大摘触发 H3，33 钩机接后生成 H4，34-37 钩修库摘解未完前不能 H5 |
+| `0310W` late 存4链 | 可从 H2/H3 附近进入 | H2/H3 -> H4 -> H5 | `PORT_READY` 后禁止回 H1 补长链；36-37 钩释放机接是硬边界 |
+| `0103W` 库内消化 | 跳过 H2/H3，从 H4 进入 | H4 -> H5 | 无标准存4释放/机接，但修库摘解和特殊工艺债务必须完成后才能库回 |
+| `0213W` 短链直接入库 | 跳过 H1/H2，压缩 H3/H4 | H3/H4 -> H5 | 不能强套标准长链；短链必须同时证明直接入库和修库消化合法 |
+| `0306W` 低信号 | H2 保守推进 | H2 -> 保守路径 -> H5 | 存4释放存在，但机接信号不标准；低置信禁止主动跨 `ACCEPTED` |
+
+### 20B.4 代表阶段路径摘要
+
+H1-H5 是人工计划阶段模型，不是所有案例都必须机械执行完整链。详细的跳过和压缩边界以 20B.3B 的 `skip_predicate` 为准；这里仅保留代表案例的阶段路径摘要。
+
+| 案例族 | 阶段路径 |
+|---|---|
+| `0117Z / 0310W / 0128W` 标准链 | H1 -> H2 -> H3 -> H4 -> H5 |
+| `0310W` late 存4 | 可从 H2/H3 附近开始，禁止回 H1 补长链 |
+| `0103W / 0223W` 库内消化 | H4 -> H5，跳过 H2/H3 |
+| `0213W` 短链直接入库 | H3/H4 压缩或跳过，不能强套 H1/H2 |
+| `0306W` 低信号 | H2 保守推进，H3 不允许低置信主动跨 `ACCEPTED` |
+
+### 20B.5 钩数不高于人工的可证明条件
+
+“钩数不高于人工”不能由阶段名称保证，只能由以下审计条件证明。
+
+case 级判定：
+
+```text
+hook_not_higher_than_human =
+  hard_violation_count = 0
+  and final_target_satisfied = true
+  and solver_hook_count <= manual_hook_count
+```
+
+阶段级判定：
+
+```text
+phase_hook_not_higher_than_human =
+  H1_hook_count <= manual_H1_hook_count
+  and H2_hook_count <= manual_H2_hook_count
+  and H3_hook_count <= manual_H3_hook_count
+  and H4_hook_count <= manual_H4_hook_count
+  and H5_hook_count <= manual_H5_hook_count
+```
+
+如果没有人工计划阶段切分，只能使用 case 级钩数，不得声称每个阶段都不高于人工。
+
+为了提高“不高于人工”的可实现性，方案必须满足：
+
+| 条件 | 量化门槛 |
+|---|---|
+| 候选生成不漏人工结构动作 | `necessary_candidate_recall = 100%` |
+| 同结构候选不接受劣解 | `dominated_accepted_rate = 0` |
+| 少钩搜索不跨结构边界 | `search_scope_violation_count = 0` |
+| 局部搜索规模可控 | `local_branch_count <= 64` |
+| 人工动作可作为结构模板覆盖 | 人工关键动作族 recall `= 100%` |
+
+如果这些条件不满足，即使 H1-H5 都能完成，也不能承诺钩数不高于人工。
+
+### 20B.6 高可解性条件
+
+高可解性不是“能跑出几个案例”，而是每个可进入的阶段都有合法 fallback 和失败定位。
+
+建议门槛：
+
+| 指标 | 达到人工线 | 高可解性目标 |
+|---|---:|---:|
+| 代表案例阶段硬门通过率 | 100% | 100% |
+| `truth2_force` 可解率 | `>= 95%` | `>= 98%` |
+| 单案 P95 runtime | `<= 300s` | `<= 180s` |
+| hard violation accepted | 0 | 0 |
+| `failure_bucket_coverage` | 100% | 100% |
+| `unknown_failure_repeat_rate` | `<= 2%` | `= 0` |
+| 必需候选 recall | 100% | 100% |
+| resource deadlock 有合法 break action | 100% | 100% |
+
+每个阶段必须有 fallback：
+
+| 阶段 | fallback |
+|---|---|
+| H1 | 前段组织失败时输出缺失 owner、服务债务、阻塞资源、不可混编原因 |
+| H2 | 存4口成形失败时输出口污染、方向冲突、阻塞合同和合法清口动作 |
+| H3 | 释放/机接失败时输出端别、机车位置、gate、接收端容量或低置信原因 |
+| H4 | 修库消化失败时输出 slot/band 缺口、stayer 锁定、端别不可达、携带顺序不可摘 |
+| H5 | 剩余到位失败时按合同族分类失败，不允许 residual 垃圾桶化 |
+
+### 20B.7 当前结论
+
+对“业务到底分成几个阶段比较合适”的当前结论是：
+
+```text
+不应固定为原先的 S1-S4。
+更合适的是人工计划反推的 H1-H5 阶段模型。
+```
+
+必须补齐：
+
+1. `HumanPhaseContract / PhaseGate`，把 H1-H5 的进入、退出、跳过和失败条件变成硬门。
+2. 阶段级指标：`front_service_progress`、`cun4_port_shape_ready`、`release_accept_boundary_done`、`depot_digest_complete`、`tail_closeout_complete`。
+3. 阶段级钩数对照：如果要声称每阶段不高于人工，必须先把人工计划切成 `manual_H1..H5_hook_count`。
+4. 可解性压测：代表案例 100% 通过，`truth2_force` 可解率至少 95%，目标 98%。
+
+如果只保留当前 `FlowEdge / EdgeContract / StationResourceGraph`，而不增加人工计划阶段门，则方案只能说“有能力表达人工关键结构”，不能说“能稳定遵守人工阶段逻辑并保证不高于人工”。
+
+## 20C. 独立复审：小结构有效性与连接闭环
+
+本节是对 20A/20B 的独立复审。它不再只问“结构是否定义了”，而是逐一审查：
+
+```text
+每个小结构是否有可量化有效标准；
+每个小结构的输入输出是否能被上下游消费；
+结构之间的连接是否 100% 可追踪、可拒绝、可定位；
+人工案例中的结构价值是否能被这些结构共同表达；
+业务文档中的硬约束是否能落到明确结构和明确 gate；
+当所有结构和连接都达标时，整体是否具备达到甚至超越人工的充分结构条件。
+```
+
+### 20C.1 独立复审结论
+
+当前方案的结构方向是正确的：`FlowGraph -> FlowEdge -> EdgeContract -> ResourceGraph -> Delta -> Gate -> LocalSearch -> Trace` 能把人工调车中的“先组织、再释放、再机接、再库内消化、再收束”转成可审计的结构链。
+
+但“结构方向正确”不等于已经可以声称必然达到或超越人工。复审结论分两层：
+
+| 问题 | 结论 |
+|---|---|
+| 如果 20A/20B/20C 的结构指标、连接指标、人工阶段门指标全部达标，整体能否达到人工？ | 可以。因为人工关键结构、业务硬约束、候选生成、资源仲裁、少钩比较和 trace 已经形成闭环。 |
+| 如果这些指标全部达标，整体能否具备超越人工的条件？ | 可以，但必须在硬约束为 0、可解率达标、钩数不高于人工之后，再证明至少 2 个二级指标支配人工。 |
+| 当前文档中的原始结构是否已经足够直接保证？ | 不足。必须补齐 `HumanPhaseContract / PhaseGate`、连接审计指标和人工阶段级钩数切分，才能把“有基础”提升为“可证明”。 |
+
+因此，方案可行性的判断不能靠最终跑几个案例像人工，而要靠以下充分链：
+
+```text
+all_small_structures_passed
+  and all_structure_connections_passed
+  and all_phase_gates_passed
+  and hard_violation_count = 0
+  and necessary_candidate_recall = 100%
+  and dominated_accepted_rate = 0
+  and final_target_satisfied = true
+  and runtime <= 300s
+  and solver_hook_count <= manual_hook_count
+=> reached_human
+```
+
+进一步：
+
+```text
+exceeded_human =
+  reached_human
+  and (
+    solver_hook_count < manual_hook_count
+    or (
+      solver_hook_count = manual_hook_count
+      and improved_secondary_metric_count >= 2
+    )
+  )
+```
+
+本章不再新增 `20D` 式审计层。后续应直接把 20A/20B/20C 的标准转成 4 类可执行标准产物：
+
+| 标准产物 | 来源章节 | 作用 | 完成后可进入 |
+|---|---|---|---|
+| 结构标准卡 | 20C.2 | 规定每个小结构本身什么算有效 | 小结构实现设计 |
+| 连接标准卡 | 20C.3 | 规定上下游结构之间如何无损接力 | runtime 集成设计 |
+| 场景验收卡 | 20C.4/20C.6 | 规定人工案例和人工计划阶段如何验收结构 | case replay 和压力测试 |
+| 指标数据字典 | 20A.2C/20C.5 | 规定指标字段、公式、来源、粒度 | 自动化验收报表 |
+
+进入下一步“小结构标准设计”的准入条件是：
+
+```text
+small_structure_standard_design_ready =
+  structure_inventory_frozen
+  and connection_inventory_frozen
+  and phase_inventory_frozen
+  and metric_dictionary_defined
+  and representative_case_set_defined
+  and human_case_phase_split_started
+  and business_rule_mapping_complete
+```
+
+| 准入项 | 通过标准 |
+|---|---|
+| `structure_inventory_frozen` | 20C.2 中的小结构清单固定；新增结构必须说明替代或合并关系 |
+| `connection_inventory_frozen` | 20C.3 中的连接链固定；新增连接必须说明上下游对象 |
+| `phase_inventory_frozen` | H1-H5 阶段、进入/退出/跳过条件固定 |
+| `metric_dictionary_defined` | 每个指标有公式、粒度、来源字段和失败桶 |
+| `representative_case_set_defined` | 至少包含 `0117Z/0310W/0103W/0213W/0306W/0128W/0223W/0130Z/0201W` |
+| `human_case_phase_split_started` | 至少 9 个金标案例开始切分 `manual_H1..H5_hook_count`；未切分完时只能做 case 级钩数对照 |
+| `business_rule_mapping_complete` | 业务文档中的硬约束均能映射到结构、连接和 gate |
+
+### 20C.2 小结构有效性总表
+
+下表是独立复审标准。审核时每一行都必须有 step/case/batch 证据。缺证据的结构即使名称存在，也只能算 L1/L2，不能算 L3。
+
+| 小结构 | 上游输入 | 下游输出 | 有效标准 | 连接标准 | 人工案例验证 | 业务约束映射 | 失败影响 |
+|---|---|---|---|---|---|---|---|
+| `OnlineObservable` | `StartStatus`、车辆属性、线路几何、目标 | 在线可用 feature、status source | `online_status_reason_coverage = 100%`; `offline_label_used_online_count = 0` | 所有 status 必须带 `source = geometry/resource/target/vehicle/executed_move` | `0306W` 低信号仍能给 confidence | 禁止用人工计划动作泄漏未来 | 信息泄漏会让可行性结论失真 |
+| `OfflineLabelOnly` | 人工钩序、人工结构标签 | hidden label、对照指标 | 只能用于评估，不能进入 runtime | `runtime_feature_join_count = 0` | 118 个人工文件只作为基准 | 审计可比性 | 泄漏后钩数和可解性无效 |
+| `FlowGraphBuilder` | 在线 feature、上一步状态 | `FlowGraph`、rebuild diff | 每步 rebuild 成功率 `100%`; unknown diff `<= 2%` | `graph_build_trace_coverage = 100%` | `0117Z` 能看到边逐步推进 | 全站业务覆盖 | 构图错误会传染所有结构 |
+| `FlowClassify` | 车辆目标、属性、当前位置、service state | 每辆需动车的合同族和 reason | `effective_contract_coverage >= 95%`; `residual_vehicle_ratio <= 5%` | `vehicle_to_contract_owner_coverage = 100%` | 标准链 97 文件主流不掉 residual | 预修/调棚/功能线/大库/存车整理全覆盖 | 主体流漏分类会导致无解或假少钩 |
+| `NoMoveVehicle` | 已满足目标车辆、阻塞检查 | no-move 集合和 reason | `no_move_false_satisfied_rate = 0` | no-move 仍要输出是否阻塞资源 | `0213W` 不强行多动车 | 避免无效动车 | 错判不动车会堵关键口 |
+| `ResidualItem` | 未绑定车辆、低信号车辆 | residual reason、expiry、suspected role | `residual_vehicle_ratio <= 5%`; reason 覆盖 `100%`; 平均生命周期 `<= 3` 次 rebuild | residual 必须有升级/失败路径，不能永久垃圾桶化 | `0306W` 可低信号保守 residual | 异常样本可解释 | residual 过多会降低可解性 |
+| `FlowGraph` | 分类结果、边识别结果 | active edges、residuals、contradictions | `subject_overlap_count = 0`; 主体流输出完整率 `100%` | 每个 active edge 必须绑定 contract 或 residual reason | `0117Z` 标准主边不断推进 | 全站并发合同视图 | 图层不稳会让目标选择乱跳 |
+| `FlowEdge` | subject、port、receiver、evidence | 边对象、状态、证据 | active edge 必填字段覆盖 `100%`; 高价值主流漏识别率 `<= 2%` | `edge_id`、subject、contract owner 连续 | `0310W` late 存4边不能被重建成长链 | 存4释放、机接、大库出入 | 边错会让合同错 |
+| `EdgeKey` | 车辆集合、方向、via、receiver | 稳定 edge identity | `edge_identity_stability >= 95%`; 无理由漂移 `= 0` | rebuild 后 `edge_key` 变化必须有原因 | `0117Z` 23-37 钩不能频繁换主边 | trace 可复盘 | identity drift 会让合同债务丢失 |
+| `FlowSubject` | 车辆集合、有序段、role | seed/forming/bound subject | 同车 primary subject 重叠 `= 0`; role 覆盖 `100%` | subject 到 candidate 的车辆集合守恒 `100%` | `0117Z` 前段组流逐渐成主列 | 编组与摘解顺序 | subject 错会导致脏携带 |
+| `FlowPort` | via line、端别、口状态 | port role、health、blocking vehicles | 存4北、联线、修库入口 health 覆盖 `100%` | port 被 candidate 使用前必须有 resource request | `0310W` 存4北释放口 | 存4北双向争抢、联6/联7 | port 当普通线会污染关键口 |
+| `FlowReceiver` | 目标区域、作业线、容量、digest state | receiver state、pending obligations | 修库/预修/调棚/功能线 receiver 覆盖 `100%` | receiver capacity unknown 不允许 accept | `0103W` 修库消化不是尾项 | 大库、功能线、预修台位 | 接收端错会提前 closeout |
+| `FlowEdgeStatus` | edge evidence、resource state、合同履约 | `SEED/FORMING/PORT_READY/ACCEPTED/DIGESTING/DONE` | `illegal_status_transition_count = 0`; 低置信跨 `ACCEPTED = 0` | status change 必须生成 status delta trace | `0306W` 不低置信主动机接 | 低信号保守边界 | 状态越级会制造非法少钩 |
+| `EdgeContract` | edge、status、template | must/protection/forbidden/finish clauses | `contract_clause_completeness = 100%` | 每个 accepted action 必须有 `ContractDelta` | `0117Z` 机接后保护主列 | 人工结构价值硬化 | 合同缺项会让评分破坏结构 |
+| `ContractTemplate` | 合同族、业务规则 | 标准条款模板 | 9 个合同族 template 缺失 `= 0` | template 到 contract 实例字段覆盖 `100%` | 非修库案例不掉 residual | 全站主体流覆盖 | 只会修库主链，泛化不足 |
+| `StationFlowContract` | 所有 active contract | active contract set、priority hint | 主体合同族覆盖率 `>= 95%` | active contract 必须进入 target selector 或 suppressed reason | `0103W` `DEPOT_DIGEST_ONLY` 优先 | 多合同并发 | 合同集缺失会让资源仲裁无 owner |
+| `RepairInboundVariant` | repair edge、证据强弱、当前位置 | variant、shortcut、forbidden move | 代表变体准确率 `100%`; 全量异常误判率 `<= 5%` | variant 必须改变 allowed/forbidden candidates | `0117Z/0310W/0103W/0213W/0306W` 分型正确 | 大库主链异常处理 | 强套标准链会劣于人工 |
+| `Blocker` | contract clause、resource conflict | blocker type、clear intent | hard blocker ignored `= 0`; reason 覆盖 `100%` | blocker 必须能生成 clear candidate 或 failure bucket | `0310W` 存4口阻塞先清理 | 存4/大库/gate 冲突 | blocker 不显式会导致死等 |
+| `Obligation` | 未完成条款、阶段债务 | owner、completion condition | hard obligation skipped `= 0`; lifecycle 覆盖 `100%` | obligation 完成必须反写 contract/status | `0103W` 修库摘解完成前不能库回 | 主合同未完禁止尾项 | 债务丢失会提前收尾 |
+| `Protection` | `ACCEPTED` 后合同、主列状态 | active protection、release condition | active protection broken accepted `= 0` | protection 违反必须进入 reject reason | `0117Z` 机接后不拆主列 | 机接硬边界 | 短期少钩会破坏后续 |
+| `TargetContractSelector` | active contracts、blockers、resource state | target contract、rank reason | `target_contract_reason_coverage = 100%`; hard priority inversion `= 0` | suppressed contract 必须有 reason | `0310W` 优先存4释放/机接，不补外场 | 阶段主次顺序 | 目标选错导致钩数膨胀 |
+| `StructuralIntentBuilder` | target contract、clauses、blockers | intent、forbidden intents | intent 无合同来源 `= 0`; intent 匹配率 `100%` | intent 到模板选择必须带 clause source | `0213W` 直接入库 intent | 不强套长链 | 意图错会生成错误候选族 |
+| `WorkPatternTemplateSelector` | intent、edge status、资源状态 | template list | 每个 intent 可用模板数 `1..6`; pattern 绕 gate `= 0` | template 必须声明 resource request schema | 人工动作族 recall `= 100%` | 人工经验动作族 | 漏模板会无解，过多会爆搜索 |
+| `EdgeBoundedCandidateGenerator` | template、subject、port、receiver | bounded candidates | `necessary_candidate_recall = 100%`; `candidate_family_count <= 8`; `planlet_horizon <= 3` | forbidden candidate 进入 scoring `= 0` | `0117Z` 标准动作族存在 | 5 分钟性能 | 候选漏召回会低可解，候选失控会超时 |
+| `ResourceRequest` | candidate、template schema | requested/blocked resources | `resource_request_coverage = 100%` | 无 request 的 candidate 不允许进入 delta | `0310W` 存4北、机接资源申请 | 存4/联线/大库/机车 | 无资源申请会放行冲突 |
+| `StationResourceGraph` | resource requests、占用、等待 | acquired/released/blocked/wait-for | `hard_resource_violation_accepted_count = 0`; 资源字段覆盖 `100%` | 每个 resource delta 必须回写 graph | 标准链存4和大库争抢 | 全站共享资源仲裁 | 资源冲突靠评分会非法 |
+| `CUN4_NORTH_BUFFER` | 存4北占用、方向、等待合同 | `FREE/INBOUND_RELEASE/OUTBOUND_HOLD/MIXED_DIRTY` | 四态识别 `100%`; direction conflict accepted `= 0` | 被占用/释放必须有 owner contract | `0117Z/0310W` 存4北释放 | 存4北不是普通终点 | 污染存4会增加钩数 |
+| `DepotSlotGraph` | 大库现车、目标台位、stayer、长度修程 | slot/band availability、locked tail | slot request 覆盖 `100%`; `depot_slot_valid = true` | 入库/出库 candidate 必须带 slot/band delta | `0103W` 库内消化、出入库摘解 | 17.6 米、厂修 4/5、stayer 锁定 | 只看线容量会产生非法入库 |
+| `DepotSwapDelta` | slot graph、入库/出库候选 | swap required/resolved/released | `swap_required_resolved_ratio = 100%` | swap 未解决不允许 H4 强行消化/入库 | 大库先出后进经验 | 出库腾位再入库 | swap 漏识别会卡死或非法 |
+| `GlobalGate` | 联6/联7开放、路径申请 | gate slot、reject reason | `gate_conflict_accepted = 0`; gate request 覆盖 `100%` | 跨 gate 动作必须有 request/result | 大库集中期避开联7前 60 分钟 | 联7前 60 分钟关闭、走行线禁停 | gate 冲突会违反业务时序 |
+| `LocoPosition` | 机车线位、端别、可达性 | track、side、distance、accessible end | `loco_position_unknown_accept_count = 0` | candidate 评分必须引用 loco position | 人工北头/南头备注 | 倒车折返、端别、空驶 | 忽略机车会低估钩数 |
+| `LocoCarryState / ordered carry segments` | 当前挂车顺序、机车端别 | ordered segments、dirty/counted flags | `enum_only_carry_enabled = false`; 车辆守恒 `100%` | `ContractDelta/ResourceDelta` 使用同一 ordered list | `0117Z` 主列保护，`0103W` 称重/顶送 | 摘解顺序、称重最后一辆 | 枚举压缩会产生非法摘挂 |
+| `WaitForGraph / DeadlockDetection` | contract/resource 等待边 | cycle、break action | cycle coverage `100%`; legal break action 输出 `100%` | break action 必须回到 target/candidate | 大库入库等出库腾位 | 存4、大库、gate 环形等待 | 无死锁解释会可解率低 |
+| `EdgeDelta` | candidate、edge before/after | status/subject/progress change | required fields 覆盖 `100%` | delta 后 edge rebuild 必须一致 | `0117Z` 每步推进可解释 | 状态变化审计 | delta 错会误判履约 |
+| `ContractDelta` | candidate、contract clauses | fulfilled/broken/new obligations | `contract_delta_required_field_coverage = 100%`; hard broken accepted `= 0` | accepted 必须有正向或合法让步 delta | 人工关键动作是正 delta | 合同硬门 | 无 delta 则少钩不可审计 |
+| `ResourceDelta` | candidate、resource graph | acquired/released/violations | `resource_delta_coverage = 100%`; resource violation accepted `= 0` | accepted 后 resource graph 更新一致 | 存4释放、大库腾位 | 临停容量、走行线禁停、gate | 资源漏更新会连锁错误 |
+| `AcceptRejectGate` | contract delta、resource delta、hard rules | accept/reject、why | `why_reject_coverage = 100%`; 硬违反 accepted `= 0` | gate bypass `= 0` | `0306W` 低置信机接被拒 | 所有业务硬约束 | gate 太松非法，太严无解 |
+| `ContractOptimizer / hook_count` | 合法候选、局部成本 | 同结构排序结果 | `search_scope_violation_count = 0`; `dominated_accepted_rate = 0` | 只能在同 contract/intent/模板边界比较 | `0128W` 标准链高钩数可优化 | 少钩目标 | 跨结构少钩会破坏人工价值 |
+| `LocalTieBreakSearch` | 同结构候选、短 horizon | best local planlet | `local_branch_count <= 64`; `planlet_horizon <= 3` | 搜索结果仍需 gate | 标准链同结构减少往返 | 5 分钟求解 | 搜索失控会超时 |
+| `State Update / FlowGraph Rebuild` | accepted move、delta | 新状态、新图、新 trace | 车辆守恒 `100%`; rebuild 覆盖 `100%` | state change 必须能由 accepted delta 解释 | 所有案例 step 级复盘 | 结果一致性 | 状态漂移会产生假可解 |
+| `Trace / failure_bucket` | 所有结构输出 | step/case/batch trace、失败桶 | `trace_field_coverage = 100%`; `failure_bucket_coverage = 100%`; unknown repeat `<= 2%` | 每个失败绑定一个主结构和最多两个辅助结构 | 代表案例全量回放 | 审核和迭代闭环 | 无法定位就无法证明方案 |
+| `HumanPhaseContract / PhaseGate` | active contracts、phase metrics、resource state | H1-H5 phase、entry/exit/skip/fail | `phase_gate_bypass_count = 0`; H1-H5 指标按 20B 达标 | phase change 必须消耗/生成对应合同债务 | `0117Z` 标准全链，`0213W` 合法跳过 | 人工阶段顺序 | 没有人工阶段门就无法证明 H1-H5 完成 |
+
+下一步把这张总表转成每个小结构的标准卡。标准卡必须使用统一模板：
+
+```text
+StructureStandardCard:
+  structure_name:
+  business_purpose:
+  process_scope:
+  upstream_inputs:
+  downstream_outputs:
+  online_offline_boundary:
+  required_fields:
+  hard_thresholds:
+  reached_human_thresholds:
+  exceeded_human_thresholds:
+  connection_requirements:
+  phase_requirements:
+  human_case_checks:
+  business_rule_mapping:
+  performance_budget:
+  failure_buckets:
+  trace_fields:
+  veto_conditions:
+  open_questions:
+```
+
+字段要求：
+
+| 字段 | 必填内容 | 不合格写法 |
+|---|---|---|
+| `business_purpose` | 这个结构解决哪个业务问题，不能只写技术职责 | “用于建模” |
+| `process_scope` | 属于 P0-P10 哪些过程，是否参与 H1-H5 | “全流程都相关” |
+| `upstream_inputs` | 输入对象、字段、来源、在线/离线边界 | “读取状态” |
+| `downstream_outputs` | 输出对象、字段、谁消费 | “输出结果” |
+| `hard_thresholds` | 触发即失败的量化指标 | “尽量避免” |
+| `reached_human_thresholds` | 达到人工计划结构价值的指标 | “效果接近人工” |
+| `exceeded_human_thresholds` | 超越人工所需的多指标支配条件 | “比人工更优” |
+| `connection_requirements` | 上下游 id、owner、trace、delta 连续性 | “连接正常” |
+| `phase_requirements` | 是否受 `HumanPhaseContract / PhaseGate` 约束 | “按阶段处理” |
+| `human_case_checks` | 需要通过哪些人工代表案例 | “用案例验证” |
+| `business_rule_mapping` | 对应业务文档哪条硬约束 | “符合业务” |
+| `performance_budget` | step/case/batch 预算 | “不能太慢” |
+| `failure_buckets` | 失败归因名称和触发条件 | “失败时记录原因” |
+| `trace_fields` | 必须写入 trace 的字段 | “输出日志” |
+| `veto_conditions` | 一票否决项 | “严重错误失败” |
+
+标准卡设计应按求解链路拆成 7 组，不按代码文件拆：
+
+| 标准包 | 包含小结构 | 先设计原因 | 完成标志 |
+|---|---|---|---|
+| A. 在线证据与车辆归属 | `OnlineObservable`, `OfflineLabelOnly`, `FlowGraphBuilder`, `FlowClassify`, `NoMoveVehicle`, `ResidualItem` | 决定后续所有结构是否有干净输入 | 每辆需动车都有 owner 或 residual reason |
+| B. 边、状态与合同 | `FlowGraph`, `FlowEdge`, `EdgeKey`, `FlowSubject`, `FlowPort`, `FlowReceiver`, `FlowEdgeStatus`, `EdgeContract`, `ContractTemplate`, `StationFlowContract`, `RepairInboundVariant` | 决定人工计划结构能否被表达 | active edge 绑定合同率 100%，variant 代表案例准确率 100% |
+| C. 目标、债务与保护 | `Blocker`, `Obligation`, `Protection`, `TargetContractSelector`, `StructuralIntentBuilder` | 决定下一步做什么，以及什么不能破坏 | target reason 覆盖 100%，hard obligation skipped = 0 |
+| D. 候选、模板与 delta | `WorkPatternTemplateSelector`, `EdgeBoundedCandidateGenerator`, `ResourceRequest`, `EdgeDelta`, `ContractDelta` | 决定必要候选不漏且搜索受控 | `necessary_candidate_recall = 100%`; `candidate_family_count <= 8` |
+| E. 资源、库位与机车携带 | `StationResourceGraph`, `CUN4_NORTH_BUFFER`, `DepotSlotGraph`, `DepotSwapDelta`, `GlobalGate`, `LocoPosition`, `LocoCarryState`, `WaitForGraph` | 决定大库、存4、联线、机车端别是否合法 | resource violation accepted = 0，slot/gate/carry request 覆盖 100% |
+| F. 人工阶段门 | `HumanPhaseContract`, `PhaseGate` | 决定 H1-H5 是否完成或合法跳过 | `phase_gate_bypass_count = 0`; H1-H5 exit condition 可审计 |
+| G. 硬门、少钩与 trace | `ResourceDelta`, `AcceptRejectGate`, `ContractOptimizer`, `LocalTieBreakSearch`, `State Update`, `FlowGraph Rebuild`, `Trace / failure_bucket` | 决定合法候选如何少钩、失败如何定位 | dominated accepted = 0，trace/failure 覆盖 100% |
+
+推荐设计顺序：
+
+```text
+A -> B -> C -> E -> F -> D -> G
+```
+
+第一批应优先设计这些结构标准卡：
+
+| 优先级 | 结构标准卡 | 为什么先写 | 必须包含的量化指标 |
+|---|---|---|---|
+| P0 | `FlowClassify` | 车辆 owner 错了，后面全部失真 | `effective_contract_coverage`, `residual_vehicle_ratio`, `no_move_false_satisfied_rate` |
+| P0 | `FlowEdge / EdgeKey / FlowEdgeStatus` | 人工结构必须先被稳定表达 | `edge_identity_stability`, `active_edge_required_field_coverage`, `illegal_status_transition_count` |
+| P0 | `EdgeContract / RepairInboundVariant` | 决定能否识别标准链、late 存4、短链、库内消化 | `contract_clause_completeness`, `variant_accuracy_on_representative_cases` |
+| P0 | `HumanPhaseContract / PhaseGate` | 决定 H1-H5 是否可证明完成 | `phase_gate_bypass_count`, `phase_exit_condition_coverage`, `phase_transition_trace_coverage` |
+| P0 | `DepotSlotGraph / DepotSwapDelta` | 决定大库能否合法先出后进 | `depot_slot_request_coverage`, `swap_required_resolved_ratio`, `depot_slot_violation_accepted` |
+| P0 | `CUN4_NORTH_BUFFER / GlobalGate` | 决定存4北和联线主冲突点 | `cun4_direction_conflict_accepted`, `gate_conflict_accepted`, `resource_request_coverage` |
+| P0 | `LocoCarryState / ordered carry segments` | 决定摘解、称重、关门车、端别是否合法 | `enum_only_carry_enabled`, `vehicle_conservation`, `invalid_detach_count` |
+| P0 | `ContractDelta / ResourceDelta / AcceptRejectGate` | 决定硬约束是否真正生效 | `hard_clause_accepted_count`, `resource_violation_accepted_count`, `why_reject_coverage` |
+| P1 | `TargetContractSelector / StructuralIntentBuilder` | 决定局部动作是否服务正确主合同 | `target_contract_reason_coverage`, `intent_contract_source_coverage`, `hard_priority_inversion_count` |
+| P1 | `EdgeBoundedCandidateGenerator / WorkPatternTemplateSelector` | 决定可解性和 5 分钟性能 | `necessary_candidate_recall`, `candidate_family_count`, `planlet_horizon` |
+| P1 | `ContractOptimizer / LocalTieBreakSearch` | 决定能否低于人工钩数 | `dominated_accepted_rate`, `search_scope_violation_count`, `local_branch_count` |
+| P1 | `Trace / failure_bucket` | 决定失败能否定位并迭代 | `trace_field_coverage`, `failure_bucket_coverage`, `unknown_failure_repeat_rate` |
+
+### 20C.3 结构连接审计标准
+
+单个结构达标仍不足以推出端到端可行。必须证明结构之间没有断链、孤儿对象和绕门行为。
+
+连接通用硬门槛：
+
+```text
+connection_trace_coverage = 100%
+orphan_edge_count = 0
+orphan_contract_count = 0
+orphan_resource_request_count = 0
+orphan_delta_count = 0
+unexplained_state_change_count = 0
+accepted_without_contract_delta_count = 0
+accepted_without_resource_delta_count = 0
+accepted_without_phase_permission_count = 0
+phase_gate_bypass_count = 0
+```
+
+核心连接链必须逐段审计：
+
+| 连接 | 需要传递的对象 | 硬门槛 | 达到人工线 | 失败后果 |
+|---|---|---|---|---|
+| `OnlineObservable -> FlowGraphBuilder` | online feature、source、confidence | `offline_label_used_online_count = 0`; `unknown_source_count = 0` | 低信号案例能保守建图 | 信息泄漏或无源状态 |
+| `FlowGraphBuilder -> FlowClassify` | vehicle state、target、service attribute | `vehicle_id_continuity = 100%` | 每辆需动车进入分类 | 车辆遗漏 |
+| `FlowClassify -> FlowGraph / FlowEdge` | contract family、role、reason | `unbound_movable_vehicle_count / movable_vehicle_count <= 5%` | 主体车流不掉 residual | 主边缺失 |
+| `FlowEdge -> EdgeContract` | edge key、status、evidence、variant | `active_edge_contract_binding = 100%` | 每条主边有合同债务 | 有边无合同 |
+| `EdgeContract -> TargetContractSelector` | clauses、priority、blocker、protection | `target_contract_reason_coverage = 100%` | 能解释为什么先做这条合同 | 目标乱跳 |
+| `TargetContractSelector -> StructuralIntentBuilder` | target contract、suppressed reason | `intent_contract_source_coverage = 100%` | intent 不脱离合同条款 | 生成无主意图 |
+| `StructuralIntentBuilder -> WorkPatternTemplateSelector` | intent、allowed/forbidden families | `template_applicability_checked = 100%` | 不复刻固定钩序，覆盖人工动作族 | 漏候选或候选泛滥 |
+| `WorkPatternTemplateSelector -> EdgeBoundedCandidateGenerator` | template、horizon、subject boundary | `necessary_candidate_recall = 100%`; `candidate_family_count <= 8` | 标准动作族都有候选 | 无解或超时 |
+| `CandidateGenerator -> ResourceRequest` | candidate、resource schema | `resource_request_coverage = 100%` | 每个候选先申请资源 | 资源冲突绕过 |
+| `ResourceRequest -> StationResourceGraph` | requested resources、owner contract | `orphan_resource_request_count = 0` | 存4、大库、gate、机车资源都有 owner | 等待关系不可解释 |
+| `StationResourceGraph -> ResourceDelta` | acquired/released/blocked | `resource_delta_coverage = 100%` | 资源收益/冲突可比较 | 放行非法占用 |
+| `Candidate -> ContractDelta` | before/after contract state | `contract_delta_required_field_coverage = 100%` | 人工关键动作可解释为正 delta | 少钩无法审计 |
+| `ContractDelta + ResourceDelta -> AcceptRejectGate` | hard clause、resource violation、why | `hard_violation_accepted_count = 0` | 拒绝人工错误模式和非法少钩 | 硬约束被评分抵消 |
+| `AcceptRejectGate -> LocalTieBreakSearch` | legal candidates only | `illegal_candidate_in_search_count = 0` | 只在同结构合法候选中少钩 | 搜索绕过结构 |
+| `LocalTieBreakSearch -> State Update` | selected move、delta | `selected_move_has_delta = 100%` | 状态变化可复盘 | 状态漂移 |
+| `State Update -> FlowGraph Rebuild` | updated vehicle positions、resources | `unexplained_state_change_count = 0` | 新图继承旧债务或解释消失 | 合同断代 |
+| `FlowGraph Rebuild -> Trace` | diff、metrics、failure bucket | `trace_field_coverage = 100%` | case 失败能定位结构 | 无法迭代 |
+| `HumanPhaseContract / PhaseGate -> TargetContractSelector` | phase、entry/exit/skip、forbidden moves | `accepted_without_phase_permission_count = 0` | 人工计划阶段有硬门 | 局部最优破坏阶段 |
+| `PhaseGate -> Trace` | phase metric、phase transition reason | `phase_transition_trace_coverage = 100%` | 能证明 H1-H5 完成或合法跳过 | 不能证明 H1-H5 业务 |
+
+连接审计必须新增一个数据包：
+
+| 数据包 | 内容 | 最低通过标准 |
+|---|---|---|
+| `connection_metrics.csv` | 每个 case、step、连接段的输入 id、输出 id、owner、trace、hard gate 结果 | 上表所有连接硬门槛 100% 达标 |
+
+`connection_metrics.csv` 至少包含：
+
+```text
+case_id
+step_index
+connection_name
+upstream_object_id
+downstream_object_id
+owner_contract_id
+owner_edge_id
+owner_phase
+input_count
+output_count
+missing_output_count
+orphan_output_count
+trace_id
+accepted
+reject_reason
+hard_gate_passed
+failure_bucket
+```
+
+### 20C.4 人工案例对结构和连接的验收作用
+
+人工案例不是用来要求算法复刻人工钩序，而是用来验证结构和连接有没有表达人工的关键判断。
+
+| 案例 | 人工结构信号 | 必过结构 | 必过连接 | 量化验收 |
+|---|---|---|---|---|
+| `0117Z` 标准完整链 | 前段组流、存4北释放、机接、修1-修4摘解、库回 | `FlowEdge`, `FlowEdgeStatus`, `EdgeContract`, `Protection`, `DepotSlotGraph`, `ContractDelta` | `FlowEdge -> EdgeContract -> ContractDelta -> Gate -> Rebuild` | variant 正确；状态路径可解释 `100%`; 大库摘解完成前 `tail_closeout_accepted = 0`; 钩数 `<= manual * 1.05`，目标 `<= manual` |
+| `0310W` late 存4链 | 前段已接近存4释放，不能回外场补长链 | `RepairInboundVariant`, `TargetContractSelector`, `CUN4_NORTH_BUFFER`, `StructuralIntentBuilder` | `Status -> Variant -> Target -> Candidate` | `FORCE_OUTER_PICKUP_ON_PORT_READY_EDGE = 0`; `PORT_READY` 后目标选择正确率 `100%` |
+| `0103W` 库内消化 | 无标准机接但修库摘解明确，有称重/顶送/尾部组织 | `DEPOT_DIGEST_ONLY`, `SPECIAL_REPAIR_PROCESS`, `Obligation`, `DepotSlotGraph`, `Trace` | `Receiver -> EdgeStatus -> EdgeContract -> Obligation -> Gate` | 修库消化债务完成前 `CLOSEOUT_BEFORE_EDGE_DONE = 0`; 称重/顶送候选 hard rule 覆盖 `100%` |
+| `0213W` 短链直接入库 | 人工 5 钩，已接近库侧，不应套标准长链 | `DIRECT_REPAIR_ENTRY`, `PhaseGate`, `WorkPatternTemplateSelector`, `LocalTieBreakSearch` | `Variant -> PhaseSkip -> Intent -> Candidate` | H1/H2 合法跳过；`new_outer_pickup_obligation_count = 0`; 钩数 `<= manual + 1`，目标 `<= manual` |
+| `0306W` 短链低信号 | 有存4释放但机接信号不标准 | `OnlineObservable`, `FlowEdgeStatus`, `MIXED_SIGNAL_REPAIR`, `AcceptRejectGate` | `Evidence -> Confidence -> StatusGuard -> Gate` | 低置信主动跨 `ACCEPTED = 0`; contradiction reason 覆盖 `100%`; 保守候选存在率 `100%` |
+| `0128W` 标准链高钩数 | 标准结构成立但有少钩优化空间 | `ContractOptimizer`, `LocalTieBreakSearch`, `LocoPosition`, `StationResourceGraph` | `LegalCandidates -> Optimizer -> Gate -> Trace` | 搜索不跨结构；`dominated_accepted_rate = 0`; 同结构少钩或二级指标至少 2 项优于人工 |
+| `0223W / 0308W / 0329W` 库内消化族 | 缺标准机接但后段明确 | `DEPOT_DIGEST_ONLY`, `TAIL_CLOSEOUT`, `FailureBucket` | `Contract -> Obligation -> Trace` | 不把 `DIGESTING` 边 closeout；失败桶覆盖 `100%` |
+| `0130Z / 0201W` 信号缺口族 | 前段或机接信号不完整 | `OnlineObservable`, `ResidualItem`, `RepairInboundVariant` | `Evidence -> Residual/Variant -> ConservativeCandidate` | 低信号不硬造高置信主边；residual reason 覆盖 `100%` |
+
+人工案例族的最低通过线：
+
+```text
+representative_case_hard_gate_pass_rate = 100%
+representative_variant_accuracy = 100%
+representative_connection_pass_rate = 100%
+representative_failure_bucket_coverage = 100%
+standard_chain_hook_count <= manual_hook_count * 1.05
+short_or_direct_hook_count <= manual_hook_count + 1
+```
+
+若要声称超越人工，代表案例还必须满足：
+
+```text
+hard_violation_count = 0
+final_target_satisfied = true
+solver_hook_count <= manual_hook_count
+improved_secondary_metric_count >= 2
+```
+
+### 20C.5 业务需求到结构的闭环映射
+
+业务文档中的要求必须落到结构、连接和指标，不能停留在描述层。
+
+| 业务要求 | 承接结构 | 必过连接 | 量化标准 |
+|---|---|---|---|
+| 求解时间限制 5 分钟 | `EdgeBoundedCandidateGenerator`, `LocalTieBreakSearch`, `Trace` | `Candidate -> Optimizer -> Gate` | 单案 `runtime <= 300s`; P95 `<= 300s`; `local_branch_count <= 64`; `planlet_horizon <= 3` |
+| 联7 前 60 分钟不开放 | `GlobalGate`, `HumanPhaseContract`, `PhaseGate` | `PhaseGate -> TargetSelector -> ResourceRequest -> GlobalGate` | `gate_conflict_accepted = 0`; 跨联7候选 gate request 覆盖 `100%` |
+| 大库前先完成非大库 80%-90% | `HumanPhaseContract`, `StationFlowContract`, `TargetContractSelector` | `PhaseGate -> TargetSelector` | H1 退出前 `non_depot_progress_ratio >= 0.8`，目标 `>= 0.9`；若低于必须有 gate reason |
+| 最大预算 40 钩完成大库前组织 | `PhaseGate`, `ContractOptimizer`, `Trace` | `PhaseGate -> HookCounter -> Trace` | `pre_depot_hook_count <= 40`，除非 hard constraint 证明必须超出 |
+| 单机车去大库清理线路和集合 | `LocoPosition`, `DepotSlotGraph`, `DepotSwapDelta`, `StationResourceGraph` | `Target -> ResourceRequest -> ResourceDelta` | 大库清理动作 owner 覆盖 `100%`; `blocking_outbound_vehicle_remaining_count = 0` |
+| 将大库车辆调到存4 | `DEPOT_OUTBOUND`, `CUN4_NORTH_BUFFER`, `GlobalGate` | `DEPOT_OUTBOUND -> CUN4_NORTH_BUFFER -> ResourceDelta` | `outbound_pull_completeness = 100%`; 存4方向冲突 accepted `= 0` |
+| 机走编组车辆分散到大库对应位置 | `REPAIR_INBOUND`, `DepotSlotGraph`, `ordered carry segments` | `Candidate -> DepotSlotGraph -> ResourceDelta -> Gate` | `inbound_placement_completeness = 100%`; `spot_or_area_satisfaction = 100%`; `invalid_detach_count = 0` |
+| 最好大库一进一出 | `HumanPhaseContract`, `LocoPosition`, `ContractOptimizer` | `PhaseGate -> Optimizer -> Trace` | `depot_entry_exit_count <= manual_depot_entry_exit_count`; 目标 `<= 1` 个完整周期 |
+| 大库台位长度规则 | `DepotSlotGraph`, `AcceptRejectGate` | `DepotSlotGraph -> ResourceDelta -> Gate` | `length_slot_violation_accepted = 0`; 长度 `>= 17.6` 仅 `301-305/401-405` |
+| 厂修只能 4/5 台位 | `DepotSlotGraph` | `SlotAssignment -> ResourceDelta -> Gate` | `factory_repair_slot_violation_accepted = 0` |
+| 段修台位序不能超过同线厂修台位数 | `DepotSlotGraph` | `SlotAssignment -> Gate` | `section_repair_order_violation_accepted = 0` |
+| 原地不动车后方不能动、空位不能占 | `DepotSlotGraph`, `NoMoveVehicle` | `NoMove -> DepotSlotGraph -> Gate` | `stayer_moved_count = 0`; `stayer_tail_occupied_violation = 0` |
+| 倒车/折返需校验物理长度并加 15m 机车 | `ResourceRequest`, `ResourceDelta`, `LocoPosition` | `Candidate -> ResourceDelta -> Gate` | `reverse_length_violation_accepted = 0`; 机车 15m 必计入 |
+| 警冲标/岔区可通过不可停车 | `StationResourceGraph`, `GlobalGate` | `ResourceRequest -> ResourceDelta -> Gate` | `fouling_point_storage_accepted = 0` |
+| 走行线禁止停放 | `StationResourceGraph`, `ResourceDelta` | `Candidate -> ResourceDelta -> Gate` | `running_line_storage_accepted = 0` |
+| 称重只在机库称重位 | `SPECIAL_REPAIR_PROCESS`, `LocoCarryState`, `ResourceDelta` | `SpecialProcess -> Candidate -> Gate` | `weighing_location_violation_accepted = 0` |
+| 单钩称重最多 1 辆 | `SPECIAL_REPAIR_PROCESS`, `AcceptRejectGate` | `ContractDelta -> Gate` | `weighing_multi_vehicle_hook_accepted = 0` |
+| 称重车必须在编组最后 | `ordered carry segments`, `ContractDelta` | `CarryState -> ContractDelta -> Gate` | `weighing_tail_order_violation_accepted = 0` |
+| 关门车顺位 | `LocoCarryState`, `ResourceDelta`, `AcceptRejectGate` | `CarryState -> ResourceDelta -> Gate` | `close_door_order_violation_accepted = 0` |
+| 重车牵引折算 | `ResourceRequest`, `ResourceDelta` | `Candidate -> ResourceDelta -> Gate` | `traction_over_limit_accepted = 0`; 重车按 4 辆折算 |
+| 预修/调棚/功能线不是普通存车 | `StationFlowContract`, `FlowReceiver`, `ContractTemplate` | `FlowClassify -> ContractTemplate -> Receiver` | 相关合同族覆盖 `>= 95%`; residual 比例 `<= 5%` |
+
+### 20C.6 人工阶段的结构充分性复审
+
+对用户关心的“到底分成几个阶段比较合适”，独立复审结论是：阶段应采用 H1-H5，而不是原先的 S1-S4。
+
+| 阶段 | 若哪些结构达标 | 是否能完成该阶段 | 钩数不高于人工的必要条件 | 可解性条件 |
+|---|---|---|---|---|
+| H1 前段全站组织与服务处理 | `FlowClassify`, `StationFlowContract`, `YARD_REBALANCE`, `FUNCTION_LINE_SERVICE`, `PRE_REPAIR_STAGING`, `DISPATCH_SHED_QUEUE`, `LocoCarryState` | 可以。非大库主体债务和大库主流 owner 能被区分，前段动作不再被当作杂活。 | `front_service_progress >= 0.8`，目标 `>= 0.9`; `manual_H1_hook_count` 可比；同结构搜索不接受劣解。 | `effective_contract_coverage >= 95%`; residual `<= 5%`; 失败有 owner/blocker/fallback。 |
+| H2 存4释放口成形与保护 | `CUN4_NORTH_BUFFER`, `FlowPort`, `Blocker`, `Protection`, `TargetContractSelector`, `StationResourceGraph` | 可以。存4北能从普通线路提升为释放口资源，并识别污染、方向和阻塞。 | `cun4_port_shape_ready = true`; 存4污染次数 `<= manual_cun4_dirty_count`。 | `port_shape_reason_coverage = 100%`; `cun4_direction_conflict_accepted = 0`。 |
+| H3 存4大释放-机接硬边界 | `RepairInboundVariant`, `FlowEdgeStatus`, `EdgeContract`, `Protection`, `ResourceRequest`, `AcceptRejectGate` | 可以。标准链能连续处理 `存4 - N 北头摘 -> 机 + N 接`，短链/低信号可合法跳过或保守。 | 标准链 `release_accept_gap <= 2`，目标 `<= 1`; `manual_H3_hook_count` 可比。 | `strict_release_candidate_recall = 100%`; `machine_accept_candidate_recall = 100%`; 低置信跨 `ACCEPTED = 0`。 |
+| H4 修库消化、库位和出入库冲突处理 | `DepotSlotGraph`, `DepotSwapDelta`, `DEPOT_OUTBOUND`, `REPAIR_INBOUND`, `Obligation`, `ResourceDelta`, `ordered carry segments` | 可以。修库摘解、slot/band、stayer、swap 和必要出库腾位能被统一处理。 | `depot_digest_complete = true`; `swap_required_resolved_ratio = 100%`; 大库进出次数 `<= manual_depot_entry_exit_count`。 | `depot_slot_violation_accepted = 0`; `invalid_detach_count = 0`; H4 失败必须给 slot/swap/端别原因。 |
+| H5 尾项收束与库回 | `TAIL_CLOSEOUT`, `YARD_REBALANCE`, `FUNCTION_LINE_SERVICE`, `LOCO_AREA_STAGING`, `SPECIAL_REPAIR_PROCESS`, `Trace` | 可以。主合同完成后再处理库回、机区、功能线、存车整理和剩余目标。 | `tail_closeout_complete = true`; 总钩数 `<= manual_hook_count`。 | `final_target_satisfied = true`; `hard_violation_count = 0`; 主体债务未完 closeout `= 0`。 |
+
+因此：
+
+```text
+H1_passed
+  and H2_passed
+  and H3_passed
+  and H4_passed
+  and H5_passed
+  and all_phase_connections_passed
+  and hook_not_higher_than_human
+=> 人工阶段达到人工
+```
+
+其中：
+
+```text
+all_phase_connections_passed =
+  phase_gate_bypass_count = 0
+  and accepted_without_phase_permission_count = 0
+  and phase_transition_trace_coverage = 100%
+  and phase_obligation_carryover_error_count = 0
+```
+
+如果没有人工阶段级钩数切分，只能证明：
+
+```text
+case_hook_not_higher_than_human =
+  solver_hook_count <= manual_hook_count
+```
+
+不能证明：
+
+```text
+H1_hook_count <= manual_H1_hook_count
+H2_hook_count <= manual_H2_hook_count
+H3_hook_count <= manual_H3_hook_count
+H4_hook_count <= manual_H4_hook_count
+H5_hook_count <= manual_H5_hook_count
+```
+
+### 20C.7 为什么这些局部指标同时达标后足以达到或超越人工
+
+人工调车的优势不是枚举能力，而是结构判断：
+
+```text
+什么时候先整理外场；
+什么时候保护存4北；
+什么时候释放并机接；
+什么时候先出库腾位；
+什么时候入库摘解；
+什么时候才可以尾项收束；
+什么时候短链不应强套长链。
+```
+
+本方案要达到人工，必须把这些判断拆成可验证结构：
+
+| 人工判断 | 方案结构 | 充分条件 |
+|---|---|---|
+| 先把主体流分清 | `FlowClassify + StationFlowContract` | 主体合同覆盖 `>= 95%`，residual `<= 5%` |
+| 保护存4释放口 | `CUN4_NORTH_BUFFER + ResourceDelta` | 存4四态识别 `100%`，方向冲突 accepted `= 0` |
+| 机接后不乱拆 | `FlowEdgeStatus + Protection + ContractDelta` | protection broken accepted `= 0` |
+| 先出库腾位再入库 | `DepotSlotGraph + DepotSwapDelta + PhaseGate` | swap required resolved `= 100%` |
+| 库内摘解完成前不收尾 | `Obligation + TAIL_CLOSEOUT Gate` | `tail_before_primary_done_count = 0` |
+| 短链直接入库不套长链 | `RepairInboundVariant + PhaseSkip` | 代表变体准确 `100%` |
+| 低信号不冒进 | `OnlineObservable + Confidence + Gate` | 低置信跨 `ACCEPTED = 0` |
+| 少钩不破坏结构 | `ContractOptimizer + LocalTieBreakSearch` | search scope violation `= 0`; dominated accepted `= 0` |
+
+这些条件同时成立时，算法不是在模仿人工计划，而是在复现人工计划的结构判断，并用候选裁剪、资源显式仲裁和局部少钩搜索减少人工计划中的经验性往返。因此它具备达到人工的充分结构条件。
+
+要进一步超越人工，还必须满足：
+
+```text
+human_structural_value_preserved = true
+hard_violation_count = 0
+final_target_satisfied = true
+solver_hook_count <= manual_hook_count
+runtime <= 300s
+trace_field_coverage = 100%
+failure_bucket_coverage = 100%
+improved_secondary_metric_count >= 2
+```
+
+二级指标只允许从以下已定义指标计数：
+
+```text
+manual_switch_count
+manual_path_cost
+manual_loco_empty_distance
+manual_cun4_dirty_count
+manual_depot_entry_exit_count
+manual_depot_swap_conflict_count
+manual_temp_buffer_use_count
+```
+
 ## 21. 成功标准
 
 第一层：全站合同覆盖可解释
@@ -4559,4 +5829,261 @@ rtk python scripts/validate_flow_edge_foundation_experiments.py --sets truth2_fo
 3. 当 0310W、0103W 等人工错误模式能稳定标 hard violation 后，再打开 hard gate。
 4. DepotSlotGraph 先进入 TargetContractSelector 排序，不直接改 replay。
 5. loco_carry 保留 ordered sequence，4 值状态只作为资源标签。
+```
+
+---
+
+## 24. P0-P9 与 H1-H5 结构化 rollout 验证记录
+
+本节记录的是文档级结构方案的实施性验证，不等同于已经完成生产求解器。
+
+验证脚本：
+
+```text
+scripts/validate_phase_gates.py
+scripts/generate_p0_p4_trace.py
+scripts/generate_p5_candidate_trace.py
+scripts/generate_p6_resource_trace.py
+scripts/generate_p7_delta_trace.py
+scripts/generate_p8_optimization_trace.py
+scripts/generate_p9_state_update_trace.py
+scripts/generate_rollout_trace.py
+```
+
+主要产物：
+
+```text
+artifacts/phase_gate_audit/
+artifacts/p0_p4_trace/
+artifacts/p5_candidate_trace/
+artifacts/p6_resource_trace/
+artifacts/p7_delta_trace/
+artifacts/p8_optimization_trace/
+artifacts/p9_state_update_trace/
+artifacts/rollout_audit/
+```
+
+### 24.1 单步 P0-P9 结构审计结论
+
+最新审计命令：
+
+```bash
+rtk python scripts/validate_phase_gates.py --phase-trace artifacts/p0_p4_trace/phase_gate_records.csv --action-trace artifacts/p0_p4_trace/action_trace_records.csv --candidate-trace artifacts/p5_candidate_trace/candidate_trace_records.csv --resource-trace artifacts/p6_resource_trace/resource_trace_records.csv --delta-trace artifacts/p7_delta_trace/delta_trace_records.csv --optimization-trace artifacts/p8_optimization_trace/optimization_trace_records.csv --state-update-trace artifacts/p9_state_update_trace/state_update_trace_records.csv --check --output-dir artifacts/phase_gate_audit
+```
+
+结果：
+
+| 项 | 结果 |
+|---|---:|
+| manual_case_count | 118 |
+| truth_case_count | 113 |
+| matched_case_count | 107 |
+| p1_passed_case_count | 113 |
+| process_failed_row_count | 0 |
+| process_blocked_row_count | 48 |
+| action/candidate/resource/delta/optimization/state_update failed records | 0 |
+
+`process_blocked_row_count = 48` 来自 6 个 truth2 案例缺人工计划基线：
+
+```text
+0130W, 0209W, 0209Z, 0212Z, 0225Z, 0325Z
+```
+
+结论：P0-P9 的单步结构字段、候选、资源、delta、优化和状态更新 trace 可以通过审计；但这只证明单步闭环，不证明整案完成。
+
+### 24.2 多步结构化 rollout 结论
+
+`generate_rollout_trace.py` 把 P5-P9 串成多步结构化 rollout：读取 `truth2` 初始车辆状态，按 H 阶段选择候选，执行车辆所在股道的状态突变，记录每步候选、资源、hard gate、状态签名、累计勾数和人工软上界。
+
+它仍然不是完整物理路径求解器，尚未证明道岔路径、联线时间窗、调车机走行、端别、精确台位、携带顺序都可执行。
+
+最新结果：
+
+| 项 | 结果 |
+|---|---:|
+| truth_case_count | 113 |
+| matched_case_count | 107 |
+| completed_case_count | 107 |
+| blocked_case_count | 6 |
+| missing_manual_case_count | 6 |
+| total_hook_soft_pass_count | 105 |
+| phase_hook_soft_pass_case_count | 97 |
+| hard_violation_count | 0 |
+| state_loop_count | 0 |
+| rollout_gap_record_count | 23 |
+
+可证明部分：
+
+```text
+107 / 107 个有人工计划基线的 truth2 案例完成终态。
+hard_violation_count = 0。
+state_loop_count = 0。
+105 / 107 个匹配案例总勾数不超过人工计划软上界。
+97 / 107 个匹配案例 H 阶段勾数不超过人工计划阶段软上界。
+```
+
+不可证明或未达部分：
+
+```text
+6 个 truth2 案例缺人工计划基线，不能做严格人工对照。
+2 个匹配案例总勾数超过人工计划软上界：0306W, 0327W。
+10 个匹配案例存在阶段级超界。
+当前 rollout 是结构化状态突变，不是完整 runtime route solver。
+```
+
+### 24.3 剩余 gap 的结构归因
+
+`artifacts/rollout_audit/rollout_gap_audit.csv` 是下一步结构标准和实现的入口。
+
+当前 gap bucket：
+
+| failure_bucket | 数量 | 含义 | 下一步结构 |
+|---|---:|---|---|
+| `manual_baseline_missing` | 6 | truth2 缺可对照人工计划 | 补人工计划匹配或建立无人工基线验收标准 |
+| `LOW_SIGNAL_PHASE_CONTRACT_TOO_COMPRESSED` | 9 | 低信号/短链阶段合同过于压缩，H2/H4/H5 分母和动作边界不稳定 | `RepairInboundVariant + PhaseGate` 要量化保守路径 |
+| `FRONT_SERVICE_BATCHING_BELOW_MANUAL` | 4 | H1 前段服务仍按 source-target 批次，缺少人工式混合携带 | H1 需要 receiver-aware co-carry batching |
+| `DEPOT_SLOT_SWAP_BATCHING_BELOW_MANUAL` | 2 | H4 大库 swap 仍不能完全达到人工摘解压缩水平 | `DepotSlotGraph/DepotSwapDelta` 要合并兼容 slot/band exchange |
+| `CASE_TOTAL_HOOK_OVER_MANUAL_SOFT_BOUND` | 2 | 整案总勾数仍超过人工计划软上界 | `ContractOptimizer` 必须降低总勾数或证明人工省略了同类义务 |
+
+因此，当前方案不能严谨地表述为“已经达到甚至超越人工”。
+
+当前可以严谨表述为：
+
+```text
+FlowEdge + EdgeContract + StationResourceGraph + HumanPhaseContract 的结构方向已经能在匹配案例上形成可解闭环；
+P0-P9 单步结构审计通过；
+结构化 rollout 在 107 个匹配案例上终态完成；
+但要达到“全面不高于人工、甚至超越人工”，还必须补齐 H1 合批、低信号阶段合同、大库 slot/band swap 压缩、缺人工计划基线和完整物理路径求解器。
+```
+
+### 24.4 下一步实施顺序
+
+优先级不是继续写抽象文档，而是逐个关闭 `rollout_gap_audit.csv`：
+
+1. 低信号/短链路径：把 `MIXED_SIGNAL_REPAIR` 的 H2/H4/H5 阶段边界、允许动作和勾数上界固定下来。
+2. H1 前段合批：实现同 receiver、同方向、可同携带的 co-carry batching，目标关闭 `FRONT_SERVICE_BATCHING_BELOW_MANUAL`。
+3. H4 大库 swap 压缩：让 `DepotSlotGraph/DepotSwapDelta` 合并兼容库线和库外衔接位，目标关闭 `DEPOT_SLOT_SWAP_BATCHING_BELOW_MANUAL`。
+4. 缺人工计划基线：处理 `0130W, 0209W, 0209Z, 0212Z, 0225Z, 0325Z`，否则全量 truth2 不能严格人工对照。
+5. 接入真实 runtime route solver：把当前结构化状态突变升级为含路径、端别、联线、调车机位置、携带顺序的可执行钩计划。
+
+### 24.5 P10 剩余结构定量验收
+
+本节不再讨论“结构是否听起来合理”，只验收剩余结构是否真正把 P10 物理运行时的阻塞清掉。
+
+新增验证脚本：
+
+```text
+scripts/generate_physical_runtime_trace.py
+scripts/validate_remaining_structure_acceptance.py
+```
+
+主要产物：
+
+```text
+artifacts/physical_runtime_trace/
+artifacts/remaining_structure_acceptance/
+```
+
+执行命令：
+
+```bash
+rtk python scripts/generate_physical_runtime_trace.py --output-dir artifacts/physical_runtime_trace --check
+rtk python scripts/validate_remaining_structure_acceptance.py --output-dir artifacts/remaining_structure_acceptance
+```
+
+当前 P10 物理运行时结果：
+
+| 项 | 结果 |
+|---|---:|
+| truth_case_count | 113 |
+| completed_case_count | 3 |
+| blocked_case_count | 110 |
+| total_initial_unsatisfied_vehicle_count | 5821 |
+| total_final_unsatisfied_vehicle_count | 2542 |
+| generated_hook_count | 1847 |
+| generated_operation_count | 3700 |
+| hard_physical_violation_accepted_count | 0 |
+| unknown_route_count | 0 |
+| state_loop_count | 0 |
+
+这说明 P10 骨架已经能做到：
+
+```text
+接口输入可读取。
+路径图当前无 unknown route。
+硬物理违反不会被接受。
+状态没有循环。
+```
+
+但它还不能证明可解，因为只完成 3 / 113 个案例。
+
+#### 24.5.1 剩余结构验收表
+
+最终验收硬门槛：
+
+```text
+每个结构对应 gap_record_count = 0。
+每个结构对应 gap_case_count = 0。
+completed_case_count = truth_case_count。
+total_final_unsatisfied_vehicle_count = 0。
+hard_physical_violation_accepted_count = 0。
+unknown_route_count = 0。
+state_loop_count = 0。
+```
+
+当前结果：
+
+| 结构 | 当前状态 | gap records | gap cases | 验收上限 | 当前主要失败指标 | 下一步动作 |
+|---|---|---:|---:|---:|---|---|
+| `DepotSlotGraph + SpotSwapDelta` | failed | 2035 | 107 | 0 | `depot_slot_failure_count = 78`; slot/spot gap 未清零 | 建 slot occupancy graph、出库释放位、swap delta，入库前必须先证明目标位可释放 |
+| `CapacityAwareCandidateGenerator + ReleaseMoveSearch` | failed | 1307 | 104 | 0 | 目标线容量不足未清零 | 加 target-capacity lookahead、release candidate、合法拆批 |
+| `StagingSearch + CarryOrderPlanner` | failed | 1214 | 105 | 0 | 同线换位仍无 staging 搜索 | 生成临停路径和 ordered carry/drop segments |
+| `SourceBlockerRelocationSearch` | failed | 525 | 46 | 0 | 源线前端阻挡未清零 | 生成 blocker relocation 或 co-carry 候选 |
+| `OrderedSpotAllocator` | failed | 481 | 61 | 0 | `target_position_collision_inside_batch = 481` | 强制台位批次必须逐车分配合法有序 spot |
+| `P10 PhysicalValidator Runtime Gate` | failed | 0 | 0 | 0 | `completed_case_count = 3 / 113`; `final_unsatisfied = 2542` | 所有候选必须过 validator，并完成全量案例 |
+
+因此，当前不能说“剩下结构已经完成”。严谨结论是：
+
+```text
+剩下结构的验收框架已经建立；
+每个结构都有明确 gap bucket、记录数、案例数和验收阈值；
+但 6 个剩余结构当前全部未通过定量验收。
+```
+
+#### 24.5.2 结构完成后如何证明“全部可解”
+
+如果以下条件全部成立：
+
+```text
+DepotSlotGraph + SpotSwapDelta gap records = 0。
+CapacityAwareCandidateGenerator + ReleaseMoveSearch gap records = 0。
+StagingSearch + CarryOrderPlanner gap records = 0。
+SourceBlockerRelocationSearch gap records = 0。
+OrderedSpotAllocator gap records = 0。
+P10 final_unsatisfied_vehicle_count = 0。
+P10 hard_physical_violation_accepted_count = 0。
+P10 unknown_route_count = 0。
+P10 state_loop_count = 0。
+P10 completed_case_count = 113。
+```
+
+则可以证明：
+
+```text
+在当前接口、主数据、truth2 样本和业务规则覆盖范围内，求解器具备物理可执行的全量可解性。
+```
+
+但“达到甚至超越人工”还要额外满足：
+
+```text
+107 个有人工计划基线的匹配案例，总勾数不超过人工计划软上界。
+H1-H5 阶段勾数不超过人工阶段软上界。
+缺人工计划基线的 6 个案例要么补齐基线，要么建立无人工基线的独立验收上界。
+```
+
+也就是说：
+
+```text
+P10 剩余结构清零 = 证明可解。
+P10 清零 + P8 勾数对照通过 = 才能证明达到或超过人工。
 ```
