@@ -316,6 +316,8 @@ class PhaseState:
 class StrategyConfig:
     staging_priority: tuple[str, ...] = STAGING_LINE_PRIORITY
     depot_aware_staging: bool = False
+    enable_contract_planlets: bool = False
+    prefer_contract_planlets: bool = False
 
 
 @dataclass(frozen=True)
@@ -1955,6 +1957,7 @@ def hook_candidate(
     generation_reason: str,
     candidate_kind: str,
     plan_steps: tuple[PlanStep, ...] = (),
+    action_family_override: str | None = None,
 ) -> HookCandidate:
     move_nos = tuple(car_no(car) for car in batch)
     has_weigh = any(bool(car.get("IsWeigh")) for car in batch)
@@ -1975,7 +1978,7 @@ def hook_candidate(
         source_line=source_line,
         target_line=target_line,
         move_car_nos=move_nos,
-        action_family=action_family(source_line, target_line, has_weigh),
+        action_family=action_family_override or action_family(source_line, target_line, has_weigh),
         train_length_m=round(sum(car_length(car) for car in batch), 3),
         pull_equivalent_count=pull_equivalent(batch),
         has_weigh=has_weigh,
@@ -2070,6 +2073,70 @@ def depot_same_line_repack_candidate(
     )
 
 
+def same_line_reorder_planlet(
+    *,
+    case_id: str,
+    hook_index: int,
+    line: str,
+    seed_batch: list[dict[str, Any]],
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    grouped: dict[str, list[dict[str, Any]]],
+    generation_reason: str,
+) -> HookCandidate | None:
+    if not seed_batch or line in DEPOT_LINES:
+        return None
+    force_spots = sorted({position for car in seed_batch for position in force_positions(car)})
+    if not force_spots:
+        return None
+    seed_positions = [int(car.get("Position") or 0) for car in seed_batch]
+    window_start = min([*seed_positions, *force_spots])
+    window_end = max([*seed_positions, *force_spots])
+    window = [
+        car
+        for car in grouped.get(line, [])
+        if window_start <= int(car.get("Position") or 0) <= window_end
+    ]
+    if not window or pull_equivalent(window) > PULL_LIMIT_EQUIVALENT:
+        return None
+    if not reverse_length_fits(line, line, window):
+        return None
+
+    window_nos = {car_no(car) for car in window}
+    planned_positions = planned_positions_for_batch(
+        batch=window,
+        target_line=line,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        batch_nos=window_nos,
+        grouped=grouped,
+    )
+    if len(planned_positions) != len(window):
+        return None
+    if not candidate_positions_available(line, planned_positions, cars, window_nos, grouped):
+        return None
+    if all(int(car.get("Position") or 0) == planned_positions.get(car_no(car), 0) for car in window):
+        return None
+
+    steps = (
+        PlanStep("Get", line, tuple(car_no(car) for car in window)),
+        PlanStep("Put", line, tuple(car_no(car) for car in window), planned_positions),
+    )
+    return planlet_candidate(
+        case_id=case_id,
+        hook_index=hook_index,
+        source_line=line,
+        target_line=line,
+        batch=window,
+        generation_reason=(
+            f"{generation_reason};window={window_start}-{window_end};"
+            f"vehicle_count={len(window)}"
+        ),
+        candidate_kind="same_line_reorder_planlet",
+        steps=steps,
+    )
+
+
 def staging_candidate_for_batch(
     *,
     case_id: str,
@@ -2122,6 +2189,7 @@ def planlet_candidate(
     generation_reason: str,
     candidate_kind: str,
     steps: tuple[PlanStep, ...],
+    action_family_override: str | None = None,
 ) -> HookCandidate:
     planned_positions: dict[str, int] = {}
     for step in steps:
@@ -2136,6 +2204,7 @@ def planlet_candidate(
         generation_reason=generation_reason,
         candidate_kind=candidate_kind,
         plan_steps=steps,
+        action_family_override=action_family_override,
     )
 
 
@@ -2323,6 +2392,210 @@ def multi_pick_planlets(
             )
         )
     return candidates
+
+
+def contract_carry_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+    contract_name: str,
+    candidate_kind: str,
+    source_filter: Any,
+    target_filter: Any,
+    max_sources: int = 4,
+    max_targets: int = 4,
+) -> list[HookCandidate]:
+    source_batches: list[tuple[str, list[dict[str, Any]]]] = []
+    for line, line_cars in sorted(grouped.items()):
+        if not source_filter(line):
+            continue
+        first = next((car for car in line_cars if not satisfied(car)), None)
+        if first is None:
+            continue
+        batch: list[dict[str, Any]] = []
+        for car in line_cars:
+            if satisfied(car):
+                break
+            target_line, _position, _reason = planned(car)
+            if not target_line or target_line == line or not target_filter(target_line) or car.get("IsWeigh"):
+                if batch:
+                    break
+                continue
+            if pull_equivalent([*batch, car]) > PULL_LIMIT_EQUIVALENT:
+                break
+            batch.append(car)
+            if len({planned(item)[0] for item in batch}) >= max_targets:
+                break
+        if batch:
+            source_batches.append((line, batch))
+
+    candidates: list[HookCandidate] = []
+    if len(source_batches) < 2:
+        return candidates
+
+    source_batches.sort(key=lambda item: (item[0] not in REMOTE_INTERACTION_LINES, item[0]))
+    carry: list[dict[str, Any]] = []
+    selected_sources: list[tuple[str, list[dict[str, Any]]]] = []
+    target_groups: dict[str, list[dict[str, Any]]] = {}
+    target_order: list[str] = []
+    for line, batch in source_batches:
+        selected_batch: list[dict[str, Any]] = []
+        for car in batch:
+            target_line, _position, _reason = planned(car)
+            if target_line not in target_groups and len(target_order) >= max_targets:
+                continue
+            if pull_equivalent([*carry, car]) > PULL_LIMIT_EQUIVALENT:
+                break
+            selected_batch.append(car)
+            carry.append(car)
+            if target_line not in target_groups:
+                target_groups[target_line] = []
+                target_order.append(target_line)
+            target_groups[target_line].append(car)
+        if selected_batch:
+            selected_sources.append((line, selected_batch))
+        if len(selected_sources) >= max_sources or len(target_order) >= max_targets:
+            break
+
+    if len(selected_sources) < 2 or len(carry) < 3 or len(target_order) < 2:
+        return candidates
+
+    all_nos = {car_no(car) for car in carry}
+    put_steps: list[PlanStep] = []
+    accepted_target_nos: set[str] = set()
+    for target_line in target_order:
+        batch = target_groups[target_line]
+        positions = planned_positions_for_batch(
+            batch=batch,
+            target_line=target_line,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            batch_nos=all_nos,
+            grouped=grouped,
+        )
+        if len(positions) != len(batch):
+            continue
+        if not candidate_positions_available(target_line, positions, cars, all_nos, grouped):
+            continue
+        if not line_has_length_capacity(target_line, cars, batch, all_nos, length_load_lookup, grouped):
+            continue
+        target_nos = tuple(car_no(car) for car in batch)
+        accepted_target_nos.update(target_nos)
+        put_steps.append(PlanStep("Put", target_line, target_nos, positions))
+
+    if len(put_steps) < 2 or len(accepted_target_nos) < 3:
+        return candidates
+
+    filtered_sources: list[tuple[str, list[dict[str, Any]]]] = []
+    filtered_carry: list[dict[str, Any]] = []
+    for line, batch in selected_sources:
+        filtered_batch = [car for car in batch if car_no(car) in accepted_target_nos]
+        if not filtered_batch:
+            continue
+        filtered_sources.append((line, filtered_batch))
+        filtered_carry.extend(filtered_batch)
+    if len(filtered_sources) < 2 or len(filtered_carry) < 3:
+        return candidates
+
+    steps: list[PlanStep] = [
+        PlanStep("Get", line, tuple(car_no(car) for car in batch))
+        for line, batch in filtered_sources
+    ]
+    steps.extend(put_steps)
+
+    candidates.append(
+        planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=filtered_sources[0][0],
+            target_line=put_steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                f"{candidate_kind};contract={contract_name};"
+                f"source_count={len(filtered_sources)};target_count={len(put_steps)};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind=candidate_kind,
+            steps=tuple(steps),
+            action_family_override=contract_name,
+        )
+    )
+    return candidates
+
+
+def h1_carry_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+) -> list[HookCandidate]:
+    front_targets = {
+        "洗罐站",
+        "洗罐线北",
+        "油漆线",
+        "抛丸线",
+        "调梁棚",
+        "调梁线北",
+        "预修线",
+        "机走棚",
+        "机走北",
+    }
+    return contract_carry_planlets(
+        case_id=case_id,
+        hook_index=hook_index,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        planned=planned,
+        satisfied=satisfied,
+        length_load_lookup=length_load_lookup,
+        grouped=grouped,
+        contract_name="FUNCTION_LINE_SERVICE",
+        candidate_kind="h1_carry_planlet",
+        source_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line in front_targets and line not in REMOTE_INTERACTION_LINES,
+        max_sources=4,
+        max_targets=4,
+    )
+
+
+def remote_exchange_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+) -> list[HookCandidate]:
+    return contract_carry_planlets(
+        case_id=case_id,
+        hook_index=hook_index,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        planned=planned,
+        satisfied=satisfied,
+        length_load_lookup=length_load_lookup,
+        grouped=grouped,
+        contract_name="REPAIR_INBOUND",
+        candidate_kind="remote_exchange_planlet",
+        source_filter=lambda line: line in REMOTE_INTERACTION_LINES or line not in RUNNING_LINES,
+        target_filter=lambda line: line in DEPOT_TARGET_LINES or line in {"存4线", "油漆线", "卸轮线"},
+        max_sources=4,
+        max_targets=4,
+    )
 
 
 def source_clear_and_restore_planlet(
@@ -2651,10 +2924,13 @@ def route_clear_planlets_for_candidate(
 def candidate_sort_key(candidate: HookCandidate) -> tuple[int, tuple[int, str, str], int, str]:
     kind_priority = {
         "remote_session_planlet": 2,
+        "remote_exchange_planlet": 3,
+        "h1_carry_planlet": 4,
         "multi_drop_planlet": 5,
         "multi_pick_planlet": 8,
         "source_clear_restore_planlet": 9,
         "source_exit_clear_restore_planlet": 9,
+        "same_line_reorder_planlet": 9,
         "route_clear_restore_planlet": 12,
         "target_move": 10,
         "depot_same_line_repack": 15,
@@ -2685,6 +2961,7 @@ def build_candidates(
     depot_aware_staging: bool = False,
     graph: TrackGraph | None = None,
     loco_location: LocoLocation | None = None,
+    enable_contract_planlets: bool = False,
 ) -> tuple[list[HookCandidate], list[CandidateAuditRow]]:
     planlet_candidates: list[HookCandidate] = []
     direct_candidates: list[HookCandidate] = []
@@ -2796,6 +3073,21 @@ def build_candidates(
                     )
                     if repack:
                         tail_candidates.append(repack)
+                reorder = same_line_reorder_planlet(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    line=target_line,
+                    seed_batch=stage_batch,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    grouped=grouped,
+                    generation_reason=(
+                        f"tail_same_line_reorder;vehicle={car_no(car)};"
+                        f"target_line={target_line};batch_count={len(stage_batch)}"
+                    ),
+                )
+                if reorder:
+                    tail_candidates.append(reorder)
                 stage = None
                 while stage_batch and stage is None:
                     stage = staging_candidate_for_batch(
@@ -3053,6 +3345,22 @@ def build_candidates(
                 if repack:
                     direct_candidates.append(repack)
                     continue
+            reorder = same_line_reorder_planlet(
+                case_id=case_id,
+                hook_index=hook_index,
+                line=target_line,
+                seed_batch=stage_batch,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                grouped=grouped,
+                generation_reason=(
+                    f"same_line_reorder;vehicle={car_no(first_unsatisfied)};"
+                    f"target_line={target_line};batch_count={len(stage_batch)}"
+                ),
+            )
+            if reorder:
+                planlet_candidates.append(reorder)
+                continue
             stage = None
             while stage_batch and stage is None:
                 stage = staging_candidate_for_batch(
@@ -3235,6 +3543,31 @@ def build_candidates(
             remote_only=True,
         )
     )
+    if enable_contract_planlets:
+        planlet_candidates.extend(
+            h1_carry_planlets(
+                case_id=case_id,
+                hook_index=hook_index,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                planned=planned,
+                satisfied=satisfied,
+                length_load_lookup=length_load_lookup(),
+                grouped=grouped,
+            )
+        )
+        planlet_candidates.extend(
+            remote_exchange_planlets(
+                case_id=case_id,
+                hook_index=hook_index,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                planned=planned,
+                satisfied=satisfied,
+                length_load_lookup=length_load_lookup(),
+                grouped=grouped,
+            )
+        )
 
     unique: dict[str, HookCandidate] = {}
     for candidate in [*tail_candidates, *planlet_candidates, *direct_candidates, *release_candidates, *staging_candidates]:
@@ -3448,7 +3781,12 @@ class PhysicalValidator:
                     has_weigh=any(bool(car.get("IsWeigh")) for car in batch),
                     plan_steps=(),
                 )
-                reasons.extend(self._validate_target_positions(step_candidate, working_cars, batch, [car for car in working_cars if car["Line"] == step.line]))
+                existing_target_cars = [
+                    car
+                    for car in working_cars
+                    if car["Line"] == step.line and car_no(car) not in carried
+                ]
+                reasons.extend(self._validate_target_positions(step_candidate, working_cars, batch, existing_target_cars))
                 reasons.extend(self._validate_closed_door(step_candidate, batch))
                 if reasons:
                     break
@@ -3978,6 +4316,22 @@ def contract_zero_or_negative_allowed(candidate: HookCandidate, reduction: int, 
     return False
 
 
+def contract_trace_has_unlock_owner(row: ContractTraceRow) -> bool:
+    if row.unsatisfied_reduction > 0 or row.non_depot_unsatisfied_reduction > 0:
+        return True
+    return row.structural_intent in {
+        "TARGET_CAPACITY_RELEASE_TO_STAGING",
+        "TARGET_CAPACITY_RELEASE_TO_TARGET",
+        "TARGET_SPOT_RELEASE_TO_STAGING",
+        "TARGET_SPOT_RELEASE_TO_TARGET",
+        "SOURCE_FRONT_BLOCKER_RELOCATION",
+        "SAME_LINE_REPOSITION_STAGE_OUT",
+        "SOURCE_CLEAR_RESTORE_PLANLET",
+        "SOURCE_EXIT_CLEAR_RESTORE_PLANLET",
+        "ROUTE_CLEAR_RESTORE_PLANLET",
+    }
+
+
 def structural_reject_reason(
     *,
     candidate: HookCandidate,
@@ -4064,6 +4418,47 @@ def aligned_selection_key(
     )
 
 
+def contract_planlet_selection_key(
+    item: tuple[HookCandidate, PhysicalValidation, str],
+    *,
+    transition_metrics: Any,
+    phase_state: PhaseState,
+    last_hook_touched_remote: bool,
+    remote_streak_count: int,
+) -> tuple[int, int, int, int, int, int, int, tuple[int, int, tuple[int, tuple[int, str, str], int, str]]]:
+    candidate, _validation, phase_reason = item
+    reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, item[1])
+    hook_count = max(1, planlet_business_hook_count(candidate))
+    continue_remote_session = (
+        last_hook_touched_remote
+        and remote_streak_count < REMOTE_CONTINUITY_MAX_STREAK
+    )
+    continuity_penalty = (
+        0
+        if not continue_remote_session or candidate_touches_remote_interaction(candidate)
+        else 1
+    )
+    phase_penalty = 1 if phase_reason else 0
+    template_priority = 0 if candidate.candidate_kind in {
+        "remote_exchange_planlet",
+        "h1_carry_planlet",
+        "remote_session_planlet",
+        "multi_drop_planlet",
+        "multi_pick_planlet",
+    } else 1
+    remote_cross_penalty = planlet_remote_cross_count(candidate) if candidate.plan_steps else int(remote_cross_for_candidate(candidate))
+    return (
+        phase_penalty,
+        -reduction,
+        -non_depot_reduction,
+        template_priority,
+        hook_count,
+        remote_cross_penalty,
+        continuity_penalty,
+        phase_candidate_sort_key(candidate, phase_state),
+    )
+
+
 def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
     status_rank = {"completed": 0, "blocked": 1, "invalid_input": 2}
     left_key = (
@@ -4134,42 +4529,63 @@ def run_case_with_diagnostics(
         capacities,
         base_assignment,
     )
+    def strategy_variants(
+        prefix: str,
+        depot_assignment: DepotAssignment,
+        short_direct_override: bool,
+    ) -> list[tuple[str, DepotAssignment, bool, StrategyConfig]]:
+        return [
+            (prefix, depot_assignment, short_direct_override, StrategyConfig()),
+            (
+                f"{prefix}_contract_planlet",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(enable_contract_planlets=True),
+            ),
+            (
+                f"{prefix}_contract_planlet_prefer",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(enable_contract_planlets=True, prefer_contract_planlets=True),
+            ),
+            (
+                f"{prefix}_depot_staging",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(depot_aware_staging=True),
+            ),
+            (
+                f"{prefix}_depot_staging_contract_planlet",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(depot_aware_staging=True, enable_contract_planlets=True),
+            ),
+            (
+                f"{prefix}_depot_staging_contract_planlet_prefer",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(
+                    depot_aware_staging=True,
+                    enable_contract_planlets=True,
+                    prefer_contract_planlets=True,
+                ),
+            ),
+        ]
+
     strategies: list[tuple[str, DepotAssignment, bool, StrategyConfig]] = [
-        ("phase_gate_base", base_assignment, False, StrategyConfig()),
-        (
-            "phase_gate_base_depot_staging",
-            base_assignment,
-            False,
-            StrategyConfig(depot_aware_staging=True),
-        ),
+        *strategy_variants("phase_gate_base", base_assignment, False),
     ]
     if strategy_mode == DIAGNOSTIC_STRATEGY_MODE:
         strategies.append(("early_depot_base", base_assignment, True, StrategyConfig()))
     if is_short_direct_depot_variant(case_id) or short_chain_manual:
-        strategies = [
-            ("short_direct_cluster", clustered_assignment, True, StrategyConfig()),
-            (
-                "short_direct_cluster_depot_staging",
-                clustered_assignment,
-                True,
-                StrategyConfig(depot_aware_staging=True),
-            ),
-        ]
+        strategies = strategy_variants("short_direct_cluster", clustered_assignment, True)
     elif (
         len(clustered_assignment.failures) <= len(base_assignment.failures)
         and len(clustered_assignment.slots) >= len(base_assignment.slots)
         and depot_source_fragmentation_score(normalized_cars, clustered_assignment)
         < depot_source_fragmentation_score(normalized_cars, base_assignment)
     ):
-        strategies.append(("phase_gate_cluster", clustered_assignment, False, StrategyConfig()))
-        strategies.append(
-            (
-                "phase_gate_cluster_depot_staging",
-                clustered_assignment,
-                False,
-                StrategyConfig(depot_aware_staging=True),
-            )
-        )
+        strategies.extend(strategy_variants("phase_gate_cluster", clustered_assignment, False))
         if strategy_mode == DIAGNOSTIC_STRATEGY_MODE:
             strategies.append(("early_depot_cluster", clustered_assignment, True, StrategyConfig()))
 
@@ -4278,6 +4694,7 @@ def _run_case_once(
             depot_aware_staging=strategy_config.depot_aware_staging,
             graph=graph,
             loco_location=loco_location,
+            enable_contract_planlets=strategy_config.enable_contract_planlets,
         )
         candidates = sorted(candidates, key=lambda candidate: phase_candidate_sort_key(candidate, phase_state))
         candidate_rows.extend(blocked_rows)
@@ -4365,6 +4782,7 @@ def _run_case_once(
                 depot_aware_staging=strategy_config.depot_aware_staging,
                 graph=graph,
                 loco_location=next_loco_location,
+                enable_contract_planlets=strategy_config.enable_contract_planlets,
             )
             for next_candidate in next_candidates:
                 if validator.validate(next_candidate, prospective_cars, next_loco_location).accepted:
@@ -4401,6 +4819,14 @@ def _run_case_once(
                 and not (manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS)
             ):
                 return aligned_selection_key(
+                    item,
+                    transition_metrics=transition_metrics,
+                    phase_state=phase_state,
+                    last_hook_touched_remote=last_hook_touched_remote,
+                    remote_streak_count=remote_streak_count,
+                )
+            if strategy_config.prefer_contract_planlets:
+                return contract_planlet_selection_key(
                     item,
                     transition_metrics=transition_metrics,
                     phase_state=phase_state,
@@ -5193,7 +5619,13 @@ def build_structural_repair_acceptance_rows(
         for reason, count in summary.rejection_reason_counts.items()
         if reason.startswith("human_phase_contract")
     )
-    zero_or_negative = sum(1 for row in contract_rows if row.unsatisfied_reduction <= 0 and row.non_depot_unsatisfied_reduction <= 0)
+    zero_or_negative = sum(
+        1
+        for row in contract_rows
+        if row.unsatisfied_reduction <= 0
+        and row.non_depot_unsatisfied_reduction <= 0
+        and not contract_trace_has_unlock_owner(row)
+    )
     p4_rejects = sum(
         count
         for reason, count in summary.rejection_reason_counts.items()
@@ -5244,7 +5676,7 @@ def build_structural_repair_acceptance_rows(
             "R2_TargetContractSelector",
             zero_or_negative == 0,
             f"zero_or_negative_delta={zero_or_negative};p4_rejects={p4_rejects}",
-            "zero_or_negative_delta=0 unless unlock reason exists",
+            "zero_or_negative_delta_without_owner=0",
             "contract_trace.csv",
             "TargetContractSelector",
         ),
