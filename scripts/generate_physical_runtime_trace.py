@@ -429,6 +429,20 @@ class RemoteSessionState:
 
 
 @dataclass(frozen=True)
+class RemoteTransitionBudget:
+    limit: int | None
+    current_count: int
+    last_business_hook_remote: bool | None
+
+    def candidate_transition_count(self, candidate: HookCandidate) -> int:
+        return candidate_remote_business_transition_count(candidate, self.last_business_hook_remote)
+
+    def over_budget_after(self, candidate: HookCandidate) -> bool:
+        transition_count = self.candidate_transition_count(candidate)
+        return bool(self.limit is not None and self.current_count + transition_count > self.limit)
+
+
+@dataclass(frozen=True)
 class CandidateAuditRow:
     case_id: str
     hook_index: int
@@ -819,6 +833,60 @@ class StructureWorkAuditRow:
     gap_reason: str
     evidence: str
     next_required_component: str
+
+
+@dataclass(frozen=True)
+class RemoteSessionPlanTraceRow:
+    case_id: str
+    solve_strategy: str
+    observed_session_id: int
+    session_type: str
+    start_business_hook_index: int
+    end_business_hook_index: int
+    remote_business_hook_count: int
+    candidate_count: int
+    structural_intents: str
+    remote_profiles: str
+    owner_candidate_count: int
+    ownerless_candidate_count: int
+    internal_remote_transition_count: int
+    manual_variant: str
+    manual_remote_transition_budget: int
+    solver_remote_transition_count: int
+    target_session_count: int
+    budget_overage_after_session: int
+    required_component: str
+
+
+@dataclass(frozen=True)
+class RemoteTransitionAttributionRow:
+    case_id: str
+    solve_strategy: str
+    transition_index: int
+    from_business_hook_index: int
+    to_business_hook_index: int
+    from_hook_index: int
+    to_hook_index: int
+    from_candidate_id: str
+    to_candidate_id: str
+    from_line: str
+    to_line: str
+    transition_type: str
+    same_candidate: bool
+    from_structural_intent: str
+    to_structural_intent: str
+    from_remote_profile: str
+    to_remote_profile: str
+    from_has_remote_owner: bool
+    to_has_remote_owner: bool
+    owner_status: str
+    manual_variant: str
+    manual_remote_transition_budget: int
+    solver_remote_transition_count: int
+    transition_over_manual_plus_1: bool
+    transition_over_manual_plus_2: bool
+    attribution_reason: str
+    required_component: str
 
 
 @dataclass
@@ -7542,6 +7610,16 @@ def run_case_with_diagnostics(
                 ),
             ),
             (
+                f"{prefix}_remote_session_only_contract",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(
+                    depot_aware_staging=True,
+                    enable_remote_session_contracts=True,
+                    enable_remote_session_bundle_contracts=True,
+                ),
+            ),
+            (
                 f"{prefix}_remote_session_contract",
                 depot_assignment,
                 short_direct_override,
@@ -7640,6 +7718,16 @@ def run_case_with_diagnostics(
     if cluster_feasible and not cluster_preferred:
         strategies.extend(
             [
+                (
+                    "phase_gate_cluster_remote_session_only_contract",
+                    clustered_assignment,
+                    False,
+                    StrategyConfig(
+                        depot_aware_staging=True,
+                        enable_remote_session_contracts=True,
+                        enable_remote_session_bundle_contracts=True,
+                    ),
+                ),
                 (
                     "phase_gate_cluster_remote_session_contract",
                     clustered_assignment,
@@ -7908,11 +7996,14 @@ def _run_case_once(
             )
             return remote_debt_cache[candidate.candidate_id]
 
-        current_remote_business_transition_count = operation_remote_business_transition_count(operations)
-        remote_business_transition_budget = (
-            manual_baseline.remote_business_transition_count + 2
-            if manual_baseline and manual_baseline.remote_business_transition_count
-            else None
+        remote_transition_budget = RemoteTransitionBudget(
+            limit=(
+                manual_baseline.remote_business_transition_count + 2
+                if manual_baseline and manual_baseline.remote_business_transition_count
+                else None
+            ),
+            current_count=operation_remote_business_transition_count(operations),
+            last_business_hook_remote=last_business_hook_remote,
         )
 
         def has_followup_candidate(prospective_cars: list[dict[str, Any]], next_loco_location: LocoLocation) -> bool:
@@ -7969,14 +8060,7 @@ def _run_case_once(
 
         def selection_key(item: tuple[HookCandidate, PhysicalValidation, str]) -> Any:
             candidate = item[0]
-            candidate_transition_count = candidate_remote_business_transition_count(
-                candidate,
-                last_business_hook_remote,
-            )
-            transition_over_budget = (
-                remote_business_transition_budget is not None
-                and current_remote_business_transition_count + candidate_transition_count > remote_business_transition_budget
-            )
+            transition_over_budget = remote_transition_budget.over_budget_after(candidate)
             if len(current_unsatisfied) <= 6 and candidate.has_weigh and not item[2]:
                 return (
                     0,
@@ -8981,6 +9065,309 @@ def build_final_capacity_warning_rows(case_rows: list[CaseSummaryRow]) -> list[F
     return rows
 
 
+def contract_trace_has_remote_owner(row: ContractTraceRow | None) -> bool:
+    if row is None:
+        return False
+    if "remote_session_owner" in row.hard_obligations or "remote_cross_owner" in row.hard_obligations:
+        return True
+    if "remote_session_bundle_owner" in row.hard_obligations:
+        return True
+    return row.structural_intent in {
+        "REMOTE_SESSION_CONTRACT",
+        "REMOTE_SESSION_BUNDLE_CONTRACT",
+        "REMOTE_CORRIDOR_CONTRACT",
+        "DEPOT_DIGEST_PLANLET",
+        "DEPOT_SLOT_SWAP_PLANLET",
+        "SHORT_CHAIN_PLANLET",
+    }
+
+
+def manual_transition_budget_for_case(
+    case_id: str,
+    manual_by_case: dict[str, ManualVsSolverCaseCompareRow],
+) -> int:
+    baseline = manual_by_case.get(case_id)
+    if baseline is None:
+        return 0
+    return baseline.remote_transition_limit_plus_2
+
+
+def target_remote_session_count_for_case(
+    case_id: str,
+    manual_by_case: dict[str, ManualVsSolverCaseCompareRow],
+) -> int:
+    baseline = manual_by_case.get(case_id)
+    if baseline is None:
+        return 0
+    return baseline.manual_remote_session_count
+
+
+def classify_observed_remote_session(
+    *,
+    session_index: int,
+    session_count: int,
+    manual_variant: str,
+    structural_intents: set[str],
+    remote_profiles: set[str],
+) -> str:
+    if manual_variant in SHORT_CHAIN_VARIANTS:
+        return "SHORT_DIRECT_REMOTE"
+    if structural_intents <= {"DEPOT_SAME_LINE_REPACK"}:
+        return "REMOTE_INTERNAL_REPACK"
+    if "REMOTE_SESSION_BUNDLE_CONTRACT" in structural_intents:
+        return "REMOTE_BUNDLE"
+    if any(profile == REMOTE_PROFILE_REMOTE_TO_FRONT for profile in remote_profiles) and not any(
+        profile == REMOTE_PROFILE_FRONT_TO_REMOTE for profile in remote_profiles
+    ):
+        return "REMOTE_OUTBOUND_RELEASE"
+    if any(profile == REMOTE_PROFILE_FRONT_TO_REMOTE for profile in remote_profiles) and not any(
+        profile == REMOTE_PROFILE_REMOTE_TO_FRONT for profile in remote_profiles
+    ):
+        return "REMOTE_INBOUND_DIGEST"
+    if session_count <= 1:
+        return "REMOTE_SINGLE_SESSION"
+    if session_index == 1:
+        return "REMOTE_PRE_DIGEST"
+    if session_index == session_count:
+        return "REMOTE_FINAL_DIGEST"
+    return "REMOTE_INTERMEDIATE"
+
+
+def operation_business_rows_by_case(
+    operation_rows: list[OperationTraceRow],
+) -> dict[str, list[tuple[int, OperationTraceRow]]]:
+    rows_by_case: dict[str, list[OperationTraceRow]] = defaultdict(list)
+    for row in operation_rows:
+        if row.action in {"Get", "Put"}:
+            rows_by_case[row.case_id].append(row)
+    indexed: dict[str, list[tuple[int, OperationTraceRow]]] = {}
+    for case_id, rows in rows_by_case.items():
+        ordered = sorted(rows, key=lambda item: (item.hook_index, item.operation_index))
+        indexed[case_id] = [(index, row) for index, row in enumerate(ordered, start=1)]
+    return indexed
+
+
+def build_remote_transition_attribution_rows(
+    *,
+    case_rows: list[CaseSummaryRow],
+    operation_rows: list[OperationTraceRow],
+    contract_rows: list[ContractTraceRow],
+    manual_vs_solver_rows: list[ManualVsSolverCaseCompareRow],
+) -> list[RemoteTransitionAttributionRow]:
+    case_by_id = {row.case_id: row for row in case_rows}
+    contract_by_candidate = {row.candidate_id: row for row in contract_rows}
+    manual_by_case = {row.case_id: row for row in manual_vs_solver_rows}
+    business_rows_by_case = operation_business_rows_by_case(operation_rows)
+    rows: list[RemoteTransitionAttributionRow] = []
+
+    for case_id, business_rows in sorted(business_rows_by_case.items()):
+        case_row = case_by_id.get(case_id)
+        if case_row is None:
+            continue
+        baseline = manual_by_case.get(case_id)
+        manual_budget = manual_transition_budget_for_case(case_id, manual_by_case)
+        manual_plus_1 = baseline.remote_transition_limit_plus_1 if baseline else 0
+        manual_plus_2 = baseline.remote_transition_limit_plus_2 if baseline else 0
+        previous: tuple[int, OperationTraceRow, bool] | None = None
+        transition_index = 0
+        for business_index, row in business_rows:
+            current_remote = row.line in REMOTE_INTERACTION_LINES
+            if previous is None:
+                previous = (business_index, row, current_remote)
+                continue
+            previous_index, previous_row, previous_remote = previous
+            if current_remote == previous_remote:
+                previous = (business_index, row, current_remote)
+                continue
+            transition_index += 1
+            from_contract = contract_by_candidate.get(previous_row.candidate_id)
+            to_contract = contract_by_candidate.get(row.candidate_id)
+            from_owner = contract_trace_has_remote_owner(from_contract)
+            to_owner = contract_trace_has_remote_owner(to_contract)
+            same_candidate = previous_row.candidate_id == row.candidate_id
+            transition_type = "FRONT_TO_REMOTE" if current_remote else "REMOTE_TO_FRONT"
+            over_plus_1 = bool(manual_plus_1 and transition_index > manual_plus_1)
+            over_plus_2 = bool(manual_plus_2 and transition_index > manual_plus_2)
+            if same_candidate and not (from_owner and to_owner):
+                attribution_reason = "internal_transition_without_remote_owner"
+                required_component = "RemoteSessionStateMachine"
+            elif same_candidate:
+                attribution_reason = "internal_session_transition"
+                required_component = "RemoteSessionPlanner"
+            elif not (from_owner or to_owner):
+                attribution_reason = "boundary_transition_without_remote_owner"
+                required_component = "RemoteSessionStateMachine"
+            elif over_plus_2:
+                attribution_reason = "transition_budget_exceeded"
+                required_component = "RemoteTransitionBudget"
+            else:
+                attribution_reason = "session_boundary_transition"
+                required_component = "RemoteSessionPlanner"
+            if same_candidate and (
+                (from_contract and from_contract.remote_profile == REMOTE_PROFILE_MIXED)
+                or (to_contract and to_contract.remote_profile == REMOTE_PROFILE_MIXED)
+            ):
+                required_component = "FlowEdgeOwnedSessionTemplate"
+            owner_status = (
+                "both_owned"
+                if from_owner and to_owner
+                else "from_owned"
+                if from_owner
+                else "to_owned"
+                if to_owner
+                else "ownerless"
+            )
+            rows.append(
+                RemoteTransitionAttributionRow(
+                    case_id=case_id,
+                    solve_strategy=case_row.solve_strategy,
+                    transition_index=transition_index,
+                    from_business_hook_index=previous_index,
+                    to_business_hook_index=business_index,
+                    from_hook_index=previous_row.hook_index,
+                    to_hook_index=row.hook_index,
+                    from_candidate_id=previous_row.candidate_id,
+                    to_candidate_id=row.candidate_id,
+                    from_line=previous_row.line,
+                    to_line=row.line,
+                    transition_type=transition_type,
+                    same_candidate=same_candidate,
+                    from_structural_intent=from_contract.structural_intent if from_contract else "",
+                    to_structural_intent=to_contract.structural_intent if to_contract else "",
+                    from_remote_profile=from_contract.remote_profile if from_contract else "",
+                    to_remote_profile=to_contract.remote_profile if to_contract else "",
+                    from_has_remote_owner=from_owner,
+                    to_has_remote_owner=to_owner,
+                    owner_status=owner_status,
+                    manual_variant=baseline.manual_variant if baseline else "",
+                    manual_remote_transition_budget=manual_budget,
+                    solver_remote_transition_count=case_row.remote_business_transition_count,
+                    transition_over_manual_plus_1=over_plus_1,
+                    transition_over_manual_plus_2=over_plus_2,
+                    attribution_reason=attribution_reason,
+                    required_component=required_component,
+                )
+            )
+            previous = (business_index, row, current_remote)
+    return rows
+
+
+def build_remote_session_plan_trace_rows(
+    *,
+    case_rows: list[CaseSummaryRow],
+    operation_rows: list[OperationTraceRow],
+    contract_rows: list[ContractTraceRow],
+    manual_vs_solver_rows: list[ManualVsSolverCaseCompareRow],
+    transition_rows: list[RemoteTransitionAttributionRow],
+) -> list[RemoteSessionPlanTraceRow]:
+    case_by_id = {row.case_id: row for row in case_rows}
+    manual_by_case = {row.case_id: row for row in manual_vs_solver_rows}
+    contract_by_candidate = {row.candidate_id: row for row in contract_rows}
+    business_rows_by_case = operation_business_rows_by_case(operation_rows)
+    transition_count_by_case_and_end: dict[tuple[str, int], int] = {}
+    transition_counter: Counter[str] = Counter()
+    for row in sorted(
+        transition_rows,
+        key=lambda item: (item.case_id, item.transition_index),
+    ):
+        transition_counter[row.case_id] = row.transition_index
+        transition_count_by_case_and_end[(row.case_id, row.to_business_hook_index)] = row.transition_index
+
+    rows: list[RemoteSessionPlanTraceRow] = []
+    for case_id, business_rows in sorted(business_rows_by_case.items()):
+        case_row = case_by_id.get(case_id)
+        if case_row is None:
+            continue
+        baseline = manual_by_case.get(case_id)
+        manual_budget = manual_transition_budget_for_case(case_id, manual_by_case)
+        target_session_count = target_remote_session_count_for_case(case_id, manual_by_case)
+        candidate_order: list[tuple[int, int, str, bool]] = []
+        seen_candidates: set[str] = set()
+        for business_index, operation in business_rows:
+            if operation.candidate_id in seen_candidates:
+                continue
+            seen_candidates.add(operation.candidate_id)
+            contract = contract_by_candidate.get(operation.candidate_id)
+            touches_remote = bool(contract and contract.remote_profile != REMOTE_PROFILE_FRONT_ONLY)
+            candidate_order.append((operation.hook_index, business_index, operation.candidate_id, touches_remote))
+
+        sessions: list[list[tuple[int, int, str, bool]]] = []
+        current: list[tuple[int, int, str, bool]] = []
+        for item in candidate_order:
+            if item[3]:
+                current.append(item)
+            elif current:
+                sessions.append(current)
+                current = []
+        if current:
+            sessions.append(current)
+
+        for session_index, session in enumerate(sessions, start=1):
+            candidate_ids = [item[2] for item in session]
+            session_contracts = [contract_by_candidate[candidate_id] for candidate_id in candidate_ids if candidate_id in contract_by_candidate]
+            first_business_index = session[0][1]
+            last_business_index = session[-1][1]
+            remote_business_hook_count = sum(
+                1
+                for business_index, operation in business_rows
+                if first_business_index <= business_index <= last_business_index
+                and operation.line in REMOTE_INTERACTION_LINES
+            )
+            structural_intents = {row.structural_intent for row in session_contracts}
+            remote_profiles = {row.remote_profile for row in session_contracts}
+            owner_count = sum(1 for row in session_contracts if contract_trace_has_remote_owner(row))
+            ownerless_count = len(session_contracts) - owner_count
+            internal_remote_transition_count = sum(row.internal_remote_transition_count for row in session_contracts)
+            transitions_until_end = max(
+                (
+                    count
+                    for (transition_case_id, end_index), count in transition_count_by_case_and_end.items()
+                    if transition_case_id == case_id and end_index <= last_business_index
+                ),
+                default=0,
+            )
+            budget_overage = max(0, transitions_until_end - manual_budget) if manual_budget else 0
+            if ownerless_count:
+                required_component = "RemoteSessionStateMachine"
+            elif budget_overage:
+                required_component = "RemoteTransitionBudget"
+            elif any(profile == REMOTE_PROFILE_MIXED for profile in remote_profiles):
+                required_component = "FlowEdgeOwnedSessionTemplate"
+            else:
+                required_component = "RemoteSessionPlanner"
+            session_type = classify_observed_remote_session(
+                session_index=session_index,
+                session_count=len(sessions),
+                manual_variant=baseline.manual_variant if baseline else "",
+                structural_intents=structural_intents,
+                remote_profiles=remote_profiles,
+            )
+            rows.append(
+                RemoteSessionPlanTraceRow(
+                    case_id=case_id,
+                    solve_strategy=case_row.solve_strategy,
+                    observed_session_id=session_index,
+                    session_type=session_type,
+                    start_business_hook_index=first_business_index,
+                    end_business_hook_index=last_business_index,
+                    remote_business_hook_count=remote_business_hook_count,
+                    candidate_count=len(session_contracts),
+                    structural_intents="|".join(sorted(structural_intents)),
+                    remote_profiles="|".join(sorted(remote_profiles)),
+                    owner_candidate_count=owner_count,
+                    ownerless_candidate_count=ownerless_count,
+                    internal_remote_transition_count=internal_remote_transition_count,
+                    manual_variant=baseline.manual_variant if baseline else "",
+                    manual_remote_transition_budget=manual_budget,
+                    solver_remote_transition_count=case_row.remote_business_transition_count,
+                    target_session_count=target_session_count,
+                    budget_overage_after_session=budget_overage,
+                    required_component=required_component,
+                )
+            )
+    return rows
+
+
 def remote_owner_candidate_ids(contract_rows: list[ContractTraceRow]) -> set[str]:
     return {
         row.candidate_id
@@ -9591,6 +9978,19 @@ def run(args: argparse.Namespace) -> int:
     short_chain_rows = build_short_chain_rows(all_case_rows, all_operation_rows, manual_baselines)
     capacity_rows = build_capacity_consistency_rows(all_case_rows)
     final_capacity_warning_rows = build_final_capacity_warning_rows(all_case_rows)
+    remote_transition_rows = build_remote_transition_attribution_rows(
+        case_rows=all_case_rows,
+        operation_rows=all_operation_rows,
+        contract_rows=all_diagnostics.contract_rows,
+        manual_vs_solver_rows=manual_vs_solver_rows,
+    )
+    remote_session_plan_rows = build_remote_session_plan_trace_rows(
+        case_rows=all_case_rows,
+        operation_rows=all_operation_rows,
+        contract_rows=all_diagnostics.contract_rows,
+        manual_vs_solver_rows=manual_vs_solver_rows,
+        transition_rows=remote_transition_rows,
+    )
     structure_work_rows = build_structure_work_audit_rows(
         case_rows=all_case_rows,
         phase_rows=all_diagnostics.phase_rows,
@@ -9623,6 +10023,8 @@ def run(args: argparse.Namespace) -> int:
     write_csv(output_dir / "candidate_dominance_audit.csv", [asdict(row) for row in all_diagnostics.dominance_rows])
     write_csv(output_dir / "candidate_pool_audit.csv", [asdict(row) for row in all_diagnostics.candidate_pool_rows])
     write_csv(output_dir / "depot_session_audit.csv", [asdict(row) for row in all_diagnostics.depot_session_rows])
+    write_csv(output_dir / "remote_session_plan_trace.csv", [asdict(row) for row in remote_session_plan_rows])
+    write_csv(output_dir / "remote_transition_attribution.csv", [asdict(row) for row in remote_transition_rows])
     write_csv(output_dir / "short_chain_diagnostic.csv", [asdict(row) for row in short_chain_rows])
     write_csv(output_dir / "capacity_consistency_audit.csv", [asdict(row) for row in capacity_rows])
     write_csv(output_dir / "final_capacity_warning_audit.csv", [asdict(row) for row in final_capacity_warning_rows])
