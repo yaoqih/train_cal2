@@ -3851,6 +3851,7 @@ def planned_unsatisfied_by_line(
     source_filter: Any,
     target_filter: Any,
     max_per_line: int = 20,
+    include_same_line: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
     for line, line_cars in grouped.items():
@@ -3861,7 +3862,12 @@ def planned_unsatisfied_by_line(
             if satisfied(car):
                 continue
             target_line, _position, _reason = planned(car)
-            if not target_line or target_line == line or not target_filter(target_line) or car.get("IsWeigh"):
+            if (
+                not target_line
+                or (target_line == line and not include_same_line)
+                or not target_filter(target_line)
+                or car.get("IsWeigh")
+            ):
                 continue
             batch.append(car)
             if len(batch) >= max_per_line:
@@ -4344,6 +4350,7 @@ def remote_session_contract_planlets(
         satisfied=satisfied,
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: True,
+        include_same_line=True,
     )
     inbound_sources = planned_unsatisfied_by_line(
         grouped=grouped,
@@ -4436,6 +4443,7 @@ def remote_session_bundle_planlets(
         satisfied=satisfied,
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        include_same_line=True,
         max_per_line=8,
     )
     inbound_sources = planned_unsatisfied_by_line(
@@ -7369,24 +7377,27 @@ def remote_session_selection_key(
     phase_state: PhaseState,
     remote_session_state: RemoteSessionState,
     last_business_hook_remote: bool | None = None,
-) -> tuple[int, int, int, int, int, int, int, tuple[int, int, tuple[int, tuple[int, str, str], int, str]]]:
+) -> tuple[int, int, int, int, int, int, int, int, tuple[int, int, tuple[int, tuple[int, str, str], int, str]]]:
     candidate, validation, phase_reason = item
     reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, validation)
-    remote_reduction, _after_remote_debt = remote_debt_metrics(candidate, validation)
+    remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
     hook_count = max(1, planlet_business_hook_count(candidate))
     touched_remote = candidate_touches_remote_interaction(candidate)
     remote_transition_count = candidate_remote_business_transition_count(candidate, last_business_hook_remote)
+    ends_remote = candidate_ends_remote(candidate)
     role = candidate_remote_session_role(candidate)
     if not touched_remote:
         role = 9
     if candidate.candidate_kind in REMOTE_SESSION_RESTORE_KINDS and (reduction <= 0 and non_depot_reduction <= 0):
         role = 10
+    unfinished_exit_penalty = 1 if after_remote_debt > 0 and not ends_remote else 0
     return (
         1 if phase_reason else 0,
         role,
+        unfinished_exit_penalty,
         -remote_reduction,
         remote_transition_count,
-        1 if remote_session_state.batch_index >= remote_session_state.max_batch_count and candidate_ends_remote(candidate) else 0,
+        1 if remote_session_state.batch_index >= remote_session_state.max_batch_count and ends_remote else 0,
         -reduction,
         -non_depot_reduction,
         hook_count,
@@ -7492,25 +7503,11 @@ def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
     if left_primary != right_primary:
         return left_primary < right_primary
 
-    hook_slack = max(3, round(right.business_get_put_hook_count * 0.10))
-    remote_slack = 2
-    if (
-        left.business_get_put_hook_count <= right.business_get_put_hook_count + hook_slack
-        and left.remote_business_transition_count + remote_slack < right.remote_business_transition_count
-    ):
+    remote_slack = 1
+    if left.remote_business_transition_count + remote_slack < right.remote_business_transition_count:
         return True
-    if (
-        right.business_get_put_hook_count <= left.business_get_put_hook_count + hook_slack
-        and right.remote_business_transition_count + remote_slack < left.remote_business_transition_count
-    ):
+    if right.remote_business_transition_count + remote_slack < left.remote_business_transition_count:
         return False
-    if left.business_get_put_hook_count > right.business_get_put_hook_count + hook_slack:
-        return False
-    if right.business_get_put_hook_count > left.business_get_put_hook_count + hook_slack:
-        return True
-
-    if left.remote_business_transition_count != right.remote_business_transition_count:
-        return left.remote_business_transition_count < right.remote_business_transition_count
 
     left_remote = (
         left.remote_interaction_cross_count,
@@ -7524,6 +7521,16 @@ def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
     )
     if left_remote != right_remote:
         return left_remote < right_remote
+
+    if left.remote_business_transition_count != right.remote_business_transition_count:
+        return left.remote_business_transition_count < right.remote_business_transition_count
+
+    hook_slack = max(3, round(right.business_get_put_hook_count * 0.10))
+    if left.business_get_put_hook_count > right.business_get_put_hook_count + hook_slack:
+        return False
+    if right.business_get_put_hook_count > left.business_get_put_hook_count + hook_slack:
+        return True
+
     return (
         left.business_get_put_hook_count,
         left.internal_move_batch_count,
