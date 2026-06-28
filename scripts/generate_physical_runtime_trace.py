@@ -35,6 +35,12 @@ DEPOT_TARGET_LINES = DEPOT_LINES | DEPOT_OUTSIDE_LINES
 REMOTE_INTERACTION_LINES = DEPOT_TARGET_LINES | {"卸轮线"}
 REMOTE_CORRIDOR_LINES = {"机走棚", "预修线", "存4线"}
 SHORT_DIRECT_DEPOT_CASE_IDS = {"0213W", "0306W", "0327W"}
+REMOTE_PROFILE_FRONT_ONLY = "FRONT_ONLY"
+REMOTE_PROFILE_REMOTE_ONLY = "REMOTE_ONLY"
+REMOTE_PROFILE_FRONT_TO_REMOTE = "FRONT_TO_REMOTE"
+REMOTE_PROFILE_REMOTE_TO_FRONT = "REMOTE_TO_FRONT"
+REMOTE_PROFILE_MIXED = "MIXED_REMOTE_FRONT"
+REMOTE_PROFILE_NONE = "NONE"
 RUNNING_LINES = {"联6", "联7"} | {f"渡{index}" for index in range(1, 14)}
 WEIGH_LINE = "机库线"
 STAGING_CANDIDATE_KINDS = {
@@ -44,6 +50,7 @@ STAGING_CANDIDATE_KINDS = {
     "spot_release_to_staging",
 }
 REMOTE_SESSION_CONTRACT_KINDS = {
+    "remote_session_bundle_planlet",
     "remote_session_contract_planlet",
     "remote_corridor_planlet",
     "depot_digest_planlet",
@@ -74,6 +81,10 @@ OWNERLESS_RECOVERY_KINDS = {
     "source_exit_clear_restore_planlet",
     "route_clear_restore_planlet",
 }
+OWNER_BOUND_RESTORE_KINDS = {
+    "source_exit_clear_restore_planlet",
+    "route_clear_restore_planlet",
+}
 REMOTE_CROSS_OWNER_KINDS = REMOTE_SESSION_CONTRACT_KINDS | {
     "remote_exchange_planlet",
     "remote_session_planlet",
@@ -86,6 +97,7 @@ REMOTE_CROSS_OWNER_FAMILIES = {
 }
 REMOTE_SESSION_PRIMARY_KINDS = {
     "short_chain_planlet",
+    "remote_session_bundle_planlet",
     "remote_session_contract_planlet",
     "depot_digest_planlet",
     "depot_slot_swap_planlet",
@@ -402,6 +414,7 @@ class StrategyConfig:
     enable_contract_planlets: bool = False
     prefer_contract_planlets: bool = False
     enable_remote_session_contracts: bool = False
+    enable_remote_session_bundle_contracts: bool = False
     front_debt_first: bool = False
     enable_front_capacity_contracts: bool = False
     suppress_ownerless_recovery: bool = False
@@ -588,6 +601,8 @@ class ContractTraceRow:
     candidate_id: str
     selected_contract: str
     structural_intent: str
+    remote_profile: str
+    internal_remote_transition_count: int
     source_line: str
     target_line: str
     owner_vehicle_count: int
@@ -1052,6 +1067,37 @@ def planlet_remote_cross_count(candidate: HookCandidate) -> int:
         for left, right in zip(lines, lines[1:])
         if (left in REMOTE_INTERACTION_LINES) != (right in REMOTE_INTERACTION_LINES)
     )
+
+
+def candidate_internal_remote_transition_count(candidate: HookCandidate) -> int:
+    return planlet_remote_cross_count(candidate)
+
+
+def candidate_remote_profile(candidate: HookCandidate) -> str:
+    lines = planlet_line_sequence(candidate)
+    if not lines:
+        return REMOTE_PROFILE_NONE
+    remote_flags = [line in REMOTE_INTERACTION_LINES for line in lines]
+    if not any(remote_flags):
+        return REMOTE_PROFILE_FRONT_ONLY
+    if all(remote_flags):
+        return REMOTE_PROFILE_REMOTE_ONLY
+    transition_count = sum(1 for left, right in zip(remote_flags, remote_flags[1:]) if left != right)
+    if transition_count > 1:
+        return REMOTE_PROFILE_MIXED
+    return REMOTE_PROFILE_FRONT_TO_REMOTE if remote_flags[-1] else REMOTE_PROFILE_REMOTE_TO_FRONT
+
+
+def candidate_allowed_internal_remote_transitions(candidate: HookCandidate) -> int:
+    if candidate.candidate_kind in {
+        "short_chain_planlet",
+        "remote_session_bundle_planlet",
+        "remote_exchange_planlet",
+        "remote_session_contract_planlet",
+        *OWNER_BOUND_RESTORE_KINDS,
+    }:
+        return 2
+    return 1
 
 
 def candidate_remote_business_transition_count(
@@ -1696,8 +1742,12 @@ def spotting_south_buffer_count(
     forced: tuple[int, ...],
     depot_assignment: DepotAssignment,
 ) -> int:
+    total = SPOTTING_LINE_TOTAL_POSITIONS.get(target_line, 0)
     count = 0
     for car in reversed(line_cars_sorted(cars, target_line)):
+        position = int(car.get("Position") or 0)
+        if total and not 1 <= position <= total:
+            continue
         no = car_no(car)
         if no in depot_assignment.slots:
             break
@@ -3330,7 +3380,9 @@ def source_line_digest_planlet(
         hook_index=hook_index,
     ):
         return None
-    if len(target_groups) < 2 or len(carry) < 3:
+    min_target_groups = 2
+    min_target_vehicles = 3
+    if len(target_groups) < min_target_groups or len(carry) < min_target_vehicles:
         return None
     if not restore_batch and sum(len(batch) for batch in target_groups.values()) < 4:
         return None
@@ -3364,7 +3416,7 @@ def source_line_digest_planlet(
             accepted_puts.extend(probe_steps)
             accepted_nos.update(car_no(car) for car in batch)
 
-    if len(accepted_puts) < 2 or len(accepted_nos) < 3:
+    if len(accepted_puts) < min_target_groups or len(accepted_nos) < min_target_vehicles:
         return None
     if source_digest_corridor_risk_rejected(
         target_lines={step.line for step in accepted_puts},
@@ -3599,6 +3651,9 @@ def contract_carry_planlets(
 
     if len(selected_sources) < 2 or len(carry) < 3 or len(target_order) < 2:
         return candidates
+
+    if candidate_kind == "remote_exchange_planlet":
+        target_order.sort(key=lambda line: (line in REMOTE_INTERACTION_LINES, line != "存4线", line))
 
     all_nos = {car_no(car) for car in carry}
     put_steps: list[PlanStep] = []
@@ -4079,38 +4134,6 @@ def depot_digest_planlets(
         target_order_key=lambda line: (line not in DEPOT_LINES, line),
     )
     candidates.extend(candidate for candidate in (outbound, inbound, internal) if candidate)
-
-    mixed_sources: list[tuple[str, list[dict[str, Any]]]] = []
-    mixed_carry: list[dict[str, Any]] = []
-    for source_groups in (selected_outbound, selected_inbound, selected_internal):
-        for line, batch in source_groups:
-            selected: list[dict[str, Any]] = []
-            for car in batch:
-                if pull_equivalent([*mixed_carry, car]) > PULL_LIMIT_EQUIVALENT:
-                    break
-                selected.append(car)
-                mixed_carry.append(car)
-            if selected:
-                mixed_sources.append((line, selected))
-            if pull_equivalent(mixed_carry) >= PULL_LIMIT_EQUIVALENT or len(mixed_sources) >= 6:
-                break
-        if pull_equivalent(mixed_carry) >= PULL_LIMIT_EQUIVALENT or len(mixed_sources) >= 6:
-            break
-    mixed = build_digest(
-        name="mixed_outbound_then_inbound",
-        source_groups=mixed_sources,
-        carry=mixed_carry,
-        min_vehicle_count=4,
-        action_family_name="REPAIR_INBOUND",
-        target_order_key=lambda line: (
-            line in REMOTE_INTERACTION_LINES,
-            line != "存4线",
-            line not in DEPOT_LINES,
-            line,
-        ),
-    )
-    if mixed:
-        candidates.append(mixed)
     return candidates
 
 
@@ -4298,7 +4321,10 @@ def remote_session_contract_planlets(
     steps, carry = build_carry_drop_steps(
         selected_sources=selected_sources,
         target_groups=target_groups,
-        target_order=[*sorted(remote_targets), *sorted(non_remote_targets, key=lambda line: (line != "存4线", line))],
+        target_order=[
+            *sorted(non_remote_targets, key=lambda line: (line != "存4线", line)),
+            *sorted(remote_targets),
+        ],
         cars=cars,
         depot_assignment=depot_assignment,
         grouped=grouped,
@@ -4323,6 +4349,113 @@ def remote_session_contract_planlets(
         action_family_override="REPAIR_INBOUND" if remote_targets else "DEPOT_OUTBOUND",
     )
     return [candidate]
+
+
+def remote_session_bundle_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+) -> list[HookCandidate]:
+    outbound_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        max_per_line=8,
+    )
+    inbound_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        max_per_line=8,
+    )
+    if not outbound_sources or not inbound_sources:
+        return []
+
+    selected_outbound, outbound_carry = select_source_batches(
+        outbound_sources,
+        max_sources=3,
+        max_per_source=6,
+        remote_first=True,
+    )
+    selected_inbound, inbound_carry = select_source_batches(
+        inbound_sources,
+        max_sources=3,
+        max_per_source=6,
+        remote_first=False,
+    )
+    if len(outbound_carry) < 3 or len(inbound_carry) < 3:
+        return []
+
+    candidates: list[HookCandidate] = []
+    for mode, selected_sources, carry, target_key, family in (
+        (
+            "outbound_then_inbound",
+            [*selected_outbound, *selected_inbound],
+            [*outbound_carry, *inbound_carry],
+            lambda line: (line in REMOTE_INTERACTION_LINES, line != "存4线", line),
+            "REMOTE_SESSION_BUNDLE",
+        ),
+        (
+            "inbound_then_outbound",
+            [*selected_inbound, *selected_outbound],
+            [*inbound_carry, *outbound_carry],
+            lambda line: (line not in REMOTE_INTERACTION_LINES, line not in DEPOT_LINES, line),
+            "REMOTE_SESSION_BUNDLE",
+        ),
+    ):
+        if pull_equivalent(carry) > PULL_LIMIT_EQUIVALENT:
+            continue
+        target_groups = target_groups_for_carry(carry, planned)
+        target_order = sorted(target_groups, key=target_key)
+        steps, filtered_carry = build_carry_drop_steps(
+            selected_sources=selected_sources,
+            target_groups=target_groups,
+            target_order=target_order,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            grouped=grouped,
+            length_load_lookup=length_load_lookup,
+        )
+        if len(steps) < 4 or len(filtered_carry) < 6:
+            continue
+        filtered_nos = {car_no(car) for car in filtered_carry}
+        filtered_outbound = [car for car in outbound_carry if car_no(car) in filtered_nos]
+        filtered_inbound = [car for car in inbound_carry if car_no(car) in filtered_nos]
+        if len(filtered_outbound) < 3 or len(filtered_inbound) < 3:
+            continue
+        candidate = planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=steps[0].line,
+            target_line=steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                f"remote_session_bundle_contract;mode={mode};"
+                f"outbound_count={len(filtered_outbound)};inbound_count={len(filtered_inbound)};"
+                f"source_count={len([step for step in steps if step.action == 'Get'])};"
+                f"target_count={len([step for step in steps if step.action == 'Put'])};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind="remote_session_bundle_planlet",
+            steps=tuple(steps),
+            action_family_override=family,
+        )
+        if candidate_remote_profile(candidate) != REMOTE_PROFILE_MIXED:
+            continue
+        if candidate_internal_remote_transition_count(candidate) != 2:
+            continue
+        candidates.append(candidate)
+    return candidates[:2]
 
 
 def remote_corridor_planlets(
@@ -4494,7 +4627,7 @@ def short_chain_planlets(
     steps, carry = build_carry_drop_steps(
         selected_sources=selected_sources,
         target_groups=target_groups,
-        target_order=sorted(target_groups, key=lambda line: (line not in REMOTE_INTERACTION_LINES, line != "存4线", line)),
+        target_order=sorted(target_groups, key=lambda line: (line in REMOTE_INTERACTION_LINES, line != "存4线", line)),
         cars=cars,
         depot_assignment=depot_assignment,
         grouped=grouped,
@@ -5140,6 +5273,7 @@ def candidate_sort_key(candidate: HookCandidate) -> tuple[int, tuple[int, str, s
     kind_priority = {
         "short_chain_planlet": 0,
         "remote_session_contract_planlet": 1,
+        "remote_session_bundle_planlet": 1,
         "depot_digest_planlet": 1,
         "depot_slot_swap_planlet": 1,
         "route_clear_session_planlet": 2,
@@ -5189,6 +5323,7 @@ def build_candidates(
     loco_location: LocoLocation | None = None,
     enable_contract_planlets: bool = False,
     enable_remote_session_contracts: bool = False,
+    enable_remote_session_bundle_contracts: bool = False,
     enable_front_capacity_contracts: bool = False,
     suppress_ownerless_recovery: bool = False,
     manual_baseline: ManualBaseline | None = None,
@@ -5236,9 +5371,9 @@ def build_candidates(
             grouped=grouped,
             staging_priority=staging_priority,
             depot_aware_staging=depot_aware_staging,
-            include_restore=not suppress_ownerless_recovery,
+            include_restore=not suppress_ownerless_recovery or candidate_touches_remote_interaction(candidate),
         ):
-            if planlet.candidate_kind in OWNERLESS_RECOVERY_KINDS:
+            if planlet.candidate_kind in OWNERLESS_RECOVERY_KINDS and not owner_bound_restore_candidate(planlet):
                 legacy_recovery_candidates.append(planlet)
             else:
                 planlet_candidates.append(planlet)
@@ -5897,6 +6032,19 @@ def build_candidates(
             )
         )
     if enable_remote_session_contracts:
+        if enable_remote_session_bundle_contracts:
+            planlet_candidates.extend(
+                remote_session_bundle_planlets(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    planned=planned,
+                    satisfied=satisfied,
+                    length_load_lookup=length_load_lookup(),
+                    grouped=grouped,
+                )
+            )
         planlet_candidates.extend(
             depot_digest_planlets(
                 case_id=case_id,
@@ -6712,6 +6860,7 @@ def structural_intent(candidate: HookCandidate) -> str:
         "spot_release_to_staging": "TARGET_SPOT_RELEASE_TO_STAGING",
         "blocker_relocation": "SOURCE_FRONT_BLOCKER_RELOCATION",
         "remote_session_contract_planlet": "REMOTE_SESSION_CONTRACT",
+        "remote_session_bundle_planlet": "REMOTE_SESSION_BUNDLE_CONTRACT",
         "remote_corridor_planlet": "REMOTE_CORRIDOR_CONTRACT",
         "depot_digest_planlet": "DEPOT_DIGEST_PLANLET",
         "depot_slot_swap_planlet": "DEPOT_SLOT_SWAP_PLANLET",
@@ -6731,6 +6880,8 @@ def hard_obligations_for_candidate(candidate: HookCandidate) -> str:
         obligations.extend(["release_depot_blocker", "preserve_cun4_capacity"])
     if candidate.candidate_kind in {"front_capacity_release_contract_planlet", "front_capacity_digest_planlet"}:
         obligations.extend(["capacity_release_owner", "front_service_recovery_owner"])
+    if candidate.candidate_kind == "remote_session_bundle_planlet":
+        obligations.extend(["remote_session_bundle_owner", "single_entry_exit_remote_contract"])
     if (
         candidate_touches_remote_interaction(candidate)
         and (
@@ -6764,6 +6915,8 @@ def protections_for_candidate(candidate: HookCandidate, expected_phase: str) -> 
         protections.append("protect_remote_session_continuity")
     if candidate.candidate_kind in REMOTE_SESSION_CONTRACT_KINDS:
         protections.append("protect_remote_session_contract")
+    if candidate.candidate_kind == "remote_session_bundle_planlet":
+        protections.append("protect_single_remote_entry_exit")
     return "|".join(protections)
 
 
@@ -6853,6 +7006,8 @@ def remote_cross_has_owner(candidate: HookCandidate) -> bool:
 def contract_zero_or_negative_allowed(candidate: HookCandidate, reduction: int, non_depot_reduction: int) -> bool:
     if reduction > 0 or non_depot_reduction > 0:
         return True
+    if owner_bound_restore_candidate(candidate):
+        return True
     if candidate.candidate_kind in OWNER_BOUND_RECOVERY_KINDS:
         return True
     if candidate_touches_remote_interaction(candidate) and candidate.action_family in {
@@ -6864,7 +7019,26 @@ def contract_zero_or_negative_allowed(candidate: HookCandidate, reduction: int, 
     return False
 
 
+def owner_bound_remote_unlock_candidate(candidate: HookCandidate) -> bool:
+    return (
+        candidate.candidate_kind in {"route_clear_session_planlet", "source_exit_session_planlet"}
+        and candidate.action_family in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}
+        and candidate_remote_profile(candidate) != REMOTE_PROFILE_MIXED
+        and remote_cross_has_owner(candidate)
+    )
+
+
+def owner_bound_restore_candidate(candidate: HookCandidate) -> bool:
+    return (
+        candidate.candidate_kind in OWNER_BOUND_RESTORE_KINDS
+        and candidate_touches_remote_interaction(candidate)
+        and remote_cross_has_owner(candidate)
+    )
+
+
 def contract_trace_has_unlock_owner(row: ContractTraceRow) -> bool:
+    if "owner" in row.hard_obligations:
+        return True
     if row.unsatisfied_reduction > 0 or row.non_depot_unsatisfied_reduction > 0:
         return True
     return row.structural_intent in {
@@ -6884,6 +7058,7 @@ def structural_reject_reason(
     phase_reason: str,
     reduction: int,
     non_depot_reduction: int,
+    after_unsatisfied: int,
     physically_accepted: list[tuple[HookCandidate, PhysicalValidation, str]],
     transition_metrics: Any,
     repair_mode: str,
@@ -6891,6 +7066,22 @@ def structural_reject_reason(
 ) -> str:
     hook_count = max(1, planlet_business_hook_count(candidate))
     remote_cross_count = planlet_remote_cross_count(candidate)
+    internal_remote_transitions = candidate_internal_remote_transition_count(candidate)
+    allowed_internal_remote_transitions = candidate_allowed_internal_remote_transitions(candidate)
+
+    if internal_remote_transitions > allowed_internal_remote_transitions:
+        return (
+            "p8_reject_mixed_remote_front_candidate:"
+            f"kind={candidate.candidate_kind}:profile={candidate_remote_profile(candidate)}:"
+            f"internal_remote_transitions={internal_remote_transitions}:"
+            f"allowed={allowed_internal_remote_transitions}"
+        )
+
+    if owner_bound_restore_candidate(candidate) and after_unsatisfied > 6:
+        return (
+            "p7_reject_non_tail_owner_bound_restore:"
+            f"kind={candidate.candidate_kind}:after_unsatisfied={after_unsatisfied}"
+        )
 
     def better_non_recovery_available() -> bool:
         for other_candidate, other_validation, other_phase_reason in physically_accepted:
@@ -6918,7 +7109,12 @@ def structural_reject_reason(
         "remote_corridor_planlet",
     }:
         min_reduction = 2 if hook_count <= 4 else 3
-        if reduction < min_reduction and non_depot_reduction <= 0 and better_non_recovery_available():
+        if (
+            reduction < min_reduction
+            and non_depot_reduction <= 0
+            and not owner_bound_restore_candidate(candidate)
+            and better_non_recovery_available()
+        ):
             return (
                 "p7_reject_low_yield_restore_session:"
                 f"kind={candidate.candidate_kind}:business_hooks={hook_count}:"
@@ -6926,7 +7122,12 @@ def structural_reject_reason(
             )
     if candidate.candidate_kind in {"route_clear_session_planlet", "source_exit_session_planlet"}:
         min_reduction = 2 if hook_count <= 4 else 3
-        if reduction < min_reduction and non_depot_reduction <= 0 and better_non_recovery_available():
+        if (
+            reduction < min_reduction
+            and non_depot_reduction <= 0
+            and not owner_bound_remote_unlock_candidate(candidate)
+            and better_non_recovery_available()
+        ):
             return (
                 "p7_reject_low_yield_corridor_session:"
                 f"kind={candidate.candidate_kind}:business_hooks={hook_count}:"
@@ -6948,7 +7149,7 @@ def structural_reject_reason(
         candidate.candidate_kind in OWNERLESS_RECOVERY_KINDS
         and reduction <= 0
         and non_depot_reduction <= 0
-        and better_non_recovery_available()
+        and not owner_bound_restore_candidate(candidate)
     ):
         return (
             "p4_contract_selector_reject_ownerless_nonpositive_recovery:"
@@ -6965,6 +7166,7 @@ def structural_reject_reason(
         candidate.candidate_kind in OWNERLESS_RECOVERY_KINDS
         and reduction <= 0
         and non_depot_reduction <= 0
+        and not owner_bound_restore_candidate(candidate)
     ):
         return (
             "p4_contract_selector_reject_ownerless_nonpositive_recovery:"
@@ -7239,14 +7441,15 @@ def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
     if right.business_get_put_hook_count > left.business_get_put_hook_count + hook_slack:
         return True
 
+    if left.remote_business_transition_count != right.remote_business_transition_count:
+        return left.remote_business_transition_count < right.remote_business_transition_count
+
     left_remote = (
-        left.remote_business_transition_count,
         left.remote_interaction_cross_count,
         left.remote_interaction_batch_count,
         left.remote_interaction_session_count,
     )
     right_remote = (
-        right.remote_business_transition_count,
         right.remote_interaction_cross_count,
         right.remote_interaction_batch_count,
         right.remote_interaction_session_count,
@@ -7351,6 +7554,20 @@ def run_case_with_diagnostics(
                     suppress_ownerless_recovery=True,
                 ),
             ),
+            (
+                f"{prefix}_remote_session_bundle_contract",
+                depot_assignment,
+                short_direct_override,
+                StrategyConfig(
+                    depot_aware_staging=True,
+                    enable_contract_planlets=True,
+                    prefer_contract_planlets=True,
+                    enable_remote_session_contracts=True,
+                    enable_remote_session_bundle_contracts=True,
+                    enable_front_capacity_contracts=True,
+                    suppress_ownerless_recovery=True,
+                ),
+            ),
         ]
 
     cluster_feasible = (
@@ -7421,20 +7638,36 @@ def run_case_with_diagnostics(
         *strategy_variants("phase_gate_base", base_assignment, False),
     ]
     if cluster_feasible and not cluster_preferred:
-        strategies.append(
-            (
-                "phase_gate_cluster_remote_session_contract",
-                clustered_assignment,
-                False,
-                StrategyConfig(
-                    depot_aware_staging=True,
-                    enable_contract_planlets=True,
-                    prefer_contract_planlets=True,
-                    enable_remote_session_contracts=True,
-                    enable_front_capacity_contracts=True,
-                    suppress_ownerless_recovery=True,
+        strategies.extend(
+            [
+                (
+                    "phase_gate_cluster_remote_session_contract",
+                    clustered_assignment,
+                    False,
+                    StrategyConfig(
+                        depot_aware_staging=True,
+                        enable_contract_planlets=True,
+                        prefer_contract_planlets=True,
+                        enable_remote_session_contracts=True,
+                        enable_front_capacity_contracts=True,
+                        suppress_ownerless_recovery=True,
+                    ),
                 ),
-            )
+                (
+                    "phase_gate_cluster_remote_session_bundle_contract",
+                    clustered_assignment,
+                    False,
+                    StrategyConfig(
+                        depot_aware_staging=True,
+                        enable_contract_planlets=True,
+                        prefer_contract_planlets=True,
+                        enable_remote_session_contracts=True,
+                        enable_remote_session_bundle_contracts=True,
+                        enable_front_capacity_contracts=True,
+                        suppress_ownerless_recovery=True,
+                    ),
+                ),
+            ]
         )
     if strategy_mode == DIAGNOSTIC_STRATEGY_MODE:
         strategies.append(("early_depot_base", base_assignment, True, StrategyConfig()))
@@ -7549,6 +7782,9 @@ def _run_case_once(
         )
         effective_enable_contract_planlets = strategy_config.enable_contract_planlets or aligned_mode
         effective_enable_remote_session_contracts = strategy_config.enable_remote_session_contracts or aligned_mode
+        effective_enable_remote_session_bundle_contracts = (
+            strategy_config.enable_remote_session_bundle_contracts
+        )
         effective_enable_front_capacity_contracts = strategy_config.enable_front_capacity_contracts or aligned_mode
 
         def build_round_candidates(*, suppress_ownerless_recovery: bool) -> tuple[list[HookCandidate], list[CandidateAuditRow]]:
@@ -7563,6 +7799,7 @@ def _run_case_once(
                 loco_location=loco_location,
                 enable_contract_planlets=effective_enable_contract_planlets,
                 enable_remote_session_contracts=effective_enable_remote_session_contracts,
+                enable_remote_session_bundle_contracts=effective_enable_remote_session_bundle_contracts,
                 enable_front_capacity_contracts=effective_enable_front_capacity_contracts,
                 suppress_ownerless_recovery=suppress_ownerless_recovery,
                 manual_baseline=manual_baseline,
@@ -7671,6 +7908,13 @@ def _run_case_once(
             )
             return remote_debt_cache[candidate.candidate_id]
 
+        current_remote_business_transition_count = operation_remote_business_transition_count(operations)
+        remote_business_transition_budget = (
+            manual_baseline.remote_business_transition_count + 2
+            if manual_baseline and manual_baseline.remote_business_transition_count
+            else None
+        )
+
         def has_followup_candidate(prospective_cars: list[dict[str, Any]], next_loco_location: LocoLocation) -> bool:
             if not unsatisfied_cars(prospective_cars, depot_assignment):
                 return True
@@ -7685,6 +7929,7 @@ def _run_case_once(
                 loco_location=next_loco_location,
                 enable_contract_planlets=effective_enable_contract_planlets,
                 enable_remote_session_contracts=effective_enable_remote_session_contracts,
+                enable_remote_session_bundle_contracts=effective_enable_remote_session_bundle_contracts,
                 enable_front_capacity_contracts=effective_enable_front_capacity_contracts,
                 suppress_ownerless_recovery=aligned_mode,
                 manual_baseline=manual_baseline,
@@ -7723,9 +7968,27 @@ def _run_case_once(
             )
 
         def selection_key(item: tuple[HookCandidate, PhysicalValidation, str]) -> Any:
-            remote_state = current_remote_session_state()
-            if remote_state.active and candidate_touches_remote_interaction(item[0]):
+            candidate = item[0]
+            candidate_transition_count = candidate_remote_business_transition_count(
+                candidate,
+                last_business_hook_remote,
+            )
+            transition_over_budget = (
+                remote_business_transition_budget is not None
+                and current_remote_business_transition_count + candidate_transition_count > remote_business_transition_budget
+            )
+            if len(current_unsatisfied) <= 6 and candidate.has_weigh and not item[2]:
                 return (
+                    0,
+                    -1,
+                    planlet_business_hook_count(candidate),
+                    candidate_remote_business_transition_count(candidate, last_business_hook_remote),
+                    candidate_sort_key(candidate),
+                )
+            remote_state = current_remote_session_state()
+            if remote_state.active and candidate_touches_remote_interaction(candidate):
+                return (
+                    1 if transition_over_budget else 0,
                     0,
                     remote_session_selection_key(
                         item,
@@ -7738,6 +8001,7 @@ def _run_case_once(
                 )
             if remote_state.active:
                 return (
+                    1 if transition_over_budget else 0,
                     1,
                     contract_planlet_selection_key(
                         item,
@@ -7764,7 +8028,8 @@ def _run_case_once(
                     else 0
                 )
                 return (
-                    front_priority,
+                    1 if transition_over_budget else 0,
+                    2 + front_priority,
                     contract_planlet_selection_key(
                         item,
                         transition_metrics=transition_metrics,
@@ -7778,24 +8043,36 @@ def _run_case_once(
                 repair_mode == ALIGNED_REPAIR_MODE
                 and not (manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS)
             ):
-                return aligned_selection_key(
-                    item,
-                    transition_metrics=transition_metrics,
-                    phase_state=phase_state,
-                    last_hook_touched_remote=last_hook_touched_remote,
-                    remote_streak_count=remote_streak_count,
-                    last_business_hook_remote=last_business_hook_remote,
+                return (
+                    1 if transition_over_budget else 0,
+                    4,
+                    aligned_selection_key(
+                        item,
+                        transition_metrics=transition_metrics,
+                        phase_state=phase_state,
+                        last_hook_touched_remote=last_hook_touched_remote,
+                        remote_streak_count=remote_streak_count,
+                        last_business_hook_remote=last_business_hook_remote,
+                    ),
                 )
             if strategy_config.prefer_contract_planlets:
-                return contract_planlet_selection_key(
-                    item,
-                    transition_metrics=transition_metrics,
-                    phase_state=phase_state,
-                    last_hook_touched_remote=last_hook_touched_remote,
-                    remote_streak_count=remote_streak_count,
-                    last_business_hook_remote=last_business_hook_remote,
+                return (
+                    1 if transition_over_budget else 0,
+                    5,
+                    contract_planlet_selection_key(
+                        item,
+                        transition_metrics=transition_metrics,
+                        phase_state=phase_state,
+                        last_hook_touched_remote=last_hook_touched_remote,
+                        remote_streak_count=remote_streak_count,
+                        last_business_hook_remote=last_business_hook_remote,
+                    ),
                 )
-            return remote_continuity_key(item)
+            return (
+                1 if transition_over_budget else 0,
+                6,
+                remote_continuity_key(item),
+            )
 
         def current_remote_session_state() -> RemoteSessionState:
             active = (
@@ -7842,13 +8119,14 @@ def _run_case_once(
                 else:
                     phase_deferred.append((candidate, validation, phase_reason))
                 continue
-            reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+            reduction, non_depot_reduction, after_unsat, _after_non_depot = transition_metrics(candidate, validation)
             structural_reason = structural_reject_reason(
                 candidate=candidate,
                 validation=validation,
                 phase_reason=phase_reason,
                 reduction=reduction,
                 non_depot_reduction=non_depot_reduction,
+                after_unsatisfied=after_unsat,
                 physically_accepted=physically_accepted,
                 transition_metrics=transition_metrics,
                 repair_mode=repair_mode,
@@ -7915,7 +8193,46 @@ def _run_case_once(
                     item for item in deferred_items if candidate_touches_remote_interaction(item[0])
                 ]
             for candidate, validation, phase_reason in sorted(deferred_items, key=selection_key):
+                reduction, non_depot_reduction, after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+                structural_reason = structural_reject_reason(
+                    candidate=candidate,
+                    validation=validation,
+                    phase_reason="",
+                    reduction=reduction,
+                    non_depot_reduction=non_depot_reduction,
+                    after_unsatisfied=after_unsat,
+                    physically_accepted=physically_accepted,
+                    transition_metrics=transition_metrics,
+                    repair_mode=repair_mode,
+                    manual_baseline=manual_baseline,
+                )
+                if structural_reason:
+                    structural_validation = PhysicalValidation(
+                        accepted=False,
+                        reasons=(structural_reason,),
+                        get_path=validation.get_path,
+                        weigh_path=validation.weigh_path,
+                        put_path=validation.put_path,
+                        operation_paths=validation.operation_paths,
+                    )
+                    candidate_rows.append(candidate_audit_row(candidate, structural_validation, "rejected"))
+                    rejected_count += 1
+                    rejection_reasons[structural_reason] += 1
+                    continue
                 prospective_cars, next_loco_location, signature = transition_for(candidate, validation)
+                if candidate.plan_steps and not followup_ok(candidate, validation):
+                    lookahead_validation = PhysicalValidation(
+                        accepted=False,
+                        reasons=("planlet_no_followup_candidate",),
+                        get_path=validation.get_path,
+                        weigh_path=validation.weigh_path,
+                        put_path=validation.put_path,
+                        operation_paths=validation.operation_paths,
+                    )
+                    candidate_rows.append(candidate_audit_row(candidate, lookahead_validation, "rejected"))
+                    rejected_count += 1
+                    rejection_reasons["planlet_no_followup_candidate"] += 1
+                    continue
                 if signature in visited:
                     loop_validation = PhysicalValidation(
                         accepted=False,
@@ -8043,6 +8360,8 @@ def _run_case_once(
                     candidate_id=candidate.candidate_id,
                     selected_contract=selected_contract(candidate),
                     structural_intent=structural_intent(candidate),
+                    remote_profile=candidate_remote_profile(candidate),
+                    internal_remote_transition_count=candidate_internal_remote_transition_count(candidate),
                     source_line=candidate.source_line,
                     target_line=candidate.target_line,
                     owner_vehicle_count=len(candidate.move_car_nos),
@@ -8672,6 +8991,7 @@ def remote_owner_candidate_ids(contract_rows: list[ContractTraceRow]) -> set[str
             "SOURCE_EXIT_CLEAR_RESTORE_PLANLET",
             "ROUTE_CLEAR_RESTORE_PLANLET",
             "REMOTE_SESSION_CONTRACT",
+            "REMOTE_SESSION_BUNDLE_CONTRACT",
             "REMOTE_CORRIDOR_CONTRACT",
             "DEPOT_DIGEST_PLANLET",
             "DEPOT_SLOT_SWAP_PLANLET",
