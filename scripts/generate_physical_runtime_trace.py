@@ -1158,12 +1158,14 @@ def candidate_remote_profile(candidate: HookCandidate) -> str:
 
 def candidate_allowed_internal_remote_transitions(candidate: HookCandidate) -> int:
     if candidate.candidate_kind in {
-        "short_chain_planlet",
         "remote_session_bundle_planlet",
-        "remote_exchange_planlet",
         "remote_session_contract_planlet",
-        *OWNER_BOUND_RESTORE_KINDS,
+        "remote_exchange_planlet",
     }:
+        return 2
+    if owner_bound_remote_unlock_candidate(candidate):
+        return 2
+    if owner_bound_restore_candidate(candidate):
         return 2
     return 1
 
@@ -4344,13 +4346,13 @@ def remote_session_contract_planlets(
     length_load_lookup: dict[str, float],
     grouped: dict[str, list[dict[str, Any]]],
 ) -> list[HookCandidate]:
-    remote_sources = planned_unsatisfied_by_line(
+    outbound_sources = planned_unsatisfied_by_line(
         grouped=grouped,
         planned=planned,
         satisfied=satisfied,
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
-        target_filter=lambda line: True,
-        include_same_line=True,
+        target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        max_per_line=8,
     )
     inbound_sources = planned_unsatisfied_by_line(
         grouped=grouped,
@@ -4358,72 +4360,156 @@ def remote_session_contract_planlets(
         satisfied=satisfied,
         source_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        max_per_line=8,
+    )
+    internal_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        include_same_line=True,
+        max_per_line=8,
     )
 
-    selected_sources: list[tuple[str, list[dict[str, Any]]]] = []
-    carry: list[dict[str, Any]] = []
-    for source_map in (remote_sources, inbound_sources):
+    candidates: list[HookCandidate] = []
+
+    def build_directional_contract(
+        *,
+        mode: str,
+        source_map: dict[str, list[dict[str, Any]]],
+        min_vehicle_count: int,
+        remote_first: bool,
+        target_order_key: Any,
+        expected_profile: str,
+        action_family_name: str,
+    ) -> HookCandidate | None:
+        selected_sources, carry = select_source_batches(
+            source_map,
+            max_sources=4,
+            max_per_source=6,
+            remote_first=remote_first,
+        )
+        if len(carry) < min_vehicle_count or not selected_sources:
+            return None
+        target_groups = target_groups_for_carry(carry, planned)
+        if not target_groups:
+            return None
+        steps, filtered_carry = build_carry_drop_steps(
+            selected_sources=selected_sources,
+            target_groups=target_groups,
+            target_order=sorted(target_groups, key=target_order_key),
+            cars=cars,
+            depot_assignment=depot_assignment,
+            grouped=grouped,
+            length_load_lookup=length_load_lookup,
+        )
+        if len(steps) < 2 or len(filtered_carry) < min_vehicle_count:
+            return None
+        candidate = planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=steps[0].line,
+            target_line=steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                f"remote_session_directional_contract;mode={mode};"
+                f"source_count={len([step for step in steps if step.action == 'Get'])};"
+                f"target_count={len([step for step in steps if step.action == 'Put'])};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind="remote_session_contract_planlet",
+            steps=tuple(steps),
+            action_family_override=action_family_name,
+        )
+        if candidate_remote_profile(candidate) != expected_profile:
+            return None
+        return candidate
+
+    outbound = build_directional_contract(
+        mode="outbound_release",
+        source_map=outbound_sources,
+        min_vehicle_count=3,
+        remote_first=True,
+        target_order_key=lambda line: (line != "存4线", line),
+        expected_profile=REMOTE_PROFILE_REMOTE_TO_FRONT,
+        action_family_name="DEPOT_OUTBOUND",
+    )
+    inbound = build_directional_contract(
+        mode="inbound_digest",
+        source_map=inbound_sources,
+        min_vehicle_count=3,
+        remote_first=False,
+        target_order_key=lambda line: (line not in DEPOT_LINES, line),
+        expected_profile=REMOTE_PROFILE_FRONT_TO_REMOTE,
+        action_family_name="REPAIR_INBOUND",
+    )
+    internal = build_directional_contract(
+        mode="remote_internal",
+        source_map=internal_sources,
+        min_vehicle_count=2,
+        remote_first=True,
+        target_order_key=lambda line: (line not in DEPOT_LINES, line),
+        expected_profile=REMOTE_PROFILE_REMOTE_ONLY,
+        action_family_name="REPAIR_INBOUND",
+    )
+    candidates.extend(candidate for candidate in (outbound, inbound, internal) if candidate)
+
+    legacy_sources: list[tuple[str, list[dict[str, Any]]]] = []
+    legacy_carry: list[dict[str, Any]] = []
+    for source_map in (outbound_sources, inbound_sources, internal_sources):
         for line, batch in sorted(source_map.items(), key=lambda item: (item[0] not in DEPOT_LINES, item[0])):
             selected: list[dict[str, Any]] = []
             for car in batch:
-                if pull_equivalent([*carry, car]) > PULL_LIMIT_EQUIVALENT:
+                if pull_equivalent([*legacy_carry, car]) > PULL_LIMIT_EQUIVALENT:
                     break
                 selected.append(car)
-                carry.append(car)
+                legacy_carry.append(car)
                 if len(selected) >= 6:
                     break
             if selected:
-                selected_sources.append((line, selected))
-            if len(selected_sources) >= 4 or pull_equivalent(carry) >= PULL_LIMIT_EQUIVALENT:
+                legacy_sources.append((line, selected))
+            if len(legacy_sources) >= 4 or pull_equivalent(legacy_carry) >= PULL_LIMIT_EQUIVALENT:
                 break
-        if len(selected_sources) >= 4 or pull_equivalent(carry) >= PULL_LIMIT_EQUIVALENT:
+        if len(legacy_sources) >= 4 or pull_equivalent(legacy_carry) >= PULL_LIMIT_EQUIVALENT:
             break
-
-    if len(carry) < 5 or len(selected_sources) < 2:
-        return []
-
-    target_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for car in carry:
-        target_line, _position, _reason = planned(car)
-        if target_line:
-            target_groups[target_line].append(car)
-
-    remote_targets = [line for line in target_groups if line in REMOTE_INTERACTION_LINES]
-    non_remote_targets = [line for line in target_groups if line not in REMOTE_INTERACTION_LINES]
-    if not remote_targets and not any(line in REMOTE_INTERACTION_LINES for line, _batch in selected_sources):
-        return []
-
-    steps, carry = build_carry_drop_steps(
-        selected_sources=selected_sources,
-        target_groups=target_groups,
-        target_order=[
-            *sorted(non_remote_targets, key=lambda line: (line != "存4线", line)),
-            *sorted(remote_targets),
-        ],
-        cars=cars,
-        depot_assignment=depot_assignment,
-        grouped=grouped,
-        length_load_lookup=length_load_lookup,
-    )
-
-    if len(steps) < 4:
-        return []
-    candidate = planlet_candidate(
-        case_id=case_id,
-        hook_index=hook_index,
-        source_line=selected_sources[0][0],
-        target_line=steps[-1].line,
-        batch=carry,
-        generation_reason=(
-            "remote_session_contract;"
-            f"source_count={len(selected_sources)};target_count={len(target_groups)};"
-            f"remote_target_count={len(remote_targets)};vehicle_count={len(carry)}"
-        ),
-        candidate_kind="remote_session_contract_planlet",
-        steps=tuple(steps),
-        action_family_override="REPAIR_INBOUND" if remote_targets else "DEPOT_OUTBOUND",
-    )
-    return [candidate]
+    if len(legacy_carry) >= 5 and len(legacy_sources) >= 2:
+        legacy_target_groups = target_groups_for_carry(legacy_carry, planned)
+        remote_targets = [line for line in legacy_target_groups if line in REMOTE_INTERACTION_LINES]
+        non_remote_targets = [line for line in legacy_target_groups if line not in REMOTE_INTERACTION_LINES]
+        legacy_steps, legacy_filtered_carry = build_carry_drop_steps(
+            selected_sources=legacy_sources,
+            target_groups=legacy_target_groups,
+            target_order=[
+                *sorted(non_remote_targets, key=lambda line: (line != "存4线", line)),
+                *sorted(remote_targets),
+            ],
+            cars=cars,
+            depot_assignment=depot_assignment,
+            grouped=grouped,
+            length_load_lookup=length_load_lookup,
+        )
+        if len(legacy_steps) >= 4 and len(legacy_filtered_carry) >= 5:
+            legacy_candidate = planlet_candidate(
+                case_id=case_id,
+                hook_index=hook_index,
+                source_line=legacy_steps[0].line,
+                target_line=legacy_steps[-1].line,
+                batch=legacy_filtered_carry,
+                generation_reason=(
+                    "remote_session_legacy_fallback_contract;"
+                    f"source_count={len([step for step in legacy_steps if step.action == 'Get'])};"
+                    f"target_count={len([step for step in legacy_steps if step.action == 'Put'])};"
+                    f"remote_target_count={len(remote_targets)};"
+                    f"vehicle_count={len(legacy_filtered_carry)}"
+                ),
+                candidate_kind="remote_session_contract_planlet",
+                steps=tuple(legacy_steps),
+                action_family_override="REPAIR_INBOUND" if remote_targets else "DEPOT_OUTBOUND",
+            )
+            if candidate_internal_remote_transition_count(legacy_candidate) <= 2:
+                candidates.append(legacy_candidate)
+    return candidates
 
 
 def remote_session_bundle_planlets(
@@ -7099,7 +7185,7 @@ def owner_bound_remote_unlock_candidate(candidate: HookCandidate) -> bool:
     return (
         candidate.candidate_kind in {"route_clear_session_planlet", "source_exit_session_planlet"}
         and candidate.action_family in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}
-        and candidate_remote_profile(candidate) != REMOTE_PROFILE_MIXED
+        and candidate_internal_remote_transition_count(candidate) <= 2
         and remote_cross_has_owner(candidate)
     )
 
