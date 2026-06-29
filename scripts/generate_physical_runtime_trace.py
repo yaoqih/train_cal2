@@ -55,6 +55,7 @@ REMOTE_SESSION_CONTRACT_KINDS = {
     "remote_corridor_planlet",
     "depot_digest_planlet",
     "depot_slot_swap_planlet",
+    "target_move",
     "short_chain_planlet",
     "route_clear_session_planlet",
     "source_exit_session_planlet",
@@ -85,6 +86,12 @@ OWNER_BOUND_RESTORE_KINDS = {
     "source_exit_clear_restore_planlet",
     "route_clear_restore_planlet",
 }
+ROUTE_CLEAR_WRAP_EXCLUDED_KINDS = {
+    "route_clear_session_planlet",
+    "source_exit_session_planlet",
+    "route_clear_restore_planlet",
+    "source_exit_clear_restore_planlet",
+}
 REMOTE_CROSS_OWNER_KINDS = REMOTE_SESSION_CONTRACT_KINDS | {
     "remote_exchange_planlet",
     "remote_session_planlet",
@@ -95,24 +102,35 @@ REMOTE_CROSS_OWNER_FAMILIES = {
     "DEPOT_SLOT",
     "SPECIAL_REPAIR_PROCESS",
 }
-REMOTE_SESSION_PRIMARY_KINDS = {
+REMOTE_SESSION_START_KINDS = {
     "short_chain_planlet",
+}
+REMOTE_SESSION_BODY_KINDS = {
     "remote_session_bundle_planlet",
     "remote_session_contract_planlet",
+    "remote_session_planlet",
     "depot_digest_planlet",
+    "depot_same_line_repack",
     "depot_slot_swap_planlet",
     "remote_exchange_planlet",
-    "remote_session_planlet",
     "multi_pick_planlet",
     "multi_drop_planlet",
     "source_line_digest_planlet",
     "target_move",
 }
+REMOTE_SESSION_PRIMARY_KINDS = REMOTE_SESSION_START_KINDS
 REMOTE_SESSION_SUPPORT_KINDS = {
     "remote_corridor_planlet",
     "route_clear_session_planlet",
     "source_exit_session_planlet",
     "corridor_closeout_planlet",
+}
+REMOTE_SESSION_TAIL_KINDS = {
+    "corridor_closeout_planlet",
+    "route_clear_session_planlet",
+    "source_exit_session_planlet",
+    "route_clear_restore_planlet",
+    "source_exit_clear_restore_planlet",
 }
 REMOTE_SESSION_RESTORE_KINDS = {
     "route_clear_restore_planlet",
@@ -429,6 +447,7 @@ class StrategyConfig:
     enable_front_capacity_contracts: bool = False
     suppress_ownerless_recovery: bool = False
     remote_transition_first: bool = False
+    allow_early_remote_entry_prep: bool = False
 
 
 @dataclass(frozen=True)
@@ -437,9 +456,21 @@ class RemoteSessionState:
     debt: int
     batch_index: int
     max_batch_count: int
+    session_index: int
+    next_session_index: int
+    target_session_count: int
+    owner_profile: str
+    entry_profiles: tuple[str, ...]
+    exit_profiles: tuple[str, ...]
+    must_finish_debt: int
+    budget: int | None
+    current_transition_count: int
+    last_business_hook_remote: bool | None
     stage: str = REMOTE_SESSION_STAGE_CLOSED
     preferred_profiles: tuple[str, ...] = ()
     allowed_profiles: tuple[str, ...] = ()
+    tail_mode: bool = False
+    leased_corridor_lines: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -458,9 +489,17 @@ class RemoteSessionPlan:
     active: bool
     stage: str
     debt: RemoteDebtProfile
+    session_index: int
+    target_session_count: int
+    owner_profile: str
+    entry_profiles: tuple[str, ...]
+    exit_profiles: tuple[str, ...]
     preferred_profiles: tuple[str, ...]
     allowed_profiles: tuple[str, ...]
+    must_finish_debt: int
+    budget: int | None
     profile_counts: tuple[tuple[str, int], ...]
+    continuity_limit: int
     transition_limit: int | None
     current_transition_count: int
 
@@ -1162,6 +1201,30 @@ def planlet_line_sequence(candidate: HookCandidate) -> tuple[str, ...]:
     return tuple(step.line for step in candidate_plan_steps(candidate) if step.action in {"Get", "Put"})
 
 
+def candidate_put_lines(candidate: HookCandidate) -> tuple[str, ...]:
+    return tuple(step.line for step in candidate_plan_steps(candidate) if step.action == "Put")
+
+
+def route_clear_leased_corridor_lines(candidate: HookCandidate) -> tuple[str, ...]:
+    if candidate.candidate_kind != "route_clear_session_planlet":
+        return ()
+    leased: list[str] = []
+    for step in candidate_plan_steps(candidate):
+        if step.action == "Get" and step.line in REMOTE_CORRIDOR_LINES:
+            leased.append(step.line)
+            continue
+        if step.action == "Put":
+            break
+    return tuple(dict.fromkeys(leased))
+
+
+def candidate_refills_leased_corridor(candidate: HookCandidate, leased_corridor_lines: tuple[str, ...]) -> bool:
+    if not leased_corridor_lines:
+        return False
+    leased = set(leased_corridor_lines)
+    return bool(leased & set(candidate_put_lines(candidate)))
+
+
 def planlet_touches_remote(candidate: HookCandidate) -> bool:
     return any(line in REMOTE_INTERACTION_LINES for line in planlet_line_sequence(candidate))
 
@@ -1194,12 +1257,19 @@ def candidate_remote_profile(candidate: HookCandidate) -> str:
     return REMOTE_PROFILE_FRONT_TO_REMOTE if remote_flags[-1] else REMOTE_PROFILE_REMOTE_TO_FRONT
 
 
+def candidate_ends_in_remote(candidate: HookCandidate) -> bool:
+    line = candidate_final_line(candidate)
+    return line in REMOTE_INTERACTION_LINES
+
+
 def candidate_allowed_internal_remote_transitions(candidate: HookCandidate) -> int:
     if candidate.candidate_kind in {
         "remote_session_bundle_planlet",
         "remote_exchange_planlet",
         "depot_slot_swap_planlet",
         "short_chain_planlet",
+        "route_clear_session_planlet",
+        "source_exit_session_planlet",
     }:
         return 2
     if owner_bound_remote_unlock_candidate(candidate):
@@ -1276,6 +1346,96 @@ def remote_session_allowed_profiles(stage: str) -> tuple[str, ...]:
         return ()
     if stage == REMOTE_SESSION_STAGE_FRONT_PREP:
         return (REMOTE_PROFILE_FRONT_ONLY,)
+    if stage == REMOTE_SESSION_STAGE_START_OUTBOUND:
+        return (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_START_INBOUND:
+        return (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_START_INTERNAL:
+        return (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_REMOTE_INTERNAL:
+        return (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_EXIT_OUTBOUND:
+        return (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_ENTER_INBOUND:
+        return (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_SHORT_DIRECT:
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
+    if stage == REMOTE_SESSION_STAGE_TAIL:
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+        )
+    return (
+        REMOTE_PROFILE_REMOTE_TO_FRONT,
+        REMOTE_PROFILE_FRONT_TO_REMOTE,
+        REMOTE_PROFILE_REMOTE_ONLY,
+    )
+
+
+def remote_session_owner_profile(debt: RemoteDebtProfile, short_chain: bool) -> str:
+    if short_chain:
+        return REMOTE_PROFILE_REMOTE_ONLY
+    if debt.outbound >= debt.inbound and debt.outbound > 0:
+        return REMOTE_PROFILE_REMOTE_TO_FRONT
+    if debt.inbound > 0:
+        return REMOTE_PROFILE_FRONT_TO_REMOTE
+    return REMOTE_PROFILE_REMOTE_ONLY
+
+
+def remote_session_entry_profiles(stage: str, owner_profile: str) -> tuple[str, ...]:
+    if stage == REMOTE_SESSION_STAGE_CLOSED:
+        return ()
+    if stage == REMOTE_SESSION_STAGE_FRONT_PREP:
+        return (REMOTE_PROFILE_FRONT_ONLY,)
+    if stage == REMOTE_SESSION_STAGE_SHORT_DIRECT:
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
+    if stage == REMOTE_SESSION_STAGE_TAIL:
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+        )
+    return (
+        REMOTE_PROFILE_REMOTE_TO_FRONT,
+        REMOTE_PROFILE_FRONT_TO_REMOTE,
+        REMOTE_PROFILE_REMOTE_ONLY,
+        REMOTE_PROFILE_MIXED,
+    )
+
+
+def remote_session_exit_profiles(stage: str, owner_profile: str) -> tuple[str, ...]:
+    if stage in {REMOTE_SESSION_STAGE_CLOSED, REMOTE_SESSION_STAGE_FRONT_PREP}:
+        return ()
+    if stage == REMOTE_SESSION_STAGE_SHORT_DIRECT:
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
+    if stage == REMOTE_SESSION_STAGE_TAIL:
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+        )
+    if stage == REMOTE_SESSION_STAGE_EXIT_OUTBOUND:
+        return (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_ENTER_INBOUND:
+        return (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+    if stage == REMOTE_SESSION_STAGE_REMOTE_INTERNAL:
+        return (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED)
     return (
         REMOTE_PROFILE_REMOTE_TO_FRONT,
         REMOTE_PROFILE_FRONT_TO_REMOTE,
@@ -1290,6 +1450,7 @@ def build_remote_session_plan(
     depot_assignment: DepotAssignment,
     phase_state: PhaseState,
     manual_baseline: ManualBaseline | None,
+    remote_session_id: int,
     last_hook_touched_remote: bool,
     last_business_hook_remote: bool | None,
     remote_streak_count: int,
@@ -1300,65 +1461,138 @@ def build_remote_session_plan(
 ) -> RemoteSessionPlan:
     debt = remote_debt_profile(cars, depot_assignment)
     short_chain = bool(manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS)
+    if debt.total <= 0:
+        target_session_count = 0
+    elif short_chain:
+        target_session_count = 1
+    elif manual_baseline and manual_baseline.remote_session_count <= 1:
+        target_session_count = 1
+    else:
+        target_session_count = 2
+    owner_profile = remote_session_owner_profile(debt, short_chain)
+    session_budget_exhausted = bool(target_session_count > 0 and remote_session_id >= target_session_count)
+    continuity_limit = REMOTE_CONTINUITY_MAX_STREAK
+    if manual_baseline and manual_baseline.remote_session_count > 0 and debt.total > 0:
+        average_remote_hooks = manual_baseline.remote_hook_count / max(1, manual_baseline.remote_session_count)
+        if target_session_count <= 1:
+            continuity_limit = max(6, min(8, round(average_remote_hooks) + 1))
+        else:
+            continuity_limit = max(4, min(5, round(average_remote_hooks)))
+    elif target_session_count <= 1:
+        continuity_limit = 6
+    elif debt.total > 0:
+        continuity_limit = 5
     if not enable_remote_session_contracts or debt.total <= 0:
         stage = REMOTE_SESSION_STAGE_CLOSED
         active = False
+        entry_profiles: tuple[str, ...] = ()
+        exit_profiles: tuple[str, ...] = ()
         preferred_profiles: tuple[str, ...] = ()
-    elif not phase_state.link7_open and not short_chain:
-        stage = REMOTE_SESSION_STAGE_FRONT_PREP
-        active = False
-        preferred_profiles = (REMOTE_PROFILE_FRONT_ONLY,)
     else:
-        active = last_hook_touched_remote and remote_streak_count < REMOTE_CONTINUITY_MAX_STREAK
+        tail_mode = (
+            debt.total > 0
+            and (
+                (not last_hook_touched_remote and session_budget_exhausted)
+            )
+        )
+        active = (
+            last_hook_touched_remote
+            and debt.total > 0
+        )
         if short_chain:
             stage = REMOTE_SESSION_STAGE_SHORT_DIRECT
+            entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+            exit_profiles = remote_session_exit_profiles(stage, owner_profile)
             preferred_profiles = (
                 (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY)
                 if debt.outbound
                 else (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT)
             )
+        elif tail_mode:
+            stage = REMOTE_SESSION_STAGE_TAIL
+            entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+            exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+            if debt.outbound:
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY)
+            elif debt.inbound:
+                preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY)
+            else:
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT)
         elif active and last_business_hook_remote:
             if debt.internal:
                 stage = REMOTE_SESSION_STAGE_REMOTE_INTERNAL
-                preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT)
             elif debt.outbound:
                 stage = REMOTE_SESSION_STAGE_EXIT_OUTBOUND
-                preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_ONLY)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY)
             elif debt.inbound:
                 stage = REMOTE_SESSION_STAGE_ENTER_INBOUND
-                preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_ONLY)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY)
             else:
                 stage = REMOTE_SESSION_STAGE_TAIL
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
                 preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY)
         elif active:
             if not last_business_hook_remote and debt.inbound:
                 stage = REMOTE_SESSION_STAGE_ENTER_INBOUND
-                preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_ONLY)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY)
             elif not last_business_hook_remote and debt.outbound:
                 stage = REMOTE_SESSION_STAGE_EXIT_OUTBOUND
-                preferred_profiles = (REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_FRONT_TO_REMOTE)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY)
             elif debt.outbound:
                 stage = REMOTE_SESSION_STAGE_EXIT_OUTBOUND
-                preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_ONLY)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY)
             else:
                 stage = REMOTE_SESSION_STAGE_START_INTERNAL
-                preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT)
+                entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+                exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+                preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY,)
         elif debt.outbound:
             stage = REMOTE_SESSION_STAGE_START_OUTBOUND
-            preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_FRONT_TO_REMOTE)
+            entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+            exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+            preferred_profiles = (REMOTE_PROFILE_REMOTE_TO_FRONT,)
         elif debt.inbound:
             stage = REMOTE_SESSION_STAGE_START_INBOUND
-            preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_MIXED, REMOTE_PROFILE_REMOTE_ONLY)
+            entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+            exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+            preferred_profiles = (REMOTE_PROFILE_FRONT_TO_REMOTE,)
         else:
             stage = REMOTE_SESSION_STAGE_START_INTERNAL
-            preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT)
+            entry_profiles = remote_session_entry_profiles(stage, owner_profile)
+            exit_profiles = remote_session_exit_profiles(stage, owner_profile)
+            preferred_profiles = (REMOTE_PROFILE_REMOTE_ONLY,)
+    must_finish_debt = 0 if target_session_count <= 1 else max(1, debt.total - round(debt.total / target_session_count))
+    if target_session_count <= 1:
+        continuity_limit = max(4, min(6, continuity_limit))
     return RemoteSessionPlan(
         active=active,
         stage=stage,
         debt=debt,
+        session_index=remote_session_id if last_hook_touched_remote else (remote_session_id + 1 if debt.total > 0 else remote_session_id),
+        target_session_count=target_session_count,
+        owner_profile=owner_profile,
+        entry_profiles=entry_profiles,
+        exit_profiles=exit_profiles,
         preferred_profiles=preferred_profiles,
         allowed_profiles=remote_session_allowed_profiles(stage),
+        must_finish_debt=must_finish_debt,
+        budget=transition_limit,
         profile_counts=tuple(sorted((profile, count) for profile, count in profile_counts.items() if count)),
+        continuity_limit=continuity_limit,
         transition_limit=transition_limit,
         current_transition_count=current_transition_count,
     )
@@ -1374,6 +1608,28 @@ def remote_session_plan_profile_rank(
     if not candidate_touches_remote_interaction(candidate):
         return (0, 0, 0, 0, 0) if profile in plan.preferred_profiles else (9, 0, 0, 0, 0)
     side_penalty = candidate_side_alignment_penalty(candidate, last_business_hook_remote)
+    if candidate.candidate_kind in REMOTE_SESSION_BODY_KINDS:
+        repeat_count = profile_counts.get(profile, 0)
+        if profile == REMOTE_PROFILE_MIXED:
+            repeat_penalty = repeat_count * 3
+        elif repeat_count >= 2:
+            repeat_penalty = 3
+        elif repeat_count:
+            repeat_penalty = 1
+        else:
+            repeat_penalty = 0
+        free_direct_penalty = int(
+            candidate.candidate_kind == "target_move"
+            and plan.debt.total > len(candidate.move_car_nos)
+            and not candidate.generation_reason.startswith(TAIL_CANDIDATE_PREFIXES)
+        )
+        return (
+            side_penalty,
+            0,
+            repeat_penalty,
+            free_direct_penalty,
+            candidate_internal_remote_transition_count(candidate),
+        )
     if profile not in plan.allowed_profiles:
         return (side_penalty, 8, profile_counts.get(profile, 0), 0, candidate_internal_remote_transition_count(candidate))
     if profile in plan.preferred_profiles:
@@ -1406,19 +1662,88 @@ def remote_session_plan_profile_rank(
 
 
 def candidate_remote_session_role(candidate: HookCandidate) -> int:
-    if candidate.candidate_kind in REMOTE_SESSION_PRIMARY_KINDS:
-        return 0
-    if candidate.candidate_kind in REMOTE_SESSION_SUPPORT_KINDS:
+    if not candidate_touches_remote_interaction(candidate):
+        return 5
+    if (
+        candidate.candidate_kind == "short_chain_planlet"
+        and "mode=front_remote_front" in candidate.generation_reason
+    ):
         return 1
+    if candidate.candidate_kind in REMOTE_SESSION_START_KINDS:
+        return 0
+    if candidate.candidate_kind in REMOTE_SESSION_BODY_KINDS:
+        return 1
+    if candidate.candidate_kind in REMOTE_SESSION_SUPPORT_KINDS:
+        return 2
     if candidate.candidate_kind in REMOTE_SESSION_RESTORE_KINDS:
         return 4
-    if candidate_touches_remote_interaction(candidate):
-        return 2
-    return 5
+    return 3
 
 
-def candidate_ends_remote(candidate: HookCandidate) -> bool:
-    return candidate_final_line(candidate) in REMOTE_INTERACTION_LINES
+def remote_session_contract_violation_reason(
+    candidate: HookCandidate,
+    remote_session_state: RemoteSessionState,
+) -> str:
+    role = candidate_remote_session_role(candidate)
+    if role == 5:
+        return ""
+    profile = candidate_remote_profile(candidate)
+    if remote_session_state.tail_mode:
+        if candidate.candidate_kind in REMOTE_SESSION_TAIL_KINDS and profile in remote_session_state.allowed_profiles:
+            return ""
+        return (
+            "p7_reject_remote_session_after_tail_boundary:"
+            f"kind={candidate.candidate_kind}:role={role}:"
+            f"session_index={remote_session_state.session_index}:"
+            f"target_session_count={remote_session_state.target_session_count}"
+        )
+    if not remote_session_state.active:
+        if role not in {0, 1, 2}:
+            return (
+                "p7_reject_remote_session_without_active_session:"
+                f"kind={candidate.candidate_kind}:role={role}:"
+                f"next_session_index={remote_session_state.next_session_index}:"
+                f"target_session_count={remote_session_state.target_session_count}"
+            )
+        if profile not in remote_session_state.entry_profiles:
+            return (
+                "p7_reject_remote_session_entry_profile_mismatch:"
+                f"kind={candidate.candidate_kind}:profile={profile}:"
+                f"entry_profiles={','.join(remote_session_state.entry_profiles)}:"
+                f"session_index={remote_session_state.session_index}"
+            )
+        return ""
+    if role == 0:
+        return (
+            "p7_reject_nested_remote_session_start:"
+            f"kind={candidate.candidate_kind}:profile={profile}:"
+            f"session_index={remote_session_state.session_index}:"
+            f"target_session_count={remote_session_state.target_session_count}"
+        )
+    if candidate.candidate_kind in REMOTE_SESSION_BODY_KINDS:
+        if profile not in remote_session_state.allowed_profiles:
+            return (
+                "p7_reject_remote_session_body_profile_mismatch:"
+                f"kind={candidate.candidate_kind}:profile={profile}:"
+                f"allowed_profiles={','.join(remote_session_state.allowed_profiles)}:"
+                f"session_index={remote_session_state.session_index}"
+            )
+        return ""
+    if profile not in remote_session_state.allowed_profiles:
+        return (
+            "p7_reject_remote_session_profile_mismatch:"
+            f"kind={candidate.candidate_kind}:profile={profile}:"
+            f"allowed_profiles={','.join(remote_session_state.allowed_profiles)}:"
+            f"session_index={remote_session_state.session_index}"
+        )
+    if candidate_ends_in_remote(candidate) and profile not in remote_session_state.exit_profiles:
+        return (
+            "p7_reject_remote_session_exit_profile_mismatch:"
+            f"kind={candidate.candidate_kind}:profile={profile}:"
+            f"exit_profiles={','.join(remote_session_state.exit_profiles)}:"
+            f"session_index={remote_session_state.session_index}"
+        )
+    return ""
 
 
 def remote_interaction_unsatisfied_count(
@@ -3536,6 +3861,122 @@ def front_capacity_digest_planlets(
     return candidates
 
 
+def remote_entry_capacity_prep_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+    staging_priority: tuple[str, ...],
+    depot_aware_staging: bool,
+    manual_baseline: ManualBaseline | None,
+    allow_early_remote_entry_prep: bool = False,
+) -> list[HookCandidate]:
+    if (
+        not allow_early_remote_entry_prep
+        and
+        manual_baseline
+        and manual_baseline.first_remote_hook
+        and manual_baseline.first_remote_hook <= 20
+    ):
+        return []
+    candidates: list[HookCandidate] = []
+    for target_line in ("存4线",):
+        outbound_sources = planned_unsatisfied_by_line(
+            grouped=grouped,
+            planned=planned,
+            satisfied=satisfied,
+            source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+            target_filter=lambda line, target_line=target_line: line == target_line,
+            max_per_line=8,
+        )
+        outbound_count = sum(len(batch) for batch in outbound_sources.values())
+        if outbound_count < 3:
+            continue
+        selected_outbound, outbound_carry = select_source_batches(
+            outbound_sources,
+            max_sources=4,
+            max_per_source=6,
+            remote_first=True,
+        )
+        if outbound_carry:
+            direct_steps, direct_carry = build_carry_drop_steps(
+                selected_sources=selected_outbound,
+                target_groups=target_groups_for_carry(outbound_carry, planned),
+                target_order=[target_line],
+                cars=cars,
+                depot_assignment=depot_assignment,
+                grouped=grouped,
+                length_load_lookup=length_load_lookup,
+            )
+            if len(direct_steps) >= 2 and len(direct_carry) >= 3:
+                continue
+
+        release_batch: list[dict[str, Any]] = []
+        for car in grouped.get(target_line, []):
+            if satisfied(car) or car.get("IsWeigh") or is_locked_depot_stayer(car, depot_assignment):
+                continue
+            planned_line, _position, _reason = planned(car)
+            if planned_line not in REMOTE_INTERACTION_LINES:
+                continue
+            if pull_equivalent([*release_batch, car]) > PULL_LIMIT_EQUIVALENT:
+                break
+            release_batch.append(car)
+            if len(release_batch) >= 6:
+                break
+        if len(release_batch) < 2:
+            continue
+
+        release_nos = {car_no(car) for car in release_batch}
+        release_target = choose_staging_line(
+            cars,
+            release_batch,
+            {target_line},
+            length_load_lookup,
+            tuple(
+                line for line in staging_priority
+                if TRACK_SPECS.get(line, TrackSpec(line, 0.0, "")).track_type != "temporary"
+            ),
+            False,
+        )
+        if not release_target or release_target in REMOTE_INTERACTION_LINES:
+            continue
+        if not reverse_length_fits(target_line, release_target, release_batch):
+            continue
+        release_positions = first_free_positions_for_batch(cars, release_target, release_batch, release_nos)
+        if not candidate_positions_available(release_target, release_positions, cars, release_nos, grouped):
+            continue
+        if not line_has_length_capacity(release_target, cars, release_batch, release_nos, length_load_lookup, grouped):
+            continue
+
+        steps = (
+            PlanStep("Get", target_line, tuple(car_no(car) for car in release_batch)),
+            PlanStep("Put", release_target, tuple(car_no(car) for car in release_batch), release_positions),
+        )
+        candidates.append(
+            planlet_candidate(
+                case_id=case_id,
+                hook_index=hook_index,
+                source_line=target_line,
+                target_line=release_target,
+                batch=release_batch,
+                generation_reason=(
+                    "remote_entry_capacity_prep;"
+                    f"target_line={target_line};release_target={release_target};"
+                    f"release_count={len(release_batch)};outbound_waiting={outbound_count}"
+                ),
+                candidate_kind="front_capacity_digest_planlet",
+                steps=steps,
+                action_family_override="YARD_REBALANCE",
+            )
+        )
+    return candidates
+
+
 def planlet_action_family(steps: tuple[PlanStep, ...]) -> str | None:
     lines = [step.line for step in steps if step.action in {"Get", "Put"}]
     put_lines = [step.line for step in steps if step.action == "Put"]
@@ -4898,7 +5339,6 @@ def remote_session_bundle_planlets(
         candidates.append(candidate)
     return candidates[:2]
 
-
 def remote_corridor_planlets(
     *,
     case_id: str,
@@ -5031,6 +5471,105 @@ def short_chain_planlets(
     if not manual_baseline or manual_baseline.variant not in SHORT_CHAIN_VARIANTS:
         return []
     candidates: list[HookCandidate] = []
+
+    inbound_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line not in REMOTE_INTERACTION_LINES and line not in RUNNING_LINES,
+        target_filter=lambda line: line in DEPOT_TARGET_LINES,
+        max_per_line=8,
+    )
+    outbound_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        max_per_line=8,
+    )
+
+    def take_sources(
+        source_map: dict[str, list[dict[str, Any]]],
+        *,
+        carry: list[dict[str, Any]],
+        max_sources: int,
+        max_per_source: int,
+        remote_first: bool,
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        selected: list[tuple[str, list[dict[str, Any]]]] = []
+        line_key = (
+            (lambda item: (item[0] not in REMOTE_INTERACTION_LINES, item[0]))
+            if remote_first
+            else (lambda item: item[0])
+        )
+        for line, batch in sorted(source_map.items(), key=line_key):
+            chosen: list[dict[str, Any]] = []
+            for car in batch[:max_per_source]:
+                if pull_equivalent([*carry, car]) > PULL_LIMIT_EQUIVALENT:
+                    break
+                chosen.append(car)
+                carry.append(car)
+            if chosen:
+                selected.append((line, chosen))
+            if len(selected) >= max_sources:
+                break
+        return selected
+
+    session_carry: list[dict[str, Any]] = []
+    front_sources = take_sources(
+        inbound_sources,
+        carry=session_carry,
+        max_sources=3,
+        max_per_source=8,
+        remote_first=False,
+    )
+    remote_sources = take_sources(
+        outbound_sources,
+        carry=session_carry,
+        max_sources=max(1, 4 - len(front_sources)),
+        max_per_source=8,
+        remote_first=True,
+    )
+    if front_sources and remote_sources and len(session_carry) >= 4:
+        target_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for car in session_carry:
+            target_line, _position, _reason = planned(car)
+            if target_line:
+                target_groups[target_line].append(car)
+        target_order = sorted(
+            target_groups,
+            key=lambda line: (line not in REMOTE_INTERACTION_LINES, line not in DEPOT_LINES, line),
+        )
+        steps, filtered_carry = build_carry_drop_steps(
+            selected_sources=[*front_sources, *remote_sources],
+            target_groups=target_groups,
+            target_order=target_order,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            grouped=grouped,
+            length_load_lookup=length_load_lookup,
+        )
+        if len(steps) >= 4 and len(filtered_carry) >= 4:
+            candidates.append(
+                planlet_candidate(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    source_line=steps[0].line,
+                    target_line=steps[-1].line,
+                    batch=filtered_carry,
+                    generation_reason=(
+                        f"short_chain_contract;variant={manual_baseline.variant};"
+                        "mode=front_remote_front;"
+                        f"source_count={len(front_sources) + len(remote_sources)};"
+                        f"target_count={len(target_groups)};"
+                        f"vehicle_count={len(filtered_carry)}"
+                    ),
+                    candidate_kind="short_chain_planlet",
+                    steps=tuple(steps),
+                    action_family_override="REPAIR_INBOUND",
+                )
+            )
 
     source_batches = planned_unsatisfied_by_line(
         grouped=grouped,
@@ -5607,6 +6146,7 @@ def route_clear_wrapped_planlet(
     grouped: dict[str, list[dict[str, Any]]],
     staging_priority: tuple[str, ...],
     depot_aware_staging: bool,
+    restore_blockers: bool,
 ) -> HookCandidate | None:
     if not candidate.plan_steps or not blocker_lines or any(line in RUNNING_LINES for line in blocker_lines):
         return None
@@ -5639,7 +6179,7 @@ def route_clear_wrapped_planlet(
     for line, line_blockers in blockers_by_line.items():
         if not reverse_length_fits(line, staging_line, line_blockers):
             return None
-        if not reverse_length_fits(staging_line, line, line_blockers):
+        if restore_blockers and not reverse_length_fits(staging_line, line, line_blockers):
             return None
     staging_positions = first_free_positions_for_batch(cars, staging_line, blockers, blocker_nos)
     if not candidate_positions_available(staging_line, staging_positions, cars, blocker_nos, grouped):
@@ -5648,11 +6188,12 @@ def route_clear_wrapped_planlet(
         return None
     all_nos = blocker_nos | set(candidate.move_car_nos)
     restore_positions_by_line: dict[str, dict[str, int]] = {}
-    for line, line_blockers in blockers_by_line.items():
-        restore_positions = {car_no(car): int(car.get("Position") or 0) for car in line_blockers}
-        if not candidate_positions_available(line, restore_positions, cars, all_nos, grouped):
-            return None
-        restore_positions_by_line[line] = restore_positions
+    if restore_blockers:
+        for line, line_blockers in blockers_by_line.items():
+            restore_positions = {car_no(car): int(car.get("Position") or 0) for car in line_blockers}
+            if not candidate_positions_available(line, restore_positions, cars, all_nos, grouped):
+                return None
+            restore_positions_by_line[line] = restore_positions
 
     blocker_tuple = tuple(car_no(car) for car in blockers)
     steps = (
@@ -5663,33 +6204,41 @@ def route_clear_wrapped_planlet(
         ),
         PlanStep("Put", staging_line, blocker_tuple, staging_positions),
         *candidate_plan_steps(candidate),
-        PlanStep("Get", staging_line, blocker_tuple),
         *(
-            PlanStep(
-                "Put",
-                line,
-                tuple(car_no(car) for car in blockers_by_line[line]),
-                restore_positions_by_line[line],
+            (
+                PlanStep("Get", staging_line, blocker_tuple),
+                *(
+                    PlanStep(
+                        "Put",
+                        line,
+                        tuple(car_no(car) for car in blockers_by_line[line]),
+                        restore_positions_by_line[line],
+                    )
+                    for line in blocker_lines
+                    if line in blockers_by_line
+                ),
             )
-            for line in blocker_lines
-            if line in blockers_by_line
+            if restore_blockers
+            else ()
         ),
     )
     wrapped_nos = blocker_nos | set(candidate.move_car_nos)
+    candidate_kind = "route_clear_restore_planlet" if restore_blockers else "route_clear_session_planlet"
     return planlet_candidate(
         case_id=case_id,
         hook_index=hook_index,
         source_line=blocker_lines[0],
-        target_line=blocker_lines[0],
+        target_line=blocker_lines[0] if restore_blockers else candidate_final_line(candidate),
         batch=[car for car in cars if car_no(car) in wrapped_nos],
         generation_reason=(
             "route_clear_wrapped_planlet;"
             f"blocker_lines={','.join(blocker_lines)};staging_line={staging_line};"
             f"wrapped_kind={candidate.candidate_kind};wrapped_source={candidate.source_line};"
             f"wrapped_target={candidate.target_line};blocker_count={len(blockers)};"
-            f"wrapped_vehicle_count={len(candidate.move_car_nos)}"
+            f"wrapped_vehicle_count={len(candidate.move_car_nos)};"
+            f"restore_blockers={int(restore_blockers)}"
         ),
-        candidate_kind="route_clear_restore_planlet",
+        candidate_kind=candidate_kind,
         steps=steps,
         action_family_override=candidate.action_family,
     )
@@ -5734,6 +6283,7 @@ def route_clear_planlets_for_candidate(
             grouped=grouped,
             staging_priority=staging_priority,
             depot_aware_staging=depot_aware_staging,
+            restore_blockers=False,
         )
         return [wrapped] if wrapped else []
     if candidate.candidate_kind not in {"target_move", "depot_same_line_repack"}:
@@ -5760,6 +6310,7 @@ def route_clear_planlets_for_candidate(
                 grouped=grouped,
                 staging_priority=staging_priority,
                 depot_aware_staging=depot_aware_staging,
+                restore_blockers=True,
             )
         session = route_clear_session_planlet(
             case_id=case_id,
@@ -5919,6 +6470,7 @@ def build_candidates(
     enable_front_capacity_contracts: bool = False,
     suppress_ownerless_recovery: bool = False,
     manual_baseline: ManualBaseline | None = None,
+    allow_early_remote_entry_prep: bool = False,
 ) -> tuple[list[HookCandidate], list[CandidateAuditRow]]:
     planlet_candidates: list[HookCandidate] = []
     legacy_recovery_candidates: list[HookCandidate] = []
@@ -6662,6 +7214,22 @@ def build_candidates(
         )
         if enable_front_capacity_contracts:
             planlet_candidates.extend(
+                remote_entry_capacity_prep_planlets(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    planned=planned,
+                    satisfied=satisfied,
+                    length_load_lookup=length_load_lookup(),
+                    grouped=grouped,
+                    staging_priority=staging_priority,
+                    depot_aware_staging=depot_aware_staging,
+                    manual_baseline=manual_baseline,
+                    allow_early_remote_entry_prep=allow_early_remote_entry_prep,
+                )
+            )
+            planlet_candidates.extend(
                 front_capacity_digest_planlets(
                     case_id=case_id,
                     hook_index=hook_index,
@@ -6764,6 +7332,30 @@ def build_candidates(
                 manual_baseline=manual_baseline,
             )
         )
+
+    if graph and loco_location:
+        route_clear_seed_candidates = [*tail_candidates, *planlet_candidates, *direct_candidates]
+        for seed_candidate in route_clear_seed_candidates:
+            if seed_candidate.candidate_kind in ROUTE_CLEAR_WRAP_EXCLUDED_KINDS:
+                continue
+            for wrapped_candidate in route_clear_planlets_for_candidate(
+                graph=graph,
+                loco_location=loco_location,
+                candidate=seed_candidate,
+                case_id=case_id,
+                hook_index=hook_index,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                length_load_lookup=length_load_lookup(),
+                grouped=grouped,
+                staging_priority=staging_priority,
+                depot_aware_staging=depot_aware_staging,
+                include_restore=not suppress_ownerless_recovery or candidate_touches_remote_interaction(seed_candidate),
+            ):
+                if wrapped_candidate.candidate_kind in OWNERLESS_RECOVERY_KINDS and not owner_bound_restore_candidate(wrapped_candidate):
+                    legacy_recovery_candidates.append(wrapped_candidate)
+                else:
+                    planlet_candidates.append(wrapped_candidate)
 
     ordered_candidates: list[HookCandidate] = [*tail_candidates, *planlet_candidates, *direct_candidates]
     if not suppress_ownerless_recovery or not ordered_candidates:
@@ -7753,11 +8345,90 @@ def structural_reject_reason(
     reduction: int,
     non_depot_reduction: int,
     after_unsatisfied: int,
+    after_remote_debt: int,
     physically_accepted: list[tuple[HookCandidate, PhysicalValidation, str]],
     transition_metrics: Any,
+    remote_debt_metrics: Any,
+    remote_session_state: RemoteSessionState,
     repair_mode: str,
     manual_baseline: ManualBaseline | None = None,
 ) -> str:
+    remote_session_reason = remote_session_contract_violation_reason(candidate, remote_session_state)
+    if remote_session_reason:
+        return remote_session_reason
+    if (
+        remote_session_state.debt > 0
+        and candidate_refills_leased_corridor(candidate, remote_session_state.leased_corridor_lines)
+        and not candidate_touches_remote_interaction(candidate)
+        and not (
+            remote_session_state.debt <= 4
+            and after_unsatisfied <= 8
+            and reduction > 0
+        )
+    ):
+        return (
+            "p7_reject_remote_corridor_lease_refill:"
+            f"kind={candidate.candidate_kind}:"
+            f"leased_corridor_lines={','.join(remote_session_state.leased_corridor_lines)}:"
+            f"remote_debt={remote_session_state.debt}"
+        )
+
+    def remote_session_progress_available() -> bool:
+        for other_candidate, _other_validation, other_phase_reason in physically_accepted:
+            if other_candidate.candidate_id == candidate.candidate_id or other_phase_reason:
+                continue
+            if not candidate_touches_remote_interaction(other_candidate):
+                continue
+            if remote_session_contract_violation_reason(other_candidate, remote_session_state):
+                continue
+            other_transition_count = candidate_remote_business_transition_count(
+                other_candidate,
+                remote_session_state.last_business_hook_remote,
+            )
+            other_remote_reduction, other_after_remote_debt = remote_debt_metrics(other_candidate, _other_validation)
+            if other_remote_reduction <= 0 or other_after_remote_debt >= remote_session_state.debt:
+                continue
+            if (
+                remote_session_state.budget is not None
+                and remote_session_state.current_transition_count + other_transition_count > remote_session_state.budget
+                and other_after_remote_debt > 0
+            ):
+                continue
+            return True
+        return False
+
+    if (
+        remote_session_state.active
+        and remote_session_state.debt > 0
+        and after_remote_debt > 0
+        and not candidate_touches_remote_interaction(candidate)
+        and remote_session_state.batch_index < remote_session_state.max_batch_count
+        and remote_session_progress_available()
+    ):
+        return (
+            "p7_reject_remote_session_front_interruption:"
+            f"kind={candidate.candidate_kind}:remote_debt={remote_session_state.debt}:"
+            f"after_remote_debt={after_remote_debt}:session_index={remote_session_state.session_index}"
+        )
+    candidate_transition_count = candidate_remote_business_transition_count(
+        candidate,
+        remote_session_state.last_business_hook_remote,
+    )
+    if (
+        remote_session_state.budget is not None
+        and remote_session_state.current_transition_count + candidate_transition_count > remote_session_state.budget
+        and after_remote_debt > 0
+        and not (
+            after_unsatisfied <= 8
+            and reduction > 0
+        )
+    ):
+        return (
+            "p7_reject_remote_transition_budget:"
+            f"kind={candidate.candidate_kind}:current={remote_session_state.current_transition_count}:"
+            f"candidate={candidate_transition_count}:"
+            f"budget={remote_session_state.budget}:session_index={remote_session_state.session_index}"
+        )
     hook_count = max(1, planlet_business_hook_count(candidate))
     remote_cross_count = planlet_remote_cross_count(candidate)
     internal_remote_transitions = candidate_internal_remote_transition_count(candidate)
@@ -7777,9 +8448,34 @@ def structural_reject_reason(
             f"kind={candidate.candidate_kind}:after_unsatisfied={after_unsatisfied}"
         )
 
+    def structurally_comparable_candidate(other_candidate: HookCandidate) -> bool:
+        if remote_session_contract_violation_reason(other_candidate, remote_session_state):
+            return False
+        if (
+            remote_session_state.debt > 0
+            and candidate_refills_leased_corridor(other_candidate, remote_session_state.leased_corridor_lines)
+            and not candidate_touches_remote_interaction(other_candidate)
+        ):
+            return False
+        other_transition_count = candidate_remote_business_transition_count(
+            other_candidate,
+            remote_session_state.last_business_hook_remote,
+        )
+        if (
+            remote_session_state.budget is not None
+            and remote_session_state.current_transition_count + other_transition_count > remote_session_state.budget
+        ):
+            return False
+        return (
+            candidate_internal_remote_transition_count(other_candidate)
+            <= candidate_allowed_internal_remote_transitions(other_candidate)
+        )
+
     def better_non_recovery_available() -> bool:
         for other_candidate, other_validation, other_phase_reason in physically_accepted:
             if other_candidate.candidate_id == candidate.candidate_id or other_phase_reason:
+                continue
+            if not structurally_comparable_candidate(other_candidate):
                 continue
             if other_candidate.candidate_kind in {
                 "route_clear_restore_planlet",
@@ -7881,6 +8577,8 @@ def structural_reject_reason(
     for other_candidate, other_validation, other_phase_reason in physically_accepted:
         if other_candidate.candidate_id == candidate.candidate_id or other_phase_reason:
             continue
+        if not structurally_comparable_candidate(other_candidate):
+            continue
         other_reduction, other_non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(
             other_candidate,
             other_validation,
@@ -7913,6 +8611,7 @@ def aligned_selection_key(
     *,
     transition_metrics: Any,
     phase_state: PhaseState,
+    remote_session_plan: RemoteSessionPlan,
     last_hook_touched_remote: bool,
     remote_streak_count: int,
     last_business_hook_remote: bool | None = None,
@@ -7921,7 +8620,7 @@ def aligned_selection_key(
     reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, item[1])
     continue_remote_session = (
         last_hook_touched_remote
-        and remote_streak_count < REMOTE_CONTINUITY_MAX_STREAK
+        and remote_streak_count < remote_session_plan.continuity_limit
     )
     continuity_penalty = (
         0
@@ -7945,6 +8644,7 @@ def contract_planlet_selection_key(
     *,
     transition_metrics: Any,
     phase_state: PhaseState,
+    remote_session_plan: RemoteSessionPlan,
     last_hook_touched_remote: bool,
     remote_streak_count: int,
     last_business_hook_remote: bool | None = None,
@@ -7955,7 +8655,7 @@ def contract_planlet_selection_key(
     hook_count = max(1, planlet_business_hook_count(candidate))
     continue_remote_session = (
         last_hook_touched_remote
-        and remote_streak_count < REMOTE_CONTINUITY_MAX_STREAK
+        and remote_streak_count < remote_session_plan.continuity_limit
     )
     continuity_penalty = (
         0
@@ -8020,13 +8720,20 @@ def remote_session_selection_key(
     hook_count = max(1, planlet_business_hook_count(candidate))
     touched_remote = candidate_touches_remote_interaction(candidate)
     remote_transition_count = candidate_remote_business_transition_count(candidate, last_business_hook_remote)
-    ends_remote = candidate_ends_remote(candidate)
+    ends_remote = candidate_ends_in_remote(candidate)
     role = candidate_remote_session_role(candidate)
     if not touched_remote:
         role = 9
     if candidate.candidate_kind in REMOTE_SESSION_RESTORE_KINDS and (reduction <= 0 and non_depot_reduction <= 0):
         role = 10
-    unfinished_exit_penalty = 1 if after_remote_debt > 0 and not ends_remote else 0
+    unfinished_exit_penalty = int(
+        after_remote_debt > 0
+        and not ends_remote
+        and (
+            remote_session_state.active
+            or remote_session_state.target_session_count <= 1
+        )
+    )
     plan_rank = remote_session_plan_profile_rank(candidate, remote_session_plan, last_business_hook_remote)
     if remote_transition_first:
         return (
@@ -8177,6 +8884,12 @@ def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
     if right.remote_business_transition_count + remote_slack < left.remote_business_transition_count:
         return False
 
+    hook_slack = max(3, round(right.business_get_put_hook_count * 0.10))
+    if left.business_get_put_hook_count > right.business_get_put_hook_count + hook_slack:
+        return False
+    if right.business_get_put_hook_count > left.business_get_put_hook_count + hook_slack:
+        return True
+
     left_remote = (
         left.remote_interaction_cross_count,
         left.remote_interaction_batch_count,
@@ -8192,12 +8905,6 @@ def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
 
     if left.remote_business_transition_count != right.remote_business_transition_count:
         return left.remote_business_transition_count < right.remote_business_transition_count
-
-    hook_slack = max(3, round(right.business_get_put_hook_count * 0.10))
-    if left.business_get_put_hook_count > right.business_get_put_hook_count + hook_slack:
-        return False
-    if right.business_get_put_hook_count > left.business_get_put_hook_count + hook_slack:
-        return True
 
     return (
         left.business_get_put_hook_count,
@@ -8378,6 +9085,7 @@ def run_case_with_diagnostics(
             enable_contract_planlets=True,
             prefer_contract_planlets=True,
             enable_remote_session_contracts=True,
+            enable_remote_session_bundle_contracts=True,
             front_debt_first=True,
             enable_front_capacity_contracts=True,
             suppress_ownerless_recovery=True,
@@ -8385,9 +9093,37 @@ def run_case_with_diagnostics(
         aligned_short_direct = is_short_direct_depot_variant(case_id) or short_chain_manual
         strategies = [
             ("aligned_base", base_assignment, aligned_short_direct, aligned_config),
+            (
+                "aligned_base_transition_first",
+                base_assignment,
+                aligned_short_direct,
+                replace(aligned_config, remote_transition_first=True),
+            ),
+            (
+                "aligned_base_early_entry_prep",
+                base_assignment,
+                aligned_short_direct,
+                replace(aligned_config, allow_early_remote_entry_prep=True),
+            ),
         ]
         if cluster_feasible:
             strategies.append(("aligned_cluster", clustered_assignment, aligned_short_direct, aligned_config))
+            strategies.append(
+                (
+                    "aligned_cluster_transition_first",
+                    clustered_assignment,
+                    aligned_short_direct,
+                    replace(aligned_config, remote_transition_first=True),
+                )
+            )
+            strategies.append(
+                (
+                    "aligned_cluster_early_entry_prep",
+                    clustered_assignment,
+                    aligned_short_direct,
+                    replace(aligned_config, allow_early_remote_entry_prep=True),
+                )
+            )
         if strategy_name_filter:
             filtered = [item for item in strategies if strategy_name_filter in item[0]]
             if filtered:
@@ -8609,6 +9345,7 @@ def _run_case_once(
     remote_session_id = 0
     current_remote_session_batch_index = 0
     current_remote_session_profile_counts: Counter[str] = Counter()
+    leased_remote_corridor_lines: set[str] = set()
     aligned_mode = repair_mode == ALIGNED_REPAIR_MODE
     while input_ok and not blocked_reason and hook_index <= max_hooks and current_unsatisfied:
         best_non_depot_unsatisfied_count = min(
@@ -8647,6 +9384,7 @@ def _run_case_once(
                 enable_front_capacity_contracts=effective_enable_front_capacity_contracts,
                 suppress_ownerless_recovery=suppress_ownerless_recovery,
                 manual_baseline=manual_baseline,
+                allow_early_remote_entry_prep=strategy_config.allow_early_remote_entry_prep,
             )
 
         candidates, blocked_rows = build_round_candidates(
@@ -8766,6 +9504,7 @@ def _run_case_once(
             depot_assignment=depot_assignment,
             phase_state=phase_state,
             manual_baseline=manual_baseline,
+            remote_session_id=remote_session_id,
             last_hook_touched_remote=last_hook_touched_remote,
             last_business_hook_remote=last_business_hook_remote,
             remote_streak_count=remote_streak_count,
@@ -8793,6 +9532,7 @@ def _run_case_once(
                 enable_front_capacity_contracts=effective_enable_front_capacity_contracts,
                 suppress_ownerless_recovery=aligned_mode,
                 manual_baseline=manual_baseline,
+                allow_early_remote_entry_prep=strategy_config.allow_early_remote_entry_prep,
             )
             for next_candidate in next_candidates:
                 if validator.validate(next_candidate, prospective_cars, next_loco_location, depot_assignment).accepted:
@@ -8811,7 +9551,7 @@ def _run_case_once(
             hook_count = max(1, planlet_business_hook_count(candidate))
             continue_remote_session = (
                 last_hook_touched_remote
-                and remote_streak_count < REMOTE_CONTINUITY_MAX_STREAK
+                and remote_streak_count < remote_session_plan.continuity_limit
             )
             continuity_penalty = (
                 0
@@ -8830,6 +9570,7 @@ def _run_case_once(
         def selection_key(item: tuple[HookCandidate, PhysicalValidation, str]) -> Any:
             candidate = item[0]
             transition_over_budget = remote_transition_budget.over_budget_after(candidate)
+            remote_state = current_remote_session_state()
             if len(current_unsatisfied) <= 6 and candidate.has_weigh and not item[2]:
                 return (
                     0,
@@ -8838,8 +9579,11 @@ def _run_case_once(
                     candidate_remote_business_transition_count(candidate, last_business_hook_remote),
                     candidate_sort_key(candidate),
                 )
-            remote_state = current_remote_session_state()
-            if remote_state.active and candidate_touches_remote_interaction(candidate):
+            if (
+                effective_enable_remote_session_contracts
+                and remote_state.debt > 0
+                and candidate_touches_remote_interaction(candidate)
+            ):
                 return (
                     1 if transition_over_budget else 0,
                     0,
@@ -8862,52 +9606,7 @@ def _run_case_once(
                         item,
                         transition_metrics=transition_metrics,
                         phase_state=phase_state,
-                        last_hook_touched_remote=last_hook_touched_remote,
-                        remote_streak_count=remote_streak_count,
-                        last_business_hook_remote=last_business_hook_remote,
-                        remote_transition_first=strategy_config.remote_transition_first,
-                    ),
-                )
-            if strategy_config.front_debt_first or aligned_mode:
-                candidate, validation, phase_reason = item
-                reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, validation)
-                front_debt_active = (
-                    phase_state.front_service_progress < 0.95
-                    and not phase_reason
-                    and (reduction > 0 or non_depot_reduction > 0)
-                )
-                front_priority = (
-                    0
-                    if front_debt_active and candidate_is_front_service(candidate)
-                    else 1
-                    if front_debt_active and candidate_touches_remote_interaction(candidate)
-                    else 0
-                )
-                if (
-                    effective_enable_remote_session_contracts
-                    and candidate_touches_remote_interaction(candidate)
-                ):
-                    return (
-                        1 if transition_over_budget else 0,
-                        2 + front_priority,
-                        remote_session_selection_key(
-                            item,
-                            transition_metrics=transition_metrics,
-                            remote_debt_metrics=remote_debt_metrics,
-                            phase_state=phase_state,
-                            remote_session_state=remote_state,
-                            remote_session_plan=remote_session_plan,
-                            last_business_hook_remote=last_business_hook_remote,
-                            remote_transition_first=strategy_config.remote_transition_first,
-                        ),
-                    )
-                return (
-                    1 if transition_over_budget else 0,
-                    2 + front_priority,
-                    contract_planlet_selection_key(
-                        item,
-                        transition_metrics=transition_metrics,
-                        phase_state=phase_state,
+                        remote_session_plan=remote_session_plan,
                         last_hook_touched_remote=last_hook_touched_remote,
                         remote_streak_count=remote_streak_count,
                         last_business_hook_remote=last_business_hook_remote,
@@ -8925,10 +9624,10 @@ def _run_case_once(
                         item,
                         transition_metrics=transition_metrics,
                         phase_state=phase_state,
+                        remote_session_plan=remote_session_plan,
                         last_hook_touched_remote=last_hook_touched_remote,
                         remote_streak_count=remote_streak_count,
                         last_business_hook_remote=last_business_hook_remote,
-                        remote_transition_first=strategy_config.remote_transition_first,
                     ),
                 )
             if strategy_config.prefer_contract_planlets:
@@ -8939,6 +9638,7 @@ def _run_case_once(
                         item,
                         transition_metrics=transition_metrics,
                         phase_state=phase_state,
+                        remote_session_plan=remote_session_plan,
                         last_hook_touched_remote=last_hook_touched_remote,
                         remote_streak_count=remote_streak_count,
                         last_business_hook_remote=last_business_hook_remote,
@@ -8951,36 +9651,43 @@ def _run_case_once(
             )
 
         def current_remote_session_state() -> RemoteSessionState:
-            active = (
+            session_index = remote_session_id if last_hook_touched_remote else (remote_session_id + 1 if remote_interaction_debt > 0 else remote_session_id)
+            next_session_index = remote_session_id + 1 if remote_interaction_debt > 0 else remote_session_id
+            session_open = (
                 bool(effective_enable_remote_session_contracts)
-                and last_hook_touched_remote
                 and remote_interaction_debt > 0
-                and remote_streak_count < REMOTE_CONTINUITY_MAX_STREAK
             )
-            max_batch_count = 4 if phase_state.active_variant == "SHORT_DIRECT_DEPOT" else 8
+            active = (
+                session_open
+                and last_hook_touched_remote
+            )
+            max_batch_count = remote_session_plan.continuity_limit
             return RemoteSessionState(
                 active=active,
                 debt=remote_interaction_debt,
                 batch_index=remote_streak_count,
                 max_batch_count=max_batch_count,
+                session_index=session_index,
+                next_session_index=next_session_index,
+                target_session_count=remote_session_plan.target_session_count,
+                owner_profile=remote_session_plan.owner_profile,
+                entry_profiles=remote_session_plan.entry_profiles,
+                exit_profiles=remote_session_plan.exit_profiles,
+                must_finish_debt=remote_session_plan.must_finish_debt,
+                budget=remote_session_plan.budget,
+                current_transition_count=remote_session_plan.current_transition_count,
+                last_business_hook_remote=last_business_hook_remote,
                 stage=remote_session_plan.stage,
                 preferred_profiles=remote_session_plan.preferred_profiles,
                 allowed_profiles=remote_session_plan.allowed_profiles,
+                tail_mode=remote_session_plan.stage == REMOTE_SESSION_STAGE_TAIL,
+                leased_corridor_lines=tuple(sorted(leased_remote_corridor_lines)),
             )
 
+        remote_state = current_remote_session_state()
         phase_selectable = [item for item in physically_accepted if not item[2]]
-        remote_session_should_continue = (
-            current_remote_session_state().active
-            and any(
-                not item[2] and candidate_touches_remote_interaction(item[0])
-                for item in physically_accepted
-            )
-        )
-        selectable_items = (
-            [item for item in physically_accepted if candidate_touches_remote_interaction(item[0]) or item[2]]
-            if remote_session_should_continue
-            else physically_accepted
-        )
+        remote_session_should_continue = remote_state.active and remote_state.debt > 0
+        selectable_items = physically_accepted
 
         for candidate, validation, phase_reason in sorted(selectable_items, key=selection_key):
             if phase_reason:
@@ -8999,6 +9706,7 @@ def _run_case_once(
                     phase_deferred.append((candidate, validation, phase_reason))
                 continue
             reduction, non_depot_reduction, after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+            _remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
             structural_reason = structural_reject_reason(
                 candidate=candidate,
                 validation=validation,
@@ -9006,8 +9714,11 @@ def _run_case_once(
                 reduction=reduction,
                 non_depot_reduction=non_depot_reduction,
                 after_unsatisfied=after_unsat,
+                after_remote_debt=after_remote_debt,
                 physically_accepted=physically_accepted,
                 transition_metrics=transition_metrics,
+                remote_debt_metrics=remote_debt_metrics,
+                remote_session_state=remote_state,
                 repair_mode=repair_mode,
                 manual_baseline=manual_baseline,
             )
@@ -9073,6 +9784,7 @@ def _run_case_once(
                 ]
             for candidate, validation, phase_reason in sorted(deferred_items, key=selection_key):
                 reduction, non_depot_reduction, after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+                _remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
                 structural_reason = structural_reject_reason(
                     candidate=candidate,
                     validation=validation,
@@ -9080,8 +9792,11 @@ def _run_case_once(
                     reduction=reduction,
                     non_depot_reduction=non_depot_reduction,
                     after_unsatisfied=after_unsat,
+                    after_remote_debt=after_remote_debt,
                     physically_accepted=physically_accepted,
                     transition_metrics=transition_metrics,
+                    remote_debt_metrics=remote_debt_metrics,
+                    remote_session_state=remote_state,
                     repair_mode=repair_mode,
                     manual_baseline=manual_baseline,
                 )
@@ -9348,6 +10063,9 @@ def _run_case_once(
                     break
             cars = prospective_cars
             loco_location = next_loco_location
+            leased_remote_corridor_lines.update(route_clear_leased_corridor_lines(candidate))
+            if remote_interaction_unsatisfied_count(cars, depot_assignment) <= 0:
+                leased_remote_corridor_lines.clear()
             last_hook_touched_remote = candidate_touches_remote_interaction(candidate)
             if not last_hook_touched_remote:
                 current_remote_session_profile_counts = Counter()
