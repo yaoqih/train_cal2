@@ -57,6 +57,7 @@ REMOTE_SESSION_CONTRACT_KINDS = {
     "depot_slot_swap_planlet",
     "target_move",
     "short_chain_planlet",
+    "short_chain_front_tail_planlet",
     "route_clear_session_planlet",
     "source_exit_session_planlet",
     "corridor_closeout_planlet",
@@ -69,6 +70,7 @@ OWNER_BOUND_RECOVERY_KINDS = {
     "depot_digest_planlet",
     "depot_slot_swap_planlet",
     "short_chain_planlet",
+    "short_chain_front_tail_planlet",
     "route_clear_session_planlet",
     "source_exit_session_planlet",
     "corridor_closeout_planlet",
@@ -116,6 +118,7 @@ REMOTE_SESSION_BODY_KINDS = {
     "multi_pick_planlet",
     "multi_drop_planlet",
     "source_line_digest_planlet",
+    "short_chain_front_tail_planlet",
     "target_move",
 }
 REMOTE_SESSION_PRIMARY_KINDS = REMOTE_SESSION_START_KINDS
@@ -159,7 +162,10 @@ TAIL_CANDIDATE_PREFIXES = (
     "tail_direct_closeout",
     "tail_force_group_closeout",
     "tail_depot_same_line_repack",
+    "tail_same_line_reorder",
     "tail_same_line_spot_closeout",
+    "tail_same_source_target_closeout",
+    "tail_same_source_target_loose_closeout",
 )
 STAGING_LINE_PRIORITY = (
     "存5线北",
@@ -195,6 +201,7 @@ DEPOT_STAGING_LINE_PRIORITY = (
 )
 MANUAL_REMOTE_PREFIXES = ("修1", "修2", "修3", "修4", "卸轮")
 SHORT_CHAIN_VARIANTS = {"DIRECT_REPAIR_ENTRY", "DEPOT_DIGEST_ONLY", "MIXED_SIGNAL_REPAIR"}
+SHORT_CHAIN_MAX_MANUAL_HOOKS = 13
 STANDARD_PHASE_ORDER = ("H1", "H2", "H3", "H4", "H5")
 DIAGNOSTIC_STRATEGY_MODE = "diagnostic"
 STANDARD_STRATEGY_MODE = "standard"
@@ -471,6 +478,7 @@ class RemoteSessionState:
     allowed_profiles: tuple[str, ...] = ()
     tail_mode: bool = False
     leased_corridor_lines: tuple[str, ...] = ()
+    short_chain: bool = False
 
 
 @dataclass(frozen=True)
@@ -482,6 +490,17 @@ class RemoteDebtProfile:
     @property
     def total(self) -> int:
         return self.outbound + self.inbound + self.internal
+
+
+@dataclass(frozen=True)
+class SessionDebtSet:
+    outbound: tuple[str, ...]
+    inbound: tuple[str, ...]
+    internal: tuple[str, ...]
+
+    @property
+    def total(self) -> int:
+        return len(self.outbound) + len(self.inbound) + len(self.internal)
 
 
 @dataclass(frozen=True)
@@ -502,6 +521,7 @@ class RemoteSessionPlan:
     continuity_limit: int
     transition_limit: int | None
     current_transition_count: int
+    short_chain: bool
 
 
 @dataclass(frozen=True)
@@ -1243,7 +1263,10 @@ def candidate_internal_remote_transition_count(candidate: HookCandidate) -> int:
 
 
 def candidate_remote_profile(candidate: HookCandidate) -> str:
-    lines = planlet_line_sequence(candidate)
+    return remote_profile_for_lines(planlet_line_sequence(candidate))
+
+
+def remote_profile_for_lines(lines: tuple[str, ...]) -> str:
     if not lines:
         return REMOTE_PROFILE_NONE
     remote_flags = [line in REMOTE_INTERACTION_LINES for line in lines]
@@ -1265,6 +1288,7 @@ def candidate_ends_in_remote(candidate: HookCandidate) -> bool:
 def candidate_allowed_internal_remote_transitions(candidate: HookCandidate) -> int:
     if candidate.candidate_kind in {
         "remote_session_bundle_planlet",
+        "remote_session_contract_planlet",
         "remote_exchange_planlet",
         "depot_slot_swap_planlet",
         "short_chain_planlet",
@@ -1341,23 +1365,78 @@ def remote_debt_profile(cars: list[dict[str, Any]], depot_assignment: DepotAssig
     return RemoteDebtProfile(outbound=outbound, inbound=inbound, internal=internal)
 
 
+def build_session_debt_set(
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+) -> SessionDebtSet:
+    loads = line_loads(cars)
+    outbound: list[str] = []
+    inbound: list[str] = []
+    internal: list[str] = []
+    for car in unsatisfied_cars(cars, depot_assignment):
+        target_line, _position, _reason = planned_target_for_car(car, cars, depot_assignment, loads)
+        source_remote = car["Line"] in REMOTE_INTERACTION_LINES
+        target_remote = target_line in REMOTE_INTERACTION_LINES
+        if source_remote and target_remote:
+            internal.append(car_no(car))
+        elif source_remote:
+            outbound.append(car_no(car))
+        elif target_remote:
+            inbound.append(car_no(car))
+    return SessionDebtSet(
+        outbound=tuple(sorted(outbound)),
+        inbound=tuple(sorted(inbound)),
+        internal=tuple(sorted(internal)),
+    )
+
+
 def remote_session_allowed_profiles(stage: str) -> tuple[str, ...]:
     if stage == REMOTE_SESSION_STAGE_CLOSED:
         return ()
     if stage == REMOTE_SESSION_STAGE_FRONT_PREP:
         return (REMOTE_PROFILE_FRONT_ONLY,)
     if stage == REMOTE_SESSION_STAGE_START_OUTBOUND:
-        return (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
     if stage == REMOTE_SESSION_STAGE_START_INBOUND:
-        return (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+        return (
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
     if stage == REMOTE_SESSION_STAGE_START_INTERNAL:
-        return (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+        return (
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_MIXED,
+        )
     if stage == REMOTE_SESSION_STAGE_REMOTE_INTERNAL:
-        return (REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_MIXED)
+        return (
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_MIXED,
+        )
     if stage == REMOTE_SESSION_STAGE_EXIT_OUTBOUND:
-        return (REMOTE_PROFILE_REMOTE_TO_FRONT, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+        return (
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
     if stage == REMOTE_SESSION_STAGE_ENTER_INBOUND:
-        return (REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY, REMOTE_PROFILE_MIXED)
+        return (
+            REMOTE_PROFILE_FRONT_TO_REMOTE,
+            REMOTE_PROFILE_REMOTE_TO_FRONT,
+            REMOTE_PROFILE_REMOTE_ONLY,
+            REMOTE_PROFILE_MIXED,
+        )
     if stage == REMOTE_SESSION_STAGE_SHORT_DIRECT:
         return (
             REMOTE_PROFILE_REMOTE_TO_FRONT,
@@ -1460,7 +1539,7 @@ def build_remote_session_plan(
     enable_remote_session_contracts: bool,
 ) -> RemoteSessionPlan:
     debt = remote_debt_profile(cars, depot_assignment)
-    short_chain = bool(manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS)
+    short_chain = is_short_chain_baseline(manual_baseline)
     if debt.total <= 0:
         target_session_count = 0
     elif short_chain:
@@ -1595,6 +1674,7 @@ def build_remote_session_plan(
         continuity_limit=continuity_limit,
         transition_limit=transition_limit,
         current_transition_count=current_transition_count,
+        short_chain=short_chain,
     )
 
 
@@ -1664,12 +1744,7 @@ def remote_session_plan_profile_rank(
 def candidate_remote_session_role(candidate: HookCandidate) -> int:
     if not candidate_touches_remote_interaction(candidate):
         return 5
-    if (
-        candidate.candidate_kind == "short_chain_planlet"
-        and "mode=front_remote_front" in candidate.generation_reason
-    ):
-        return 1
-    if candidate.candidate_kind in REMOTE_SESSION_START_KINDS:
+    if candidate_opens_remote_session(candidate):
         return 0
     if candidate.candidate_kind in REMOTE_SESSION_BODY_KINDS:
         return 1
@@ -1680,15 +1755,65 @@ def candidate_remote_session_role(candidate: HookCandidate) -> int:
     return 3
 
 
+def candidate_opens_remote_session(candidate: HookCandidate) -> bool:
+    if candidate.candidate_kind in REMOTE_SESSION_START_KINDS:
+        return True
+    return False
+
+
+def candidate_continues_remote_session(candidate: HookCandidate) -> bool:
+    return (
+        candidate.candidate_kind == "remote_session_contract_planlet"
+        or candidate.candidate_kind == "short_chain_planlet"
+        or candidate.candidate_kind == "route_clear_session_planlet"
+    )
+
+
+def candidate_is_short_chain_contract(candidate: HookCandidate) -> bool:
+    return (
+        candidate.candidate_kind == "short_chain_planlet"
+        or (
+            candidate.candidate_kind == "route_clear_session_planlet"
+            and "wrapped_kind=short_chain_planlet" in candidate.generation_reason
+        )
+    )
+
+
 def remote_session_contract_violation_reason(
     candidate: HookCandidate,
     remote_session_state: RemoteSessionState,
+    after_remote_debt: int | None = None,
+    reduction: int | None = None,
 ) -> str:
     role = candidate_remote_session_role(candidate)
     if role == 5:
         return ""
     profile = candidate_remote_profile(candidate)
+    tail_debt_closeout = (
+        after_remote_debt is not None
+        and reduction is not None
+        and reduction > 0
+        and after_remote_debt < remote_session_state.debt
+        and candidate_touches_remote_interaction(candidate)
+        and remote_cross_has_owner(candidate)
+        and (
+            tail_closeout_candidate(candidate)
+            or owner_bound_restore_candidate(candidate)
+            or owner_bound_remote_unlock_candidate(candidate)
+        )
+    )
+    if tail_debt_closeout:
+        return ""
     if remote_session_state.tail_mode:
+        if (
+            after_remote_debt is not None
+            and after_remote_debt < remote_session_state.debt
+            and candidate_touches_remote_interaction(candidate)
+            and remote_cross_has_owner(candidate)
+            and candidate_internal_remote_transition_count(candidate)
+            <= candidate_allowed_internal_remote_transitions(candidate)
+        ):
+            return ""
         if candidate.candidate_kind in REMOTE_SESSION_TAIL_KINDS and profile in remote_session_state.allowed_profiles:
             return ""
         return (
@@ -1713,13 +1838,22 @@ def remote_session_contract_violation_reason(
                 f"session_index={remote_session_state.session_index}"
             )
         return ""
-    if role == 0:
+    if role == 0 and not (remote_session_state.short_chain and candidate_continues_remote_session(candidate)):
         return (
             "p7_reject_nested_remote_session_start:"
             f"kind={candidate.candidate_kind}:profile={profile}:"
             f"session_index={remote_session_state.session_index}:"
             f"target_session_count={remote_session_state.target_session_count}"
         )
+    if role == 0:
+        if profile not in remote_session_state.allowed_profiles:
+            return (
+                "p7_reject_remote_session_body_profile_mismatch:"
+                f"kind={candidate.candidate_kind}:profile={profile}:"
+                f"allowed_profiles={','.join(remote_session_state.allowed_profiles)}:"
+                f"session_index={remote_session_state.session_index}"
+            )
+        return ""
     if candidate.candidate_kind in REMOTE_SESSION_BODY_KINDS:
         if profile not in remote_session_state.allowed_profiles:
             return (
@@ -1782,6 +1916,17 @@ def manual_hook_touches_remote(hook: Any) -> bool:
     line = normalize_line(hook.line or hook.line_raw or "")
     raw_line = str(hook.line_raw or "")
     return line in REMOTE_INTERACTION_LINES or raw_line.startswith(MANUAL_REMOTE_PREFIXES)
+
+
+def is_short_chain_baseline(manual_baseline: ManualBaseline | None) -> bool:
+    if manual_baseline is None:
+        return False
+    if manual_baseline.variant == "DIRECT_REPAIR_ENTRY":
+        return True
+    return (
+        manual_baseline.variant in SHORT_CHAIN_VARIANTS
+        and manual_baseline.observed_hook_count <= SHORT_CHAIN_MAX_MANUAL_HOOKS
+    )
 
 
 def planlet_candidate_id(
@@ -2863,7 +3008,7 @@ def phase_reject_reason(
                 f"expected_phase={expected_phase}:manual_variant={manual_variant}"
             )
         if expected_phase in {"H1", "H2"} and candidate.action_family in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}:
-            if manual_variant not in SHORT_CHAIN_VARIANTS:
+            if not is_short_chain_baseline(manual_baseline):
                 return (
                     "phase_manual_defer_action_family:"
                     f"expected_phase={expected_phase}:action_family={candidate.action_family}:"
@@ -4096,7 +4241,7 @@ def source_line_digest_planlet(
     grouped: dict[str, list[dict[str, Any]]],
     manual_baseline: ManualBaseline | None,
 ) -> HookCandidate | None:
-    if manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS:
+    if is_short_chain_baseline(manual_baseline):
         return None
     if line in FRONT_SERVICE_TARGET_LINES or line in REMOTE_INTERACTION_LINES:
         return None
@@ -4355,6 +4500,8 @@ def contract_carry_planlets(
     max_sources: int = 4,
     max_targets: int = 4,
     oriented_exchange_variants: bool = False,
+    allow_weigh: bool = False,
+    include_weigh_step: bool = False,
 ) -> list[HookCandidate]:
     source_batches: list[tuple[str, list[dict[str, Any]]]] = []
     for line, line_cars in sorted(grouped.items()):
@@ -4368,7 +4515,12 @@ def contract_carry_planlets(
             if satisfied(car):
                 break
             target_line, _position, _reason = planned(car)
-            if not target_line or target_line == line or not target_filter(target_line) or car.get("IsWeigh"):
+            if (
+                not target_line
+                or target_line == line
+                or not target_filter(target_line)
+                or (car.get("IsWeigh") and not allow_weigh)
+            ):
                 if batch:
                     break
                 continue
@@ -4461,25 +4613,27 @@ def contract_carry_planlets(
             PlanStep("Get", line, tuple(car_no(car) for car in batch))
             for line, batch in filtered_sources
         ]
+        weigh_nos = tuple(car_no(car) for car in filtered_carry if car.get("IsWeigh") and not car.get("_Weighed"))
+        if include_weigh_step and weigh_nos:
+            steps.append(PlanStep("Weigh", WEIGH_LINE, weigh_nos))
         steps.extend(put_steps)
 
-        candidates.append(
-            planlet_candidate(
-                case_id=case_id,
-                hook_index=hook_index,
-                source_line=filtered_sources[0][0],
-                target_line=put_steps[-1].line,
-                batch=filtered_carry,
-                generation_reason=(
-                    f"{candidate_kind};contract={contract_name};mode={mode};"
-                    f"source_count={len(filtered_sources)};target_count={len(put_steps)};"
-                    f"vehicle_count={len(filtered_carry)}"
-                ),
-                candidate_kind=candidate_kind,
-                steps=tuple(steps),
-                action_family_override=contract_name,
-            )
+        candidate = planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=filtered_sources[0][0],
+            target_line=put_steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                f"{candidate_kind};contract={contract_name};mode={mode};"
+                f"source_count={len(filtered_sources)};target_count={len(put_steps)};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind=candidate_kind,
+            steps=tuple(steps),
+            action_family_override=contract_name,
         )
+        candidates.append(candidate)
 
     append_contract_candidate(
         source_order=selected_sources,
@@ -4487,7 +4641,7 @@ def contract_carry_planlets(
         mode="primary",
     )
     if candidate_kind == "remote_exchange_planlet" and oriented_exchange_variants:
-        front_first_sources = sorted(
+        front_first_order = sorted(
             selected_sources,
             key=lambda item: (item[0] in REMOTE_INTERACTION_LINES, item[0]),
         )
@@ -4495,9 +4649,9 @@ def contract_carry_planlets(
             target_groups,
             key=lambda line: (line not in REMOTE_INTERACTION_LINES, line not in DEPOT_LINES, line),
         )
-        if front_first_sources != selected_sources or remote_first_targets != target_order:
+        if front_first_order != selected_sources or remote_first_targets != target_order:
             append_contract_candidate(
-                source_order=front_first_sources,
+                source_order=front_first_order,
                 ordered_targets=remote_first_targets,
                 mode="front_remote_front",
             )
@@ -4559,9 +4713,9 @@ def remote_exchange_planlets(
         target_filter=lambda line: line in DEPOT_TARGET_LINES or line in {"存4线", "油漆线", "卸轮线"},
         max_sources=4,
         max_targets=4,
-        oriented_exchange_variants=not (
-            manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS
-        ),
+        oriented_exchange_variants=not is_short_chain_baseline(manual_baseline),
+        allow_weigh=True,
+        include_weigh_step=True,
     )
 
 
@@ -4574,6 +4728,7 @@ def planned_unsatisfied_by_line(
     target_filter: Any,
     max_per_line: int = 20,
     include_same_line: bool = False,
+    allow_weigh: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
     for line, line_cars in grouped.items():
@@ -4588,7 +4743,7 @@ def planned_unsatisfied_by_line(
                 not target_line
                 or (target_line == line and not include_same_line)
                 or not target_filter(target_line)
-                or car.get("IsWeigh")
+                or (car.get("IsWeigh") and not allow_weigh)
             ):
                 continue
             batch.append(car)
@@ -4639,6 +4794,7 @@ def build_carry_drop_steps(
     depot_assignment: DepotAssignment,
     grouped: dict[str, list[dict[str, Any]]],
     length_load_lookup: dict[str, float],
+    include_weigh_step: bool = False,
 ) -> tuple[list[PlanStep], list[dict[str, Any]]]:
     provisional_nos = {car_no(car) for _line, batch in selected_sources for car in batch}
     accepted_lines: list[str] = []
@@ -4680,6 +4836,9 @@ def build_carry_drop_steps(
         PlanStep("Get", line, tuple(car_no(car) for car in batch))
         for line, batch in filtered_sources
     ]
+    weigh_nos = tuple(car_no(car) for car in filtered_carry if car.get("IsWeigh") and not car.get("_Weighed"))
+    if include_weigh_step and weigh_nos:
+        steps.append(PlanStep("Weigh", WEIGH_LINE, weigh_nos))
     for target_line in accepted_lines:
         batch = [car for car in target_groups[target_line] if car_no(car) in final_nos]
         if not append_put_step_if_valid(
@@ -4695,6 +4854,7 @@ def build_carry_drop_steps(
             return [], []
     return steps, filtered_carry
 
+
 def select_source_batches(
     source_map: dict[str, list[dict[str, Any]]],
     *,
@@ -4702,13 +4862,18 @@ def select_source_batches(
     max_pull: int = PULL_LIMIT_EQUIVALENT,
     max_per_source: int = 8,
     remote_first: bool = True,
+    sort_key: Any | None = None,
 ) -> tuple[list[tuple[str, list[dict[str, Any]]]], list[dict[str, Any]]]:
     selected_sources: list[tuple[str, list[dict[str, Any]]]] = []
     carry: list[dict[str, Any]] = []
     line_key = (
-        (lambda item: (item[0] not in REMOTE_INTERACTION_LINES, item[0]))
-        if remote_first
-        else (lambda item: item[0])
+        sort_key
+        if sort_key is not None
+        else (
+            (lambda item: (item[0] not in REMOTE_INTERACTION_LINES, item[0]))
+            if remote_first
+            else (lambda item: item[0])
+        )
     )
     for line, batch in sorted(source_map.items(), key=line_key):
         selected: list[dict[str, Any]] = []
@@ -4797,6 +4962,7 @@ def depot_digest_planlets(
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
         max_per_line=10,
+        allow_weigh=True,
     )
     inbound_sources = planned_unsatisfied_by_line(
         grouped=grouped,
@@ -4812,6 +4978,7 @@ def depot_digest_planlets(
         satisfied=satisfied,
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        include_same_line=True,
         max_per_line=8,
     )
     selected_outbound, outbound_carry = select_source_batches(
@@ -4825,6 +4992,12 @@ def depot_digest_planlets(
         max_sources=4,
         max_per_source=8,
         remote_first=False,
+        sort_key=lambda item: (
+            item[0] != "存4线",
+            not any(planned(car)[0] in DEPOT_LINES for car in item[1]),
+            any(car.get("IsWeigh") for car in item[1]),
+            item[0],
+        ),
     )
     selected_internal, internal_carry = select_source_batches(
         internal_sources,
@@ -4874,6 +5047,9 @@ def depot_digest_planlets(
             PlanStep("Get", line, tuple(car_no(car) for car in batch))
             for line, batch in filtered_sources
         ]
+        weigh_nos = tuple(car_no(car) for car in filtered_carry if car.get("IsWeigh") and not car.get("_Weighed"))
+        if name == "outbound_only" and weigh_nos:
+            steps.append(PlanStep("Weigh", WEIGH_LINE, weigh_nos))
         for target_line in accepted_lines:
             batch = [car for car in target_groups[target_line] if car_no(car) in final_nos]
             if not append_put_step_if_valid(
@@ -4946,13 +5122,12 @@ def depot_slot_swap_planlets(
 ) -> list[HookCandidate]:
     candidates: list[HookCandidate] = []
     for source_line, line_cars in sorted(grouped.items()):
-        if source_line in REMOTE_INTERACTION_LINES:
-            continue
+        source_remote = source_line in REMOTE_INTERACTION_LINES
         first = next((car for car in line_cars if not satisfied(car)), None)
         if first is None:
             continue
         target_line, _position, _reason = planned(first)
-        if target_line not in DEPOT_LINES:
+        if target_line not in DEPOT_LINES or source_line == target_line:
             continue
         inbound_batch = first_front_batch_to_target(
             line_cars=line_cars,
@@ -4974,14 +5149,19 @@ def depot_slot_swap_planlets(
         )
         if len(inbound_positions) != len(inbound_batch):
             continue
-        blockers = [
-            car
-            for car in target_position_occupants(cars, target_line, set(inbound_positions.values()), inbound_nos)
-            if not is_locked_depot_stayer(car, depot_assignment)
-            and not satisfied(car)
-            and planned(car)[0]
-            and planned(car)[0] != target_line
-        ]
+        blockers: list[dict[str, Any]] = []
+        for car in target_position_occupants(cars, target_line, set(inbound_positions.values()), inbound_nos):
+            blocker_target, _blocker_position, _blocker_reason = planned(car)
+            if (
+                is_locked_depot_stayer(car, depot_assignment)
+                or satisfied(car)
+                or not blocker_target
+                or blocker_target == target_line
+            ):
+                continue
+            if source_remote and blocker_target not in REMOTE_INTERACTION_LINES:
+                continue
+            blockers.append(car)
         if not blockers or pull_equivalent(blockers) > PULL_LIMIT_EQUIVALENT:
             continue
         blocker_targets = target_groups_for_carry(blockers, planned)
@@ -5010,9 +5190,19 @@ def depot_slot_swap_planlets(
             continue
         if not line_has_length_capacity(target_line, cars, inbound_batch, all_nos, length_load_lookup, grouped):
             continue
-        steps: list[PlanStep] = [
-            PlanStep("Get", target_line, tuple(car_no(car) for car in blockers))
-        ]
+        steps: list[PlanStep]
+        if source_line in REMOTE_INTERACTION_LINES:
+            steps = [
+                PlanStep("Get", target_line, tuple(car_no(car) for car in blockers)),
+                PlanStep("Get", source_line, tuple(car_no(car) for car in inbound_batch)),
+                PlanStep("Put", target_line, tuple(car_no(car) for car in inbound_batch), inbound_positions),
+            ]
+        else:
+            steps = [
+                PlanStep("Get", source_line, tuple(car_no(car) for car in inbound_batch)),
+                PlanStep("Get", target_line, tuple(car_no(car) for car in blockers)),
+                PlanStep("Put", target_line, tuple(car_no(car) for car in inbound_batch), inbound_positions),
+            ]
         for line in accepted_blocker_lines:
             batch = [car for car in blocker_targets[line] if car_no(car) in blocker_nos]
             if not append_put_step_if_valid(
@@ -5027,29 +5217,24 @@ def depot_slot_swap_planlets(
             ):
                 break
         else:
-            steps.extend(
-                (
-                    PlanStep("Get", source_line, tuple(car_no(car) for car in inbound_batch)),
-                    PlanStep("Put", target_line, tuple(car_no(car) for car in inbound_batch), inbound_positions),
-                )
+            candidate = planlet_candidate(
+                case_id=case_id,
+                hook_index=hook_index,
+                source_line=target_line,
+                target_line=steps[-1].line,
+                batch=[*blockers, *inbound_batch],
+                generation_reason=(
+                    "depot_slot_swap_contract;"
+                    f"target_line={target_line};source_line={source_line};"
+                    f"blocker_count={len(blockers)};inbound_count={len(inbound_batch)}"
+                ),
+                candidate_kind="depot_slot_swap_planlet",
+                steps=tuple(steps),
+                action_family_override="REPAIR_INBOUND",
             )
-            candidates.append(
-                planlet_candidate(
-                    case_id=case_id,
-                    hook_index=hook_index,
-                    source_line=target_line,
-                    target_line=target_line,
-                    batch=[*blockers, *inbound_batch],
-                    generation_reason=(
-                        "depot_slot_swap_contract;"
-                        f"target_line={target_line};source_line={source_line};"
-                        f"blocker_count={len(blockers)};inbound_count={len(inbound_batch)}"
-                    ),
-                    candidate_kind="depot_slot_swap_planlet",
-                    steps=tuple(steps),
-                    action_family_override="REPAIR_INBOUND",
-                )
-            )
+            if source_remote and candidate_remote_profile(candidate) != REMOTE_PROFILE_REMOTE_ONLY:
+                continue
+            candidates.append(candidate)
             if len(candidates) >= 2:
                 break
     return candidates
@@ -5073,6 +5258,7 @@ def remote_session_contract_planlets(
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
         max_per_line=8,
+        allow_weigh=True,
     )
     inbound_sources = planned_unsatisfied_by_line(
         grouped=grouped,
@@ -5123,6 +5309,7 @@ def remote_session_contract_planlets(
             depot_assignment=depot_assignment,
             grouped=grouped,
             length_load_lookup=length_load_lookup,
+            include_weigh_step=mode == "outbound_release",
         )
         if len(steps) < 2 or len(filtered_carry) < min_vehicle_count:
             return None
@@ -5175,60 +5362,108 @@ def remote_session_contract_planlets(
     )
     candidates.extend(candidate for candidate in (outbound, inbound, internal) if candidate)
 
-    legacy_sources: list[tuple[str, list[dict[str, Any]]]] = []
-    legacy_carry: list[dict[str, Any]] = []
+    mixed_sources: list[tuple[str, list[dict[str, Any]]]] = []
+    mixed_carry: list[dict[str, Any]] = []
     for source_map in (outbound_sources, inbound_sources, internal_sources):
         for line, batch in sorted(source_map.items(), key=lambda item: (item[0] not in DEPOT_LINES, item[0])):
             selected: list[dict[str, Any]] = []
             for car in batch:
-                if pull_equivalent([*legacy_carry, car]) > PULL_LIMIT_EQUIVALENT:
+                if pull_equivalent([*mixed_carry, car]) > PULL_LIMIT_EQUIVALENT:
                     break
                 selected.append(car)
-                legacy_carry.append(car)
+                mixed_carry.append(car)
                 if len(selected) >= 6:
                     break
             if selected:
-                legacy_sources.append((line, selected))
-            if len(legacy_sources) >= 4 or pull_equivalent(legacy_carry) >= PULL_LIMIT_EQUIVALENT:
+                mixed_sources.append((line, selected))
+            if len(mixed_sources) >= 5 or pull_equivalent(mixed_carry) >= PULL_LIMIT_EQUIVALENT:
                 break
-        if len(legacy_sources) >= 4 or pull_equivalent(legacy_carry) >= PULL_LIMIT_EQUIVALENT:
+        if len(mixed_sources) >= 5 or pull_equivalent(mixed_carry) >= PULL_LIMIT_EQUIVALENT:
             break
-    if len(legacy_carry) >= 5 and len(legacy_sources) >= 2:
-        legacy_target_groups = target_groups_for_carry(legacy_carry, planned)
-        remote_targets = [line for line in legacy_target_groups if line in REMOTE_INTERACTION_LINES]
-        non_remote_targets = [line for line in legacy_target_groups if line not in REMOTE_INTERACTION_LINES]
-        legacy_steps, legacy_filtered_carry = build_carry_drop_steps(
-            selected_sources=legacy_sources,
-            target_groups=legacy_target_groups,
-            target_order=[
-                *sorted(non_remote_targets, key=lambda line: (line != "存4线", line)),
-                *sorted(remote_targets),
-            ],
-            cars=cars,
-            depot_assignment=depot_assignment,
-            grouped=grouped,
-            length_load_lookup=length_load_lookup,
-        )
-        if len(legacy_steps) >= 4 and len(legacy_filtered_carry) >= 5:
-            legacy_candidate = planlet_candidate(
+
+    if len(mixed_carry) >= 5 and len(mixed_sources) >= 2:
+        mixed_target_groups = target_groups_for_carry(mixed_carry, planned)
+        remote_targets = [line for line in mixed_target_groups if line in REMOTE_INTERACTION_LINES]
+        front_targets = [line for line in mixed_target_groups if line not in REMOTE_INTERACTION_LINES]
+
+        def add_mixed_contract(
+            *,
+            mode: str,
+            source_order: list[tuple[str, list[dict[str, Any]]]],
+            target_order: list[str],
+        ) -> None:
+            steps, filtered_carry = build_carry_drop_steps(
+                selected_sources=source_order,
+                target_groups=mixed_target_groups,
+                target_order=target_order,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                grouped=grouped,
+                length_load_lookup=length_load_lookup,
+            )
+            if len(steps) < 4 or len(filtered_carry) < 5:
+                return
+            profile = remote_profile_for_lines(
+                tuple(step.line for step in steps if step.action in {"Get", "Put"})
+            )
+            after_remote_debt = -1
+            contract_name = "remote_session_extended_directional_contract"
+            if profile == REMOTE_PROFILE_MIXED:
+                contract_name = "remote_session_closeout_contract"
+                probe = [dict(car) for car in cars]
+                probe_candidate = planlet_candidate(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    source_line=steps[0].line,
+                    target_line=steps[-1].line,
+                    batch=filtered_carry,
+                    generation_reason="remote_session_closeout_probe",
+                    candidate_kind="remote_session_contract_planlet",
+                    steps=tuple(steps),
+                    action_family_override="REPAIR_INBOUND" if remote_targets else "DEPOT_OUTBOUND",
+                )
+                apply_candidate(probe_candidate, probe)
+                after_remote_debt = remote_interaction_unsatisfied_count(probe, depot_assignment)
+                if after_remote_debt > 0:
+                    return
+            candidate = planlet_candidate(
                 case_id=case_id,
                 hook_index=hook_index,
-                source_line=legacy_steps[0].line,
-                target_line=legacy_steps[-1].line,
-                batch=legacy_filtered_carry,
+                source_line=steps[0].line,
+                target_line=steps[-1].line,
+                batch=filtered_carry,
                 generation_reason=(
-                    "remote_session_legacy_fallback_contract;"
-                    f"source_count={len([step for step in legacy_steps if step.action == 'Get'])};"
-                    f"target_count={len([step for step in legacy_steps if step.action == 'Put'])};"
+                    f"{contract_name};mode={mode};"
+                    f"source_count={len([step for step in steps if step.action == 'Get'])};"
+                    f"target_count={len([step for step in steps if step.action == 'Put'])};"
                     f"remote_target_count={len(remote_targets)};"
-                    f"vehicle_count={len(legacy_filtered_carry)}"
+                    f"after_remote_debt={after_remote_debt};"
+                    f"vehicle_count={len(filtered_carry)}"
                 ),
                 candidate_kind="remote_session_contract_planlet",
-                steps=tuple(legacy_steps),
+                steps=tuple(steps),
                 action_family_override="REPAIR_INBOUND" if remote_targets else "DEPOT_OUTBOUND",
             )
-            if candidate_internal_remote_transition_count(legacy_candidate) <= 2:
-                candidates.append(legacy_candidate)
+            if candidate_internal_remote_transition_count(candidate) <= 2:
+                candidates.append(candidate)
+
+        add_mixed_contract(
+            mode="remote_targets_then_front_targets",
+            source_order=sorted(mixed_sources, key=lambda item: (item[0] in REMOTE_INTERACTION_LINES, item[0])),
+            target_order=[
+                *sorted(remote_targets),
+                *sorted(front_targets, key=lambda line: (line != "存4线", line)),
+            ],
+        )
+        if front_targets:
+            add_mixed_contract(
+                mode="front_targets_then_remote_targets",
+                source_order=mixed_sources,
+                target_order=[
+                    *sorted(front_targets, key=lambda line: (line != "存4线", line)),
+                    *sorted(remote_targets),
+                ],
+            )
     return candidates
 
 
@@ -5258,6 +5493,16 @@ def remote_session_bundle_planlets(
         satisfied=satisfied,
         source_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        max_per_line=10,
+        allow_weigh=True,
+    )
+    internal_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        include_same_line=True,
         max_per_line=8,
     )
     if not outbound_sources or not inbound_sources:
@@ -5271,32 +5516,100 @@ def remote_session_bundle_planlets(
     )
     selected_inbound, inbound_carry = select_source_batches(
         inbound_sources,
-        max_sources=3,
-        max_per_source=6,
+        max_sources=4,
+        max_per_source=8,
         remote_first=False,
+    )
+    selected_internal, internal_carry = select_source_batches(
+        internal_sources,
+        max_sources=2,
+        max_per_source=4,
+        remote_first=True,
     )
     if len(outbound_carry) < 3 or len(inbound_carry) < 3:
         return []
 
     candidates: list[HookCandidate] = []
-    for mode, selected_sources, carry, target_key, family in (
-        (
-            "outbound_then_inbound",
-            [*selected_outbound, *selected_inbound],
-            [*outbound_carry, *inbound_carry],
-            lambda line: (line in REMOTE_INTERACTION_LINES, line != "存4线", line),
-            "REMOTE_SESSION_BUNDLE",
-        ),
-        (
-            "inbound_then_outbound",
-            [*selected_inbound, *selected_outbound],
-            [*inbound_carry, *outbound_carry],
-            lambda line: (line not in REMOTE_INTERACTION_LINES, line not in DEPOT_LINES, line),
-            "REMOTE_SESSION_BUNDLE",
-        ),
-    ):
+
+    def clipped_bundle_sources(
+        selected_sources: list[tuple[str, list[dict[str, Any]]]],
+    ) -> tuple[list[tuple[str, list[dict[str, Any]]]], list[dict[str, Any]]]:
+        clipped = [(line, list(batch)) for line, batch in selected_sources if batch]
+
+        def role(car: dict[str, Any]) -> str:
+            target_line, _position, _reason = planned(car)
+            source_remote = car["Line"] in REMOTE_INTERACTION_LINES
+            target_remote = target_line in REMOTE_INTERACTION_LINES
+            if source_remote and target_remote:
+                return "internal"
+            if source_remote:
+                return "outbound"
+            if target_remote:
+                return "inbound"
+            return "front"
+
+        def carry() -> list[dict[str, Any]]:
+            return [car for _line, batch in clipped for car in batch]
+
+        def counts() -> Counter[str]:
+            return Counter(role(car) for car in carry())
+
+        minimum = {"outbound": 3, "inbound": 3, "internal": 0, "front": 0}
+        while pull_equivalent(carry()) > PULL_LIMIT_EQUIVALENT:
+            current_counts = counts()
+            removable_roles = [
+                item
+                for item in current_counts
+                if current_counts[item] > minimum.get(item, 0)
+            ]
+            if not removable_roles:
+                break
+            remove_role = max(
+                removable_roles,
+                key=lambda item: (
+                    current_counts[item] - minimum.get(item, 0),
+                    current_counts[item],
+                ),
+            )
+            removable: list[tuple[tuple[Any, ...], int, int]] = []
+            for source_index, (line, batch) in enumerate(clipped):
+                for car_index, car in enumerate(batch):
+                    if role(car) != remove_role:
+                        continue
+                    target_line, _position, _reason = planned(car)
+                    removable.append(
+                        (
+                            (
+                                line == "存4线" and remove_role == "inbound",
+                                target_line in DEPOT_OUTSIDE_LINES,
+                                not bool(car.get("IsHeavy")),
+                                line not in {"卸轮线", "洗罐站"},
+                                int(car.get("Position") or 0),
+                            ),
+                            source_index,
+                            car_index,
+                        )
+                    )
+            if not removable:
+                break
+            _priority, source_index, car_index = max(removable)
+            del clipped[source_index][1][car_index]
+            if not clipped[source_index][1]:
+                del clipped[source_index]
+        return clipped, carry()
+
+    def add_bundle_candidate(
+        *,
+        mode: str,
+        selected_sources: list[tuple[str, list[dict[str, Any]]]],
+        carry: list[dict[str, Any]],
+        target_key: Any,
+        family: str,
+    ) -> None:
         if pull_equivalent(carry) > PULL_LIMIT_EQUIVALENT:
-            continue
+            selected_sources, carry = clipped_bundle_sources(selected_sources)
+        if pull_equivalent(carry) > PULL_LIMIT_EQUIVALENT:
+            return
         target_groups = target_groups_for_carry(carry, planned)
         target_order = sorted(target_groups, key=target_key)
         steps, filtered_carry = build_carry_drop_steps(
@@ -5307,14 +5620,15 @@ def remote_session_bundle_planlets(
             depot_assignment=depot_assignment,
             grouped=grouped,
             length_load_lookup=length_load_lookup,
+            include_weigh_step=True,
         )
         if len(steps) < 4 or len(filtered_carry) < 6:
-            continue
+            return
         filtered_nos = {car_no(car) for car in filtered_carry}
         filtered_outbound = [car for car in outbound_carry if car_no(car) in filtered_nos]
         filtered_inbound = [car for car in inbound_carry if car_no(car) in filtered_nos]
         if len(filtered_outbound) < 3 or len(filtered_inbound) < 3:
-            continue
+            return
         candidate = planlet_candidate(
             case_id=case_id,
             hook_index=hook_index,
@@ -5333,11 +5647,28 @@ def remote_session_bundle_planlets(
             action_family_override=family,
         )
         if candidate_remote_profile(candidate) != REMOTE_PROFILE_MIXED:
-            continue
+            return
         if candidate_internal_remote_transition_count(candidate) != 2:
-            continue
+            return
         candidates.append(candidate)
+
+    add_bundle_candidate(
+        mode="outbound_then_inbound",
+        selected_sources=[*selected_outbound, *selected_inbound],
+        carry=[*outbound_carry, *inbound_carry],
+        target_key=lambda line: (line in REMOTE_INTERACTION_LINES, line != "存4线", line),
+        family="REMOTE_SESSION_BUNDLE",
+    )
+    add_bundle_candidate(
+        mode="inbound_then_outbound",
+        selected_sources=[*selected_inbound, *selected_internal, *selected_outbound],
+        carry=[*inbound_carry, *internal_carry, *outbound_carry],
+        target_key=lambda line: (line not in REMOTE_INTERACTION_LINES, line not in DEPOT_LINES, line),
+        family="REMOTE_SESSION_BUNDLE",
+    )
+
     return candidates[:2]
+
 
 def remote_corridor_planlets(
     *,
@@ -5468,10 +5799,9 @@ def short_chain_planlets(
     grouped: dict[str, list[dict[str, Any]]],
     manual_baseline: ManualBaseline | None,
 ) -> list[HookCandidate]:
-    if not manual_baseline or manual_baseline.variant not in SHORT_CHAIN_VARIANTS:
+    if not is_short_chain_baseline(manual_baseline):
         return []
     candidates: list[HookCandidate] = []
-
     inbound_sources = planned_unsatisfied_by_line(
         grouped=grouped,
         planned=planned,
@@ -5487,6 +5817,100 @@ def short_chain_planlets(
         source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
         target_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
         max_per_line=8,
+    )
+    internal_sources = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line in REMOTE_INTERACTION_LINES,
+        include_same_line=True,
+        max_per_line=8,
+    )
+
+    def add_directional_candidate(
+        *,
+        mode: str,
+        selected_sources: list[tuple[str, list[dict[str, Any]]]],
+        carry: list[dict[str, Any]],
+        target_order_key: Any,
+        action_family_name: str,
+        min_vehicle_count: int,
+        expected_profiles: set[str],
+    ) -> None:
+        if len(carry) < min_vehicle_count or not selected_sources:
+            return
+        target_groups = target_groups_for_carry(carry, planned)
+        if not target_groups:
+            return
+        steps, filtered_carry = build_carry_drop_steps(
+            selected_sources=selected_sources,
+            target_groups=target_groups,
+            target_order=sorted(target_groups, key=target_order_key),
+            cars=cars,
+            depot_assignment=depot_assignment,
+            grouped=grouped,
+            length_load_lookup=length_load_lookup,
+        )
+        if len(steps) < 2 or len(filtered_carry) < min_vehicle_count:
+            return
+        candidate = planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=steps[0].line,
+            target_line=steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                f"short_chain_contract;variant={manual_baseline.variant};mode={mode};"
+                f"source_count={len([step for step in steps if step.action == 'Get'])};"
+                f"target_count={len([step for step in steps if step.action == 'Put'])};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind="short_chain_planlet",
+            steps=tuple(steps),
+            action_family_override=action_family_name,
+        )
+        if candidate_remote_profile(candidate) in expected_profiles:
+            candidates.append(candidate)
+
+    outbound_selected, outbound_carry = select_source_batches(
+        outbound_sources,
+        max_sources=6,
+        max_per_source=8,
+        remote_first=True,
+    )
+    add_directional_candidate(
+        mode="outbound_only",
+        selected_sources=outbound_selected,
+        carry=outbound_carry,
+        target_order_key=lambda line: (line != "存4线", line),
+        action_family_name="DEPOT_OUTBOUND",
+        min_vehicle_count=3,
+        expected_profiles={REMOTE_PROFILE_REMOTE_TO_FRONT},
+    )
+
+    inbound_selected, inbound_carry = select_source_batches(
+        inbound_sources,
+        max_sources=5,
+        max_per_source=8,
+        remote_first=False,
+    )
+    remaining_pull = PULL_LIMIT_EQUIVALENT - pull_equivalent(inbound_carry)
+    internal_selected, internal_carry = select_source_batches(
+        internal_sources,
+        max_sources=3,
+        max_pull=max(0, remaining_pull),
+        max_per_source=8,
+        remote_first=True,
+    )
+    add_directional_candidate(
+        mode="inbound_with_remote_internal",
+        selected_sources=[*inbound_selected, *internal_selected],
+        carry=[*inbound_carry, *internal_carry],
+        target_order_key=lambda line: (line not in DEPOT_LINES, line),
+        action_family_name="REPAIR_INBOUND",
+        min_vehicle_count=3,
+        expected_profiles={REMOTE_PROFILE_FRONT_TO_REMOTE, REMOTE_PROFILE_REMOTE_ONLY},
     )
 
     def take_sources(
@@ -5591,7 +6015,7 @@ def short_chain_planlets(
             carry.append(car)
         if selected:
             selected_sources.append((line, selected))
-        if len(selected_sources) >= 4 or len(carry) >= 16:
+        if len(selected_sources) >= 6 or pull_equivalent(carry) >= PULL_LIMIT_EQUIVALENT:
             break
     if len(carry) < 4 or len(selected_sources) < 2:
         return candidates
@@ -5637,6 +6061,91 @@ def short_chain_planlets(
         )
     )
     return candidates
+
+
+def short_chain_front_tail_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+    manual_baseline: ManualBaseline | None,
+) -> list[HookCandidate]:
+    if not is_short_chain_baseline(manual_baseline):
+        return []
+    if remote_interaction_unsatisfied_count(cars, depot_assignment) > 0:
+        return []
+
+    source_map = planned_unsatisfied_by_line(
+        grouped=grouped,
+        planned=planned,
+        satisfied=satisfied,
+        source_filter=lambda line: line not in REMOTE_INTERACTION_LINES,
+        target_filter=lambda line: line not in REMOTE_INTERACTION_LINES and line not in RUNNING_LINES,
+        max_per_line=8,
+        allow_weigh=True,
+    )
+    if len(source_map) < 2:
+        return []
+
+    selected_sources, carry = select_source_batches(
+        source_map,
+        max_sources=5,
+        max_per_source=8,
+        remote_first=False,
+    )
+    if len(selected_sources) < 2 or len(carry) < 4:
+        return []
+    target_groups = target_groups_for_carry(carry, planned)
+    if len(target_groups) < 2:
+        return []
+
+    target_order = sorted(
+        target_groups,
+        key=lambda line: (
+            line not in FRONT_SERVICE_TARGET_LINES,
+            line not in REMOTE_CORRIDOR_LINES,
+            line,
+        ),
+    )
+    steps, filtered_carry = build_carry_drop_steps(
+        selected_sources=selected_sources,
+        target_groups=target_groups,
+        target_order=target_order,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        grouped=grouped,
+        length_load_lookup=length_load_lookup,
+        include_weigh_step=True,
+    )
+    if len(steps) < 4 or len(filtered_carry) < 4:
+        return []
+    if any(step.line in REMOTE_INTERACTION_LINES for step in steps if step.action in {"Get", "Put"}):
+        return []
+
+    return [
+        planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=steps[0].line,
+            target_line=steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                "short_chain_front_tail_contract;"
+                f"variant={manual_baseline.variant if manual_baseline else ''};"
+                f"source_count={len([step for step in steps if step.action == 'Get'])};"
+                f"target_count={len([step for step in steps if step.action == 'Put'])};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind="short_chain_front_tail_planlet",
+            steps=tuple(steps),
+            action_family_override="FUNCTION_LINE_SERVICE",
+        )
+    ]
 
 
 def corridor_closeout_planlets(
@@ -6415,6 +6924,7 @@ def route_clear_planlets_for_candidate(
 def candidate_sort_key(candidate: HookCandidate) -> tuple[int, tuple[int, str, str], int, str]:
     kind_priority = {
         "short_chain_planlet": 0,
+        "short_chain_front_tail_planlet": 0,
         "remote_session_contract_planlet": 1,
         "remote_session_bundle_planlet": 1,
         "depot_digest_planlet": 1,
@@ -6423,7 +6933,6 @@ def candidate_sort_key(candidate: HookCandidate) -> tuple[int, tuple[int, str, s
         "source_exit_session_planlet": 2,
         "remote_corridor_planlet": 2,
         "corridor_closeout_planlet": 3,
-        "remote_session_planlet": 2,
         "remote_exchange_planlet": 3,
         "front_capacity_release_contract_planlet": 3,
         "front_capacity_digest_planlet": 2,
@@ -6954,7 +7463,7 @@ def build_candidates(
                 stage_batch.append(car)
             if not stage_batch:
                 stage_batch = batch[:1]
-            if target_line in DEPOT_LINES:
+            if target_line in DEPOT_LINES and len(all_unsatisfied) <= 6:
                 repack = depot_same_line_repack_candidate(
                     case_id=case_id,
                     hook_index=hook_index,
@@ -7308,7 +7817,19 @@ def build_candidates(
             )
         )
         planlet_candidates.extend(
-            remote_session_contract_planlets(
+                remote_session_contract_planlets(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    planned=planned,
+                    satisfied=satisfied,
+                    length_load_lookup=length_load_lookup(),
+                    grouped=grouped,
+                )
+            )
+        planlet_candidates.extend(
+            short_chain_planlets(
                 case_id=case_id,
                 hook_index=hook_index,
                 cars=cars,
@@ -7317,10 +7838,11 @@ def build_candidates(
                 satisfied=satisfied,
                 length_load_lookup=length_load_lookup(),
                 grouped=grouped,
+                manual_baseline=manual_baseline,
             )
         )
         planlet_candidates.extend(
-            short_chain_planlets(
+            short_chain_front_tail_planlets(
                 case_id=case_id,
                 hook_index=hook_index,
                 cars=cars,
@@ -7944,7 +8466,7 @@ def apply_candidate(
             if step.line not in DEPOT_LINES:
                 normalize_duplicate_positions(cars, step.line)
             for source_line, moved_nos in source_lines_by_step:
-                if source_line != step.line:
+                if source_line != step.line and source_line not in DEPOT_LINES:
                     compact_source_positions(cars, source_line, moved_nos)
             source_lines_by_step = [
                 (source_line, moved_nos - step_nos)
@@ -7963,7 +8485,8 @@ def apply_candidate(
         if no == weighed_no:
             car["_Weighed"] = True
     if candidate.source_line != candidate.target_line:
-        compact_source_positions(cars, candidate.source_line, move_nos)
+        if candidate.source_line not in DEPOT_LINES:
+            compact_source_positions(cars, candidate.source_line, move_nos)
     if candidate.target_line not in DEPOT_LINES:
         normalize_duplicate_positions(cars, candidate.target_line)
 
@@ -8077,10 +8600,10 @@ def manual_expected_phase(manual_baseline: ManualBaseline | None, business_hook_
     return ""
 
 
-def phase_allowed_action(phase: str, action_family: str, manual_variant: str) -> bool:
+def phase_allowed_action(phase: str, action_family: str, short_chain: bool = False) -> bool:
     if not phase:
         return True
-    if manual_variant in SHORT_CHAIN_VARIANTS and action_family in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}:
+    if short_chain and action_family in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}:
         return True
     if phase in {"H1", "H2"} and action_family not in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}:
         return True
@@ -8108,7 +8631,11 @@ def phase_permission_for_candidate(
         return expected_phase, "no_manual_baseline", "manual baseline unavailable; runtime permission only", over_manual_bound
     if over_manual_bound:
         return expected_phase, "over_manual_soft_hook_bound", "business hook index exceeds manual soft bound", over_manual_bound
-    if not phase_allowed_action(expected_phase, candidate.action_family, manual_variant):
+    if not phase_allowed_action(
+        expected_phase,
+        candidate.action_family,
+        is_short_chain_baseline(manual_baseline),
+    ):
         return (
             expected_phase,
             "phase_action_mismatch",
@@ -8151,6 +8678,7 @@ def structural_intent(candidate: HookCandidate) -> str:
         "depot_digest_planlet": "DEPOT_DIGEST_PLANLET",
         "depot_slot_swap_planlet": "DEPOT_SLOT_SWAP_PLANLET",
         "short_chain_planlet": "SHORT_CHAIN_PLANLET",
+        "short_chain_front_tail_planlet": "SHORT_CHAIN_FRONT_TAIL_PLANLET",
         "route_clear_session_planlet": "ROUTE_CLEAR_SESSION_PLANLET",
         "source_exit_session_planlet": "SOURCE_EXIT_SESSION_PLANLET",
         "corridor_closeout_planlet": "CORRIDOR_CLOSEOUT_PLANLET",
@@ -8305,6 +8833,24 @@ def contract_zero_or_negative_allowed(candidate: HookCandidate, reduction: int, 
     return False
 
 
+def tail_closeout_candidate(candidate: HookCandidate) -> bool:
+    return candidate.generation_reason.startswith(TAIL_CANDIDATE_PREFIXES)
+
+
+def tail_local_closeout_allowed(
+    candidate: HookCandidate,
+    *,
+    after_unsatisfied: int,
+    after_remote_debt: int,
+    remote_session_state: RemoteSessionState,
+) -> bool:
+    if not tail_closeout_candidate(candidate):
+        return False
+    if candidate_touches_remote_interaction(candidate):
+        return remote_cross_has_owner(candidate) and after_remote_debt <= remote_session_state.debt
+    return after_unsatisfied <= 4
+
+
 def owner_bound_remote_unlock_candidate(candidate: HookCandidate) -> bool:
     return (
         candidate.candidate_kind in {"route_clear_session_planlet", "source_exit_session_planlet"}
@@ -8349,13 +8895,112 @@ def structural_reject_reason(
     physically_accepted: list[tuple[HookCandidate, PhysicalValidation, str]],
     transition_metrics: Any,
     remote_debt_metrics: Any,
+    session_debt_metrics: Any,
     remote_session_state: RemoteSessionState,
     repair_mode: str,
     manual_baseline: ManualBaseline | None = None,
 ) -> str:
-    remote_session_reason = remote_session_contract_violation_reason(candidate, remote_session_state)
+    remote_session_reason = remote_session_contract_violation_reason(
+        candidate,
+        remote_session_state,
+        after_remote_debt,
+        reduction,
+    )
     if remote_session_reason:
         return remote_session_reason
+    if (
+        remote_session_state.debt > 0
+        and candidate_remote_profile(candidate) == REMOTE_PROFILE_MIXED
+    ):
+        before_session_debt, after_session_debt = session_debt_metrics(candidate, validation)
+        candidate_transition_count = max(
+            1,
+            candidate_remote_business_transition_count(
+                candidate,
+                remote_session_state.last_business_hook_remote,
+            ),
+        )
+        transition_count = max(1, candidate_internal_remote_transition_count(candidate))
+        min_mixed_reduction = min(3, transition_count + 1)
+        session_debt_reduction = before_session_debt.total - after_session_debt.total
+        if (
+            after_session_debt.total > 0
+            and session_debt_reduction < min_mixed_reduction
+        ):
+            return (
+                "p7_reject_mixed_session_low_debt_reduction:"
+                f"kind={candidate.candidate_kind}:"
+                f"before_remote_debt={before_session_debt.total}:"
+                f"after_remote_debt={after_session_debt.total}"
+            )
+
+        def directional_progress_more_efficient() -> bool:
+            if after_session_debt.total <= 0 or session_debt_reduction <= 0:
+                return False
+            mixed_efficiency = session_debt_reduction / candidate_transition_count
+            for other_candidate, other_validation, other_phase_reason in physically_accepted:
+                if other_phase_reason or other_candidate.candidate_id == candidate.candidate_id:
+                    continue
+                other_profile = candidate_remote_profile(other_candidate)
+                if other_profile == REMOTE_PROFILE_MIXED or not candidate_touches_remote_interaction(other_candidate):
+                    continue
+                other_remote_reduction, other_after_remote_debt = remote_debt_metrics(
+                    other_candidate,
+                    other_validation,
+                )
+                if other_remote_reduction < 3 or other_after_remote_debt >= remote_session_state.debt:
+                    continue
+                other_transition_count = candidate_remote_business_transition_count(
+                    other_candidate,
+                    remote_session_state.last_business_hook_remote,
+                )
+                if other_transition_count <= 0 or other_transition_count >= candidate_transition_count:
+                    continue
+                if remote_session_contract_violation_reason(
+                    other_candidate,
+                    remote_session_state,
+                    other_after_remote_debt,
+                ):
+                    continue
+                if (
+                    remote_session_state.budget is not None
+                    and remote_session_state.current_transition_count + other_transition_count > remote_session_state.budget
+                ):
+                    continue
+                if (other_remote_reduction / other_transition_count) >= mixed_efficiency:
+                    return True
+            return False
+
+        if directional_progress_more_efficient():
+            return (
+                "p7_reject_mixed_session_directional_candidate_better:"
+                f"kind={candidate.candidate_kind}:"
+                f"debt_reduction={session_debt_reduction}:"
+                f"transition_count={candidate_transition_count}"
+            )
+
+    def session_tail_closeout_allowed() -> bool:
+        if reduction <= 0 and non_depot_reduction <= 0:
+            return False
+        if candidate_touches_remote_interaction(candidate):
+            if not remote_cross_has_owner(candidate):
+                return False
+            remote_debt_reduction = remote_session_state.debt - after_remote_debt
+            if after_remote_debt <= 0:
+                return True
+            if (
+                remote_debt_reduction >= 2
+                and after_unsatisfied <= 8
+                and (
+                    tail_closeout_candidate(candidate)
+                    or owner_bound_restore_candidate(candidate)
+                    or owner_bound_remote_unlock_candidate(candidate)
+                )
+            ):
+                return True
+            return after_unsatisfied <= 4
+        return remote_session_state.active and after_remote_debt <= 2
+
     if (
         remote_session_state.debt > 0
         and candidate_refills_leased_corridor(candidate, remote_session_state.leased_corridor_lines)
@@ -8365,6 +9010,7 @@ def structural_reject_reason(
             and after_unsatisfied <= 8
             and reduction > 0
         )
+        and not session_tail_closeout_allowed()
     ):
         return (
             "p7_reject_remote_corridor_lease_refill:"
@@ -8379,13 +9025,17 @@ def structural_reject_reason(
                 continue
             if not candidate_touches_remote_interaction(other_candidate):
                 continue
-            if remote_session_contract_violation_reason(other_candidate, remote_session_state):
-                continue
             other_transition_count = candidate_remote_business_transition_count(
                 other_candidate,
                 remote_session_state.last_business_hook_remote,
             )
             other_remote_reduction, other_after_remote_debt = remote_debt_metrics(other_candidate, _other_validation)
+            if remote_session_contract_violation_reason(
+                other_candidate,
+                remote_session_state,
+                other_after_remote_debt,
+            ):
+                continue
             if other_remote_reduction <= 0 or other_after_remote_debt >= remote_session_state.debt:
                 continue
             if (
@@ -8404,6 +9054,7 @@ def structural_reject_reason(
         and not candidate_touches_remote_interaction(candidate)
         and remote_session_state.batch_index < remote_session_state.max_batch_count
         and remote_session_progress_available()
+        and not session_tail_closeout_allowed()
     ):
         return (
             "p7_reject_remote_session_front_interruption:"
@@ -8422,6 +9073,7 @@ def structural_reject_reason(
             after_unsatisfied <= 8
             and reduction > 0
         )
+        and not session_tail_closeout_allowed()
     ):
         return (
             "p7_reject_remote_transition_budget:"
@@ -8441,15 +9093,18 @@ def structural_reject_reason(
             f"internal_remote_transitions={internal_remote_transitions}:"
             f"allowed={allowed_internal_remote_transitions}"
         )
-
     if owner_bound_restore_candidate(candidate) and after_unsatisfied > 6:
         return (
             "p7_reject_non_tail_owner_bound_restore:"
             f"kind={candidate.candidate_kind}:after_unsatisfied={after_unsatisfied}"
         )
 
-    def structurally_comparable_candidate(other_candidate: HookCandidate) -> bool:
-        if remote_session_contract_violation_reason(other_candidate, remote_session_state):
+    def structurally_comparable_candidate(
+        other_candidate: HookCandidate,
+        other_validation: PhysicalValidation,
+    ) -> bool:
+        _other_remote_reduction, other_after_remote_debt = remote_debt_metrics(other_candidate, other_validation)
+        if remote_session_contract_violation_reason(other_candidate, remote_session_state, other_after_remote_debt):
             return False
         if (
             remote_session_state.debt > 0
@@ -8475,7 +9130,7 @@ def structural_reject_reason(
         for other_candidate, other_validation, other_phase_reason in physically_accepted:
             if other_candidate.candidate_id == candidate.candidate_id or other_phase_reason:
                 continue
-            if not structurally_comparable_candidate(other_candidate):
+            if not structurally_comparable_candidate(other_candidate, other_validation):
                 continue
             if other_candidate.candidate_kind in {
                 "route_clear_restore_planlet",
@@ -8535,13 +9190,20 @@ def structural_reject_reason(
             f"kind={candidate.candidate_kind}:remote_cross={remote_cross_count}:"
             f"unsatisfied_reduction={reduction}:non_depot_reduction={non_depot_reduction}"
         )
+    source_unlock_allowed = (
+        candidate.candidate_kind == "blocker_relocation"
+        and candidate.generation_reason.startswith("source_front_blocker_relocation")
+        and not candidate_touches_remote_interaction(candidate)
+        and not better_non_recovery_available()
+        and after_unsatisfied <= 12
+    )
     if (
         candidate.candidate_kind in OWNERLESS_RECOVERY_KINDS
         and reduction <= 0
         and non_depot_reduction <= 0
         and not owner_bound_restore_candidate(candidate)
     ):
-        if after_unsatisfied <= 6:
+        if after_unsatisfied <= 6 or source_unlock_allowed:
             return ""
         return (
             "p4_contract_selector_reject_ownerless_nonpositive_recovery:"
@@ -8552,7 +9214,14 @@ def structural_reject_reason(
         return ""
     if phase_reason:
         return phase_reason
-    if manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS:
+    if is_short_chain_baseline(manual_baseline):
+        return ""
+    if tail_local_closeout_allowed(
+        candidate,
+        after_unsatisfied=after_unsatisfied,
+        after_remote_debt=after_remote_debt,
+        remote_session_state=remote_session_state,
+    ):
         return ""
     if (
         candidate.candidate_kind in OWNERLESS_RECOVERY_KINDS
@@ -8560,7 +9229,7 @@ def structural_reject_reason(
         and non_depot_reduction <= 0
         and not owner_bound_restore_candidate(candidate)
     ):
-        if after_unsatisfied <= 6:
+        if after_unsatisfied <= 6 or source_unlock_allowed:
             return ""
         return (
             "p4_contract_selector_reject_ownerless_nonpositive_recovery:"
@@ -8577,7 +9246,7 @@ def structural_reject_reason(
     for other_candidate, other_validation, other_phase_reason in physically_accepted:
         if other_candidate.candidate_id == candidate.candidate_id or other_phase_reason:
             continue
-        if not structurally_comparable_candidate(other_candidate):
+        if not structurally_comparable_candidate(other_candidate, other_validation):
             continue
         other_reduction, other_non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(
             other_candidate,
@@ -8588,6 +9257,8 @@ def structural_reject_reason(
             and not remote_cross_for_candidate(other_candidate)
             and other_reduction >= reduction
             and other_non_depot_reduction >= non_depot_reduction
+            and not (remote_session_state.debt > 0 and after_remote_debt < remote_session_state.debt)
+            and not session_tail_closeout_allowed()
         ):
             return (
                 "p7_reject_same_progress_without_remote_cross:"
@@ -8719,11 +9390,16 @@ def remote_session_selection_key(
     remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
     hook_count = max(1, planlet_business_hook_count(candidate))
     touched_remote = candidate_touches_remote_interaction(candidate)
+    profile = candidate_remote_profile(candidate)
     remote_transition_count = candidate_remote_business_transition_count(candidate, last_business_hook_remote)
     ends_remote = candidate_ends_in_remote(candidate)
     role = candidate_remote_session_role(candidate)
     if not touched_remote:
         role = 9
+    if remote_session_state.short_chain and candidate_is_short_chain_contract(candidate):
+        role = -1
+        if profile == REMOTE_PROFILE_MIXED:
+            role = 1
     if candidate.candidate_kind in REMOTE_SESSION_RESTORE_KINDS and (reduction <= 0 and non_depot_reduction <= 0):
         role = 10
     unfinished_exit_penalty = int(
@@ -8915,6 +9591,19 @@ def better_case_result(left: CaseSummaryRow, right: CaseSummaryRow) -> bool:
     )
 
 
+def parse_debug_candidate_rounds(raw_values: list[str] | None) -> set[tuple[str, int]]:
+    rounds: set[tuple[str, int]] = set()
+    for raw in raw_values or []:
+        if ":" not in raw:
+            continue
+        case_id, hook_text = raw.split(":", 1)
+        try:
+            rounds.add((case_id.upper(), int(hook_text)))
+        except ValueError:
+            continue
+    return rounds
+
+
 def run_case(
     truth_path: Path,
     output_dir: Path,
@@ -8925,6 +9614,7 @@ def run_case(
     repair_mode: str = AUDIT_REPAIR_MODE,
     allow_phase_forced_open: bool = True,
     strategy_name_filter: str = "",
+    debug_candidate_rounds: set[tuple[str, int]] | None = None,
 ) -> tuple[CaseSummaryRow, list[CandidateAuditRow], list[OperationTraceRow], Counter[str]]:
     summary, candidate_rows, operation_rows_for_case, rejection_reasons, _diagnostics = run_case_with_diagnostics(
         truth_path=truth_path,
@@ -8936,6 +9626,7 @@ def run_case(
         repair_mode=repair_mode,
         allow_phase_forced_open=allow_phase_forced_open,
         strategy_name_filter=strategy_name_filter,
+        debug_candidate_rounds=debug_candidate_rounds,
     )
     return summary, candidate_rows, operation_rows_for_case, rejection_reasons
 
@@ -8950,6 +9641,7 @@ def run_case_with_diagnostics(
     repair_mode: str = AUDIT_REPAIR_MODE,
     allow_phase_forced_open: bool = True,
     strategy_name_filter: str = "",
+    debug_candidate_rounds: set[tuple[str, int]] | None = None,
 ) -> tuple[CaseSummaryRow, list[CandidateAuditRow], list[OperationTraceRow], Counter[str], RuntimeDiagnosticRows]:
     case_id = case_id_from_path(truth_path)
     payload = read_json(truth_path)
@@ -8957,7 +9649,7 @@ def run_case_with_diagnostics(
     normalized_cars = [normalized_car(car) for car in payload.get("StartStatus") or []]
     capacities = terminal_capacity_by_line(payload)
     manual_baseline = baseline_for_case(manual_baselines, case_id)
-    short_chain_manual = bool(manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS)
+    short_chain_manual = is_short_chain_baseline(manual_baseline)
 
     base_assignment = build_depot_assignment([dict(car) for car in normalized_cars], capacities)
     clustered_assignment = build_short_direct_depot_assignment(
@@ -9093,37 +9785,9 @@ def run_case_with_diagnostics(
         aligned_short_direct = is_short_direct_depot_variant(case_id) or short_chain_manual
         strategies = [
             ("aligned_base", base_assignment, aligned_short_direct, aligned_config),
-            (
-                "aligned_base_transition_first",
-                base_assignment,
-                aligned_short_direct,
-                replace(aligned_config, remote_transition_first=True),
-            ),
-            (
-                "aligned_base_early_entry_prep",
-                base_assignment,
-                aligned_short_direct,
-                replace(aligned_config, allow_early_remote_entry_prep=True),
-            ),
         ]
         if cluster_feasible:
             strategies.append(("aligned_cluster", clustered_assignment, aligned_short_direct, aligned_config))
-            strategies.append(
-                (
-                    "aligned_cluster_transition_first",
-                    clustered_assignment,
-                    aligned_short_direct,
-                    replace(aligned_config, remote_transition_first=True),
-                )
-            )
-            strategies.append(
-                (
-                    "aligned_cluster_early_entry_prep",
-                    clustered_assignment,
-                    aligned_short_direct,
-                    replace(aligned_config, allow_early_remote_entry_prep=True),
-                )
-            )
         if strategy_name_filter:
             filtered = [item for item in strategies if strategy_name_filter in item[0]]
             if filtered:
@@ -9148,6 +9812,7 @@ def run_case_with_diagnostics(
                     manual_baseline=manual_baseline,
                     repair_mode=repair_mode,
                     allow_phase_forced_open=allow_phase_forced_open,
+                    debug_candidate_rounds=debug_candidate_rounds,
                 )
             )
         best = results[0]
@@ -9280,6 +9945,7 @@ def run_case_with_diagnostics(
                 manual_baseline=manual_baseline,
                 repair_mode=repair_mode,
                 allow_phase_forced_open=allow_phase_forced_open,
+                debug_candidate_rounds=debug_candidate_rounds,
             )
         )
 
@@ -9314,6 +9980,7 @@ def _run_case_once(
     manual_baseline: ManualBaseline | None = None,
     repair_mode: str = AUDIT_REPAIR_MODE,
     allow_phase_forced_open: bool = True,
+    debug_candidate_rounds: set[tuple[str, int]] | None = None,
 ) -> tuple[CaseSummaryRow, list[CandidateAuditRow], list[OperationTraceRow], Counter[str], RuntimeDiagnosticRows]:
     cars = [dict(car) for car in normalized_cars]
     validator = PhysicalValidator(graph)
@@ -9432,6 +10099,8 @@ def _run_case_once(
         prospective_cache: dict[str, list[dict[str, Any]]] = {}
         metrics_cache: dict[str, tuple[int, int, int, int]] = {}
         remote_debt_cache: dict[str, tuple[int, int]] = {}
+        session_debt_before = build_session_debt_set(cars, depot_assignment)
+        session_debt_cache: dict[str, tuple[SessionDebtSet, SessionDebtSet]] = {}
 
         def prospective_cars_for(candidate: HookCandidate) -> list[dict[str, Any]]:
             cached = prospective_cache.get(candidate.candidate_id)
@@ -9489,6 +10158,20 @@ def _run_case_once(
                 after_remote_debt,
             )
             return remote_debt_cache[candidate.candidate_id]
+
+        def session_debt_metrics(
+            candidate: HookCandidate,
+            validation: PhysicalValidation,
+        ) -> tuple[SessionDebtSet, SessionDebtSet]:
+            cached = session_debt_cache.get(candidate.candidate_id)
+            if cached is not None:
+                return cached
+            prospective_cars = prospective_cars_for(candidate)
+            session_debt_cache[candidate.candidate_id] = (
+                session_debt_before,
+                build_session_debt_set(prospective_cars, depot_assignment),
+            )
+            return session_debt_cache[candidate.candidate_id]
 
         remote_transition_budget = RemoteTransitionBudget(
             limit=(
@@ -9615,7 +10298,7 @@ def _run_case_once(
                 )
             if (
                 repair_mode == ALIGNED_REPAIR_MODE
-                and not (manual_baseline and manual_baseline.variant in SHORT_CHAIN_VARIANTS)
+                and not is_short_chain_baseline(manual_baseline)
             ):
                 return (
                     1 if transition_over_budget else 0,
@@ -9682,14 +10365,33 @@ def _run_case_once(
                 allowed_profiles=remote_session_plan.allowed_profiles,
                 tail_mode=remote_session_plan.stage == REMOTE_SESSION_STAGE_TAIL,
                 leased_corridor_lines=tuple(sorted(leased_remote_corridor_lines)),
+                short_chain=remote_session_plan.short_chain,
             )
 
         remote_state = current_remote_session_state()
+        debug_this_round = bool(debug_candidate_rounds and (case_id.upper(), hook_index) in debug_candidate_rounds)
+        debug_rows: list[tuple[Any, str, HookCandidate, int, int, int, int, int, str]] = []
         phase_selectable = [item for item in physically_accepted if not item[2]]
         remote_session_should_continue = remote_state.active and remote_state.debt > 0
         selectable_items = physically_accepted
 
         for candidate, validation, phase_reason in sorted(selectable_items, key=selection_key):
+            if debug_this_round and phase_reason:
+                reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+                remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
+                debug_rows.append(
+                    (
+                        selection_key((candidate, validation, phase_reason)),
+                        "",
+                        candidate,
+                        reduction,
+                        non_depot_reduction,
+                        remote_reduction,
+                        after_remote_debt,
+                        candidate_remote_business_transition_count(candidate, last_business_hook_remote),
+                        phase_reason,
+                    )
+                )
             if phase_reason:
                 if repair_mode == ALIGNED_REPAIR_MODE and phase_reason.startswith("human_phase_contract"):
                     structural_validation = PhysicalValidation(
@@ -9718,10 +10420,25 @@ def _run_case_once(
                 physically_accepted=physically_accepted,
                 transition_metrics=transition_metrics,
                 remote_debt_metrics=remote_debt_metrics,
+                session_debt_metrics=session_debt_metrics,
                 remote_session_state=remote_state,
                 repair_mode=repair_mode,
                 manual_baseline=manual_baseline,
             )
+            if debug_this_round:
+                debug_rows.append(
+                    (
+                        selection_key((candidate, validation, phase_reason)),
+                        structural_reason,
+                        candidate,
+                        reduction,
+                        non_depot_reduction,
+                        remote_debt_metrics(candidate, validation)[0],
+                        after_remote_debt,
+                        candidate_remote_business_transition_count(candidate, last_business_hook_remote),
+                        phase_reason,
+                    )
+                )
             if structural_reason:
                 structural_validation = PhysicalValidation(
                     accepted=False,
@@ -9763,6 +10480,22 @@ def _run_case_once(
             selected_transition = (candidate, validation, prospective_cars, next_loco_location, signature, "")
             break
 
+        if debug_this_round:
+            print(
+                f"DEBUG_CANDIDATE_ROUND case={case_id} strategy={solve_strategy} hook={hook_index} "
+                f"last_remote={last_business_hook_remote} remote_debt={remote_interaction_debt} "
+                f"stage={remote_session_plan.stage} active={remote_state.active}"
+            )
+            for rank, (key, structural_reason, candidate, reduction, non_depot_reduction, remote_reduction, after_remote_debt, transition_count, phase_reason) in enumerate(sorted(debug_rows, key=lambda item: item[0])[:20], start=1):
+                print(
+                    "DEBUG_CANDIDATE "
+                    f"rank={rank} kind={candidate.candidate_kind} profile={candidate_remote_profile(candidate)} "
+                    f"internal={candidate_internal_remote_transition_count(candidate)} transitions={transition_count} "
+                    f"reduction={reduction} non_depot={non_depot_reduction} remote_reduction={remote_reduction} "
+                    f"after_remote={after_remote_debt} phase_reason={phase_reason or '-'} "
+                    f"structural_reason={structural_reason or '-'} reason={candidate.generation_reason}"
+                )
+
         if selected_transition is None and phase_deferred:
             if repair_mode == ALIGNED_REPAIR_MODE and not allow_phase_forced_open:
                 blocked_reason = "human_phase_contract_no_phase_permitted_candidate"
@@ -9779,10 +10512,61 @@ def _run_case_once(
                     rejection_reasons[phase_reason] += 1
             deferred_items = [] if repair_mode == ALIGNED_REPAIR_MODE and not allow_phase_forced_open else phase_deferred
             if remote_session_should_continue:
-                deferred_items = [
-                    item for item in deferred_items if candidate_touches_remote_interaction(item[0])
-                ]
-            for candidate, validation, phase_reason in sorted(deferred_items, key=selection_key):
+                remote_debt_reducing_deferred: list[tuple[HookCandidate, PhysicalValidation, str]] = []
+                for item in deferred_items:
+                    candidate, validation, _phase_reason = item
+                    if not candidate_touches_remote_interaction(candidate):
+                        continue
+                    _remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
+                    if after_remote_debt >= remote_state.debt:
+                        continue
+                    reduction, non_depot_reduction, after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+                    if structural_reject_reason(
+                        candidate=candidate,
+                        validation=validation,
+                        phase_reason="",
+                        reduction=reduction,
+                        non_depot_reduction=non_depot_reduction,
+                        after_unsatisfied=after_unsat,
+                        after_remote_debt=after_remote_debt,
+                        physically_accepted=physically_accepted,
+                        transition_metrics=transition_metrics,
+                        remote_debt_metrics=remote_debt_metrics,
+                        session_debt_metrics=session_debt_metrics,
+                        remote_session_state=remote_state,
+                        repair_mode=repair_mode,
+                        manual_baseline=manual_baseline,
+                    ):
+                        continue
+                    remote_debt_reducing_deferred.append(item)
+                if remote_debt_reducing_deferred:
+                    deferred_items = remote_debt_reducing_deferred
+
+            def deferred_selection_key(item: tuple[HookCandidate, PhysicalValidation, str]) -> Any:
+                candidate, validation, phase_reason = item
+                if remote_session_should_continue and candidate_touches_remote_interaction(candidate):
+                    remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
+                    reduction, non_depot_reduction, _after_unsat, _after_non_depot = transition_metrics(candidate, validation)
+                    hook_count = max(1, planlet_business_hook_count(candidate))
+                    transition_count = max(
+                        1,
+                        candidate_remote_business_transition_count(candidate, last_business_hook_remote),
+                    )
+                    return (
+                        0,
+                        0 if remote_reduction > 0 else 1,
+                        round(-remote_reduction / transition_count, 4),
+                        transition_count,
+                        round(-remote_reduction / hook_count, 4),
+                        after_remote_debt,
+                        -remote_reduction,
+                        -reduction,
+                        -non_depot_reduction,
+                        selection_key(item),
+                    )
+                return (1, selection_key(item))
+
+            for candidate, validation, phase_reason in sorted(deferred_items, key=deferred_selection_key):
                 reduction, non_depot_reduction, after_unsat, _after_non_depot = transition_metrics(candidate, validation)
                 _remote_reduction, after_remote_debt = remote_debt_metrics(candidate, validation)
                 structural_reason = structural_reject_reason(
@@ -9796,6 +10580,7 @@ def _run_case_once(
                     physically_accepted=physically_accepted,
                     transition_metrics=transition_metrics,
                     remote_debt_metrics=remote_debt_metrics,
+                    session_debt_metrics=session_debt_metrics,
                     remote_session_state=remote_state,
                     repair_mode=repair_mode,
                     manual_baseline=manual_baseline,
@@ -10480,7 +11265,7 @@ def build_short_chain_rows(
     rows: list[ShortChainDiagnosticRow] = []
     for case_row in case_rows:
         baseline = manual_baselines.get(case_row.case_id)
-        if baseline is None or baseline.variant not in SHORT_CHAIN_VARIANTS:
+        if not is_short_chain_baseline(baseline):
             continue
         remote_metrics = solver_remote_metrics_for_case(
             operations_by_case.get(case_row.case_id, []),
@@ -10623,11 +11408,12 @@ def classify_observed_remote_session(
     *,
     session_index: int,
     session_count: int,
+    short_chain: bool,
     manual_variant: str,
     structural_intents: set[str],
     remote_profiles: set[str],
 ) -> str:
-    if manual_variant in SHORT_CHAIN_VARIANTS:
+    if short_chain:
         return "SHORT_DIRECT_REMOTE"
     if structural_intents <= {"DEPOT_SAME_LINE_REPACK"}:
         return "REMOTE_INTERNAL_REPACK"
@@ -10855,6 +11641,11 @@ def build_remote_session_plan_trace_rows(
             session_type = classify_observed_remote_session(
                 session_index=session_index,
                 session_count=len(sessions),
+                short_chain=bool(
+                    baseline
+                    and baseline.manual_variant in SHORT_CHAIN_VARIANTS
+                    and baseline.manual_hook_count <= SHORT_CHAIN_MAX_MANUAL_HOOKS
+                ),
                 manual_variant=baseline.manual_variant if baseline else "",
                 structural_intents=structural_intents,
                 remote_profiles=remote_profiles,
@@ -11018,7 +11809,7 @@ def build_structure_work_audit_rows(
     case_by_id = {row.case_id: row for row in case_rows}
     for case_id, case_row in case_by_id.items():
         first_remote = first_remote_by_case.get(case_id)
-        baseline_like_short = any(row.case_id == case_id and row.manual_variant in SHORT_CHAIN_VARIANTS for row in short_chain_rows)
+        baseline_like_short = any(row.case_id == case_id for row in short_chain_rows)
         if first_remote is None:
             progress = 1.0 if case_row.status == "completed" else 0.0
             business_start = 0
@@ -11054,7 +11845,7 @@ def build_structure_work_audit_rows(
         passed = not requires_owner or has_owner
         add(
             item=4,
-            name="RemoteSessionDebtSet",
+            name="RemoteSessionContract",
             scope="remote_session_batch",
             case_id=row.case_id,
             solve_strategy=row.solve_strategy,
@@ -11070,7 +11861,7 @@ def build_structure_work_audit_rows(
             target_value="every remote enter/exit/cross has declared remote session owner and debt set",
             gap_reason="" if passed else "remote_session_without_owner",
             evidence="depot_session_audit.csv + contract_trace.csv",
-            next_required_component="RemoteSessionDebtSet",
+            next_required_component="RemoteSessionContract",
         )
 
     for row in manual_vs_solver_rows:
@@ -11459,6 +12250,7 @@ def run(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     graph = TrackGraph()
     manual_baselines = load_manual_baselines(root, args.manual_dir)
+    debug_candidate_rounds = parse_debug_candidate_rounds(args.debug_candidate_round)
 
     truth_paths = sorted(path for path in truth_dir.glob("*.json") if path.name != "conversion_summary.json")
     if args.case_id:
@@ -11482,6 +12274,7 @@ def run(args: argparse.Namespace) -> int:
             repair_mode=args.repair_mode,
             allow_phase_forced_open=args.allow_phase_forced_open,
             strategy_name_filter=args.strategy_name_filter,
+            debug_candidate_rounds=debug_candidate_rounds,
         )
         all_case_rows.append(case_row)
         all_candidate_rows.extend(candidate_rows)
@@ -11599,6 +12392,12 @@ def parse_args() -> argparse.Namespace:
         "--strategy-name-filter",
         default="",
         help="diagnostic-only substring filter for strategy names; default runs the normal strategy set.",
+    )
+    parser.add_argument(
+        "--debug-candidate-round",
+        nargs="*",
+        default=[],
+        help="Print selected candidate ranking diagnostics for CASE:HOOK pairs, e.g. 0104W:5.",
     )
     parser.add_argument("--case-id", nargs="*")
     parser.add_argument("--check", action="store_true")

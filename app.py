@@ -326,6 +326,7 @@ def _render_p10_result(
     source_name: str = "",
 ) -> None:
     summary_dict = asdict(summary)
+    vehicle_display_labels = _p10_vehicle_display_labels(payload)
     status = summary_dict["status"]
     status_text = _p10_status_text(status)
     business_hook_count = _p10_business_hook_count(operation_rows)
@@ -359,22 +360,6 @@ def _render_p10_result(
         "内部移动批次 = runtime 一次取放搬运分组；接口操作数 = Operations 条数，包含称重等非挂摘操作。"
     )
 
-    guard_rows = [
-        {"check": "business_get_put_hook_count", "value": business_hook_count},
-        {"check": "get_count", "value": action_counts.get("Get", 0)},
-        {"check": "put_count", "value": action_counts.get("Put", 0)},
-        {"check": "weigh_operation_count", "value": action_counts.get("Weigh", 0)},
-        {"check": "solve_strategy", "value": summary_dict.get("solve_strategy", "未知")},
-        {"check": "remote_interaction_cross_count", "value": summary_dict.get("remote_interaction_cross_count", 0)},
-        {"check": "remote_business_transition_count", "value": summary_dict.get("remote_business_transition_count", 0)},
-        {"check": "remote_interaction_batch_count", "value": summary_dict.get("remote_interaction_batch_count", 0)},
-        {"check": "remote_interaction_session_count", "value": summary_dict.get("remote_interaction_session_count", 0)},
-        {"check": "unknown_route_count", "value": summary_dict["unknown_route_count"]},
-        {"check": "depot_slot_failure_count", "value": summary_dict["depot_slot_failure_count"]},
-        {"check": "state_loop_count", "value": summary_dict["state_loop_count"]},
-        {"check": "blocked_reason", "value": summary_dict["blocked_reason"] or "无"},
-    ]
-    st.dataframe(_stringify_value_column(guard_rows), width="stretch", hide_index=True)
     st.caption(f"runtime 输入文件：{runtime_input_path}")
     if summary_dict.get("response_path"):
         st.caption(f"接口响应文件：{summary_dict['response_path']}")
@@ -387,7 +372,7 @@ def _render_p10_result(
     )
     if view == "接口响应":
         st.caption("接口响应中的 Operations[].Index 是操作序号；业务勾数请以上方 Get/Put 计数为准。")
-        st.json(response)
+        st.json(_p10_response_for_display(response, vehicle_display_labels))
         st.download_button(
             "下载响应 JSON",
             data=json.dumps(response, ensure_ascii=False, indent=2),
@@ -396,20 +381,20 @@ def _render_p10_result(
             key="p10-response-download",
         )
     elif view == "批次/操作计划":
-        hook_rows = _p10_hook_summary_rows(operation_rows)
+        hook_rows = _p10_hook_summary_rows(operation_rows, vehicle_display_labels)
         if hook_rows:
             st.markdown("**按内部移动批次汇总**")
             st.dataframe(hook_rows, width="stretch", hide_index=True)
             st.markdown("**接口操作序列 / 业务挂摘勾号**")
-            st.dataframe(_p10_operation_table_rows(operation_rows), width="stretch", hide_index=True)
+            st.dataframe(_p10_operation_table_rows(operation_rows, vehicle_display_labels), width="stretch", hide_index=True)
         else:
             st.info("当前没有生成操作。")
     elif view == "可视化回放":
-        _render_p10_replay(payload, operation_rows, response)
+        _render_p10_replay(payload, operation_rows, response, vehicle_display_labels)
     elif view == "终态":
-        _render_p10_end_status(response)
+        _render_p10_end_status(response, vehicle_display_labels)
     else:
-        _render_p10_diagnostics(summary, candidate_rows, rejection_reasons)
+        _render_p10_diagnostics(summary, candidate_rows, rejection_reasons, vehicle_display_labels)
 
 
 def _p10_status_text(status: str) -> str:
@@ -428,6 +413,153 @@ def _stringify_value_column(rows: list[dict]) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _p10_vehicle_display_labels(payload: dict) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for car in payload.get("StartStatus") or []:
+        no = str(car.get("No") or "").strip()
+        if not no:
+            continue
+        attributes = _p10_vehicle_display_attributes(car)
+        labels[no] = f"{no}({';'.join(attributes)})"
+    return labels
+
+
+def _p10_vehicle_display_attributes(car: dict) -> list[str]:
+    attributes: list[str] = []
+    target_lines = [
+        str(line).strip()
+        for line in car.get("TargetLines") or []
+        if str(line).strip()
+    ]
+    display_targets = _p10_display_target_lines(target_lines)
+    attributes.append("/".join(display_targets) if display_targets else "无目标")
+
+    repair_process = str(car.get("RepairProcess") or "").strip()
+    if repair_process:
+        attributes.append(repair_process)
+
+    length_text = _p10_format_number(car.get("Length"))
+    if length_text:
+        attributes.append(f"{length_text}m")
+
+    if _p10_as_bool(car.get("IsHeavy")):
+        attributes.append("重")
+    if _p10_as_bool(car.get("IsWeigh")):
+        attributes.append("称重")
+    if _p10_as_bool(car.get("IsClosedDoor")):
+        attributes.append("关门")
+
+    force_positions = [
+        str(position).strip()
+        for position in car.get("ForceTargetPosition") or []
+        if str(position).strip()
+    ]
+    if force_positions:
+        attributes.append(f"位{'/'.join(force_positions)}")
+    return attributes
+
+
+def _p10_display_target_lines(target_lines: list[str]) -> list[str]:
+    display_targets: list[str] = []
+    for line in target_lines:
+        display_line = "大库内" if line in {"修1库内", "修2库内", "修3库内", "修4库内"} else line
+        if display_line not in display_targets:
+            display_targets.append(display_line)
+    return display_targets
+
+
+def _p10_format_number(value) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:g}"
+
+
+def _p10_as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "是"}
+    return bool(value)
+
+
+def _p10_vehicle_label(car_no, vehicle_display_labels: dict[str, str]) -> str:
+    no = str(car_no or "").strip()
+    if not no:
+        return ""
+    return vehicle_display_labels.get(no, f"{no}(目标:未知)")
+
+
+def _p10_compact_vehicle_label(car_no, vehicle_display_labels: dict[str, str]) -> str:
+    no = str(car_no or "").strip()
+    if not no:
+        return ""
+    full_label = _p10_vehicle_label(no, vehicle_display_labels)
+    target_match = re.search(r"\(([^;)]+)", full_label)
+    target_text = target_match.group(1) if target_match else "?"
+    short_target = target_text.split("/")[0]
+    return f"{no}({short_target})"
+
+
+def _p10_format_vehicle_list(car_nos: list[str], vehicle_display_labels: dict[str, str]) -> str:
+    return " ".join(
+        label
+        for label in (_p10_vehicle_label(car_no, vehicle_display_labels) for car_no in car_nos)
+        if label
+    )
+
+
+def _p10_format_vehicle_pipe(text: str, vehicle_display_labels: dict[str, str]) -> str:
+    return _p10_format_vehicle_list(_p10_split_pipe(text), vehicle_display_labels)
+
+
+def _p10_annotate_known_vehicle_text(text, vehicle_display_labels: dict[str, str]) -> str:
+    result = str(text or "")
+    for car_no, label in sorted(vehicle_display_labels.items(), key=lambda item: len(item[0]), reverse=True):
+        result = re.sub(
+            rf"(?<![0-9A-Za-z]){re.escape(car_no)}(?![0-9A-Za-z])",
+            label,
+            result,
+        )
+    return result
+
+
+def _p10_annotate_known_vehicle_json(value, vehicle_display_labels: dict[str, str]):
+    if isinstance(value, dict):
+        return {
+            key: _p10_annotate_known_vehicle_json(item, vehicle_display_labels)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_p10_annotate_known_vehicle_json(item, vehicle_display_labels) for item in value]
+    if isinstance(value, str):
+        return _p10_annotate_known_vehicle_text(value, vehicle_display_labels)
+    return value
+
+
+def _p10_response_for_display(value, vehicle_display_labels: dict[str, str]):
+    if isinstance(value, list):
+        return [_p10_response_for_display(item, vehicle_display_labels) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    result = {}
+    for key, item in value.items():
+        if key in {"MoveCars", "TrainCars"} and isinstance(item, list):
+            result[key] = [
+                _p10_vehicle_label(car_no, vehicle_display_labels)
+                for car_no in item
+            ]
+        elif key == "No":
+            result[key] = _p10_vehicle_label(item, vehicle_display_labels)
+        else:
+            result[key] = _p10_response_for_display(item, vehicle_display_labels)
+    return result
 
 
 def _p10_format_blocked_reason(reason: str) -> str:
@@ -474,7 +606,7 @@ def _p10_generated_status_from_payload(payload: dict) -> list[dict]:
     return sorted(rows, key=lambda row: (row["Line"], row["Position"], row["No"]))
 
 
-def _p10_hook_summary_rows(operation_rows) -> list[dict[str, object]]:
+def _p10_hook_summary_rows(operation_rows, vehicle_display_labels: dict[str, str]) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for hook_index, group in _p10_group_operations_by_hook(operation_rows).items():
         get_op = next((row for row in group if row.action == "Get"), group[0])
@@ -489,7 +621,7 @@ def _p10_hook_summary_rows(operation_rows) -> list[dict[str, object]]:
                 "source": get_op.line,
                 "target": put_op.line,
                 "carCount": len(move_cars),
-                "moveCars": " ".join(move_cars),
+                "moveCars": _p10_format_vehicle_list(move_cars, vehicle_display_labels),
                 "hasWeigh": any(row.action == "Weigh" for row in group),
                 "businessHookCount": sum(row.action in P10_BUSINESS_HOOK_ACTIONS for row in group),
                 "operationCount": len(group),
@@ -499,13 +631,13 @@ def _p10_hook_summary_rows(operation_rows) -> list[dict[str, object]]:
     return rows
 
 
-def _p10_operation_table_rows(operation_rows) -> list[dict[str, object]]:
+def _p10_operation_table_rows(operation_rows, vehicle_display_labels: dict[str, str]) -> list[dict[str, object]]:
     rows = []
     business_hook_no = 0
     for row in sorted(operation_rows, key=lambda item: (item.hook_index, item.operation_index)):
         if row.action in P10_BUSINESS_HOOK_ACTIONS:
             business_hook_no += 1
-            display_business_hook_no: int | str = business_hook_no
+            display_business_hook_no = str(business_hook_no)
         else:
             display_business_hook_no = ""
         rows.append(
@@ -515,8 +647,8 @@ def _p10_operation_table_rows(operation_rows) -> list[dict[str, object]]:
                 "operationIndex": row.operation_index,
                 "action": row.action,
                 "line": row.line,
-                "moveCars": " ".join(_p10_split_pipe(row.move_cars)),
-                "trainCars": " ".join(_p10_split_pipe(row.train_cars)),
+                "moveCars": _p10_format_vehicle_pipe(row.move_cars, vehicle_display_labels),
+                "trainCars": _p10_format_vehicle_pipe(row.train_cars, vehicle_display_labels),
                 "passbyPath": " -> ".join(_p10_split_pipe(row.passby_path)),
             }
         )
@@ -533,7 +665,12 @@ def _p10_group_operations_by_hook(operation_rows) -> dict[int, list]:
     }
 
 
-def _render_p10_replay(payload: dict, operation_rows, response: dict) -> None:
+def _render_p10_replay(
+    payload: dict,
+    operation_rows,
+    response: dict,
+    vehicle_display_labels: dict[str, str],
+) -> None:
     frames = _p10_build_replay_frames(payload, operation_rows, response)
     if not frames:
         st.info("当前没有可回放状态。")
@@ -588,6 +725,7 @@ def _render_p10_replay(payload: dict, operation_rows, response: dict) -> None:
                     target_line=frame["target_line"],
                     move_cars=frame["move_cars"],
                     train_cars=frame["train_cars"],
+                    vehicle_display_labels=vehicle_display_labels,
                 ),
                 unsafe_allow_html=True,
             )
@@ -596,24 +734,23 @@ def _render_p10_replay(payload: dict, operation_rows, response: dict) -> None:
             unsafe_allow_html=True,
         )
     with side_col:
-        side_rows = [
-            {"label": "步骤", "value": f"{frame_index + 1}/{len(frames)}"},
-            {"label": "业务勾号", "value": frame["business_hook"] or "无"},
-            {"label": "内部移动批次", "value": frame["hook"] or "无"},
-            {"label": "接口操作序号", "value": frame["operation"] or "无"},
-            {"label": "动作", "value": frame["action"] or "初始"},
-            {"label": "股道", "value": frame["active_line"] or "无"},
-            {"label": "移动车辆", "value": " ".join(frame["move_cars"]) or "无"},
-            {"label": "调车机后挂", "value": " ".join(frame["train_cars"]) or "无"},
-        ]
-        st.dataframe(_stringify_value_column(side_rows), width="stretch", hide_index=True)
+        st.markdown(
+            _p10_replay_detail_html(
+                frame,
+                frame_index=frame_index,
+                frame_count=len(frames),
+                vehicle_display_labels=vehicle_display_labels,
+            ),
+            unsafe_allow_html=True,
+        )
 
     state_rows = _p10_state_table_rows(
         frame["state"],
         highlighted_lines=set(frame["path"]) | {frame["source_line"], frame["target_line"]},
+        vehicle_display_labels=vehicle_display_labels,
     )
     if state_rows:
-        st.dataframe(state_rows, width="stretch", hide_index=True)
+        st.markdown(_p10_cars_table_html(state_rows), unsafe_allow_html=True)
 
 
 def _p10_build_replay_frames(payload: dict, operation_rows, response: dict) -> list[dict]:
@@ -715,6 +852,99 @@ def _p10_replay_frame_title(row, business_hook_no: int | str) -> str:
             f"接口操作 {row.operation_index}: {row.action}"
         )
     return f"内部移动批次 {row.hook_index} / 接口操作 {row.operation_index}: {row.action}"
+
+
+def _p10_replay_detail_html(
+    frame: dict,
+    *,
+    frame_index: int,
+    frame_count: int,
+    vehicle_display_labels: dict[str, str],
+) -> str:
+    detail_rows = [
+        ("步骤", f"{frame_index + 1}/{frame_count}", False),
+        ("业务勾号", frame["business_hook"] or "无", False),
+        ("内部移动批次", frame["hook"] or "无", False),
+        ("接口操作序号", frame["operation"] or "无", False),
+        ("动作", frame["action"] or "初始", False),
+        ("股道", frame["active_line"] or "无", False),
+        ("移动车辆", frame["move_cars"], True),
+        ("调车机后挂", frame["train_cars"], True),
+    ]
+    rows_html = []
+    for label, value, multiline in detail_rows:
+        value_html = (
+            _p10_vehicle_lines_html(value, vehicle_display_labels)
+            if multiline
+            else escape(str(value))
+        )
+        value_class = "p10-detail-value p10-detail-value-multiline" if multiline else "p10-detail-value"
+        rows_html.append(
+            "<div class='p10-detail-row'>"
+            f"<div class='p10-detail-label'>{escape(label)}</div>"
+            f"<div class='{value_class}'>{value_html}</div>"
+            "</div>"
+        )
+    return f"""
+    <style>
+    .p10-detail-panel {{
+      border: 1px solid #d9e2ec;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #ffffff;
+    }}
+    .p10-detail-row {{
+      display: grid;
+      grid-template-columns: minmax(86px, 34%) minmax(0, 1fr);
+      border-bottom: 1px solid #e5edf5;
+      min-height: 34px;
+    }}
+    .p10-detail-row:last-child {{
+      border-bottom: 0;
+    }}
+    .p10-detail-label {{
+      padding: 8px 10px;
+      background: #f8fafc;
+      color: #475569;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.35;
+    }}
+    .p10-detail-value {{
+      padding: 8px 10px;
+      color: #0f172a;
+      font-size: 13px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }}
+    .p10-detail-value-multiline {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 360px;
+      overflow: auto;
+    }}
+    .p10-detail-car {{
+      display: block;
+      padding: 3px 0;
+      border-bottom: 1px dashed #e2e8f0;
+      overflow-wrap: anywhere;
+    }}
+    .p10-detail-car:last-child {{
+      border-bottom: 0;
+    }}
+    </style>
+    <div class="p10-detail-panel">{''.join(rows_html)}</div>
+    """
+
+
+def _p10_vehicle_lines_html(car_nos: list[str], vehicle_display_labels: dict[str, str]) -> str:
+    if not car_nos:
+        return "无"
+    return "".join(
+        f"<span class='p10-detail-car'>{escape(_p10_vehicle_label(car_no, vehicle_display_labels))}</span>"
+        for car_no in car_nos
+    )
 
 
 def _p10_initial_state(payload: dict) -> dict[str, list[str]]:
@@ -979,6 +1209,7 @@ def _p10_yard_svg(
     target_line: str,
     move_cars: list[str],
     train_cars: list[str],
+    vehicle_display_labels: dict[str, str],
 ) -> str:
     groups = _p10_line_groups(state_by_line, active_path | {source_line, target_line})
     width = 1220
@@ -1039,22 +1270,30 @@ def _p10_yard_svg(
                 f'y="{y + 3:.1f}">{len(cars)}</text>'
             )
             chip_x = track_x + 7
-            max_chips = max(1, int((track_width - 48) // 36))
+            chip_width = 92
+            chip_gap = 4
+            max_chips = max(1, int((track_width - 48) // (chip_width + chip_gap)))
             for chip_index, car_no in enumerate(cars[:max_chips]):
-                cx = chip_x + chip_index * 36
+                cx = chip_x + chip_index * (chip_width + chip_gap)
                 is_active = car_no in move_set
                 chip_class = "p10-chip p10-chip-active" if is_active else "p10-chip"
                 text_class = "p10-chip-text p10-chip-text-active" if is_active else "p10-chip-text"
-                label = car_no[-4:] if len(car_no) > 4 else car_no
+                full_label = _p10_vehicle_label(car_no, vehicle_display_labels)
+                compact_label = _p10_compact_vehicle_label(car_no, vehicle_display_labels)
+                parts.append("<g>")
+                parts.append(f"<title>{escape(full_label)}</title>")
                 parts.append(
-                    f'<rect class="{chip_class}" x="{cx:.1f}" y="{track_y + 4:.1f}" width="31" height="16" rx="4" />'
+                    f'<rect class="{chip_class}" x="{cx:.1f}" y="{track_y + 4:.1f}" '
+                    f'width="{chip_width}" height="16" rx="4" />'
                 )
                 parts.append(
-                    f'<text class="{text_class}" x="{cx + 15.5:.1f}" y="{track_y + 12.5:.1f}">{escape(label)}</text>'
+                    f'<text class="{text_class}" x="{cx + chip_width / 2:.1f}" y="{track_y + 12.5:.1f}">'
+                    f"{escape(compact_label)}</text>"
                 )
+                parts.append("</g>")
             if len(cars) > max_chips:
                 parts.append(
-                    f'<text class="p10-more" x="{chip_x + max_chips * 36 + 2:.1f}" '
+                    f'<text class="p10-more" x="{chip_x + max_chips * (chip_width + chip_gap) + 2:.1f}" '
                     f'y="{track_y + 16:.1f}">+{len(cars) - max_chips}</text>'
                 )
 
@@ -1110,10 +1349,120 @@ def _p10_route_chips_html(path: list[str]) -> str:
     """
 
 
+def _p10_cars_table_html(rows: list[dict[str, object]]) -> str:
+    if not rows:
+        return ""
+    columns = [column for column in ("line", "carCount", "cars") if column in rows[0]]
+    header_labels = {
+        "line": "股道",
+        "carCount": "辆数",
+        "cars": "车辆",
+    }
+    header_html = "".join(
+        f"<th class='p10-cars-col-{escape(column)}'>{escape(header_labels.get(column, column))}</th>"
+        for column in columns
+    )
+    body_rows = []
+    for row in rows:
+        cells = []
+        for column in columns:
+            value = row.get(column, "")
+            if column == "cars":
+                value_html = _p10_cars_cell_html(value)
+            else:
+                value_html = escape(str(value))
+            cells.append(f"<td class='p10-cars-col-{escape(column)}'>{value_html}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    return f"""
+    <style>
+    .p10-cars-table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      margin: 8px 0 14px 0;
+      border: 1px solid #d9e2ec;
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 13px;
+    }}
+    .p10-cars-table th,
+    .p10-cars-table td {{
+      border-bottom: 1px solid #e5edf5;
+      padding: 7px 9px;
+      vertical-align: top;
+      line-height: 1.35;
+    }}
+    .p10-cars-table th {{
+      background: #f8fafc;
+      color: #475569;
+      font-weight: 700;
+      text-align: left;
+    }}
+    .p10-cars-table tr:last-child td {{
+      border-bottom: 0;
+    }}
+    .p10-cars-col-line {{
+      width: 112px;
+      white-space: nowrap;
+    }}
+    .p10-cars-col-carCount {{
+      width: 64px;
+      text-align: right;
+      white-space: nowrap;
+    }}
+    .p10-cars-col-cars {{
+      width: auto;
+      overflow-wrap: anywhere;
+    }}
+    .p10-cars-list {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px 8px;
+      align-items: flex-start;
+    }}
+    .p10-cars-item {{
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: #f1f5f9;
+      color: #0f172a;
+      border: 1px solid #e2e8f0;
+      overflow-wrap: anywhere;
+    }}
+    </style>
+    <table class="p10-cars-table">
+      <thead><tr>{header_html}</tr></thead>
+      <tbody>{''.join(body_rows)}</tbody>
+    </table>
+    """
+
+
+def _p10_cars_cell_html(value) -> str:
+    if isinstance(value, (list, tuple)):
+        items = [str(item) for item in value if str(item)]
+    else:
+        items = _p10_split_vehicle_labels(str(value))
+    if not items:
+        return ""
+    return "<div class='p10-cars-list'>" + "".join(
+        f"<span class='p10-cars-item'>{escape(item)}</span>"
+        for item in items
+    ) + "</div>"
+
+
+def _p10_split_vehicle_labels(value: str) -> list[str]:
+    text = value.strip()
+    if not text:
+        return []
+    matches = re.findall(r"\S+\([^)]*\)", text)
+    return matches or [text]
+
+
 def _p10_state_table_rows(
     state_by_line: dict[str, list[str]],
     *,
     highlighted_lines: set[str],
+    vehicle_display_labels: dict[str, str],
 ) -> list[dict[str, object]]:
     rows = []
     for line in sorted(state_by_line):
@@ -1125,14 +1474,17 @@ def _p10_state_table_rows(
                 "line": line,
                 "highlighted": line in highlighted_lines,
                 "carCount": len(cars),
-                "cars": " ".join(cars),
+                "cars": [
+                    _p10_vehicle_label(car_no, vehicle_display_labels)
+                    for car_no in cars
+                ],
             }
         )
     return rows
 
 
-def _render_p10_end_status(response: dict) -> None:
-    rows = _p10_end_status_rows(response)
+def _render_p10_end_status(response: dict, vehicle_display_labels: dict[str, str]) -> None:
+    rows = _p10_end_status_rows(response, vehicle_display_labels)
     if not rows:
         st.info("接口响应中没有 GeneratedEndStatus。")
         return
@@ -1141,18 +1493,18 @@ def _render_p10_end_status(response: dict) -> None:
     for row in rows:
         grouped[str(row["line"])].append(str(row["vehicleNo"]))
     for line, cars in sorted(grouped.items()):
-        line_rows.append({"line": line, "carCount": len(cars), "cars": " ".join(cars)})
+        line_rows.append({"line": line, "carCount": len(cars), "cars": cars})
     st.markdown("**终态股道汇总**")
-    st.dataframe(line_rows, width="stretch", hide_index=True)
+    st.markdown(_p10_cars_table_html(line_rows), unsafe_allow_html=True)
     st.markdown("**终态车辆位置**")
     st.dataframe(rows, width="stretch", hide_index=True)
 
 
-def _p10_end_status_rows(response: dict) -> list[dict[str, object]]:
+def _p10_end_status_rows(response: dict, vehicle_display_labels: dict[str, str]) -> list[dict[str, object]]:
     status_rows = ((response or {}).get("Data") or {}).get("GeneratedEndStatus") or []
     rows = [
         {
-            "vehicleNo": str(item.get("No") or ""),
+            "vehicleNo": _p10_vehicle_label(item.get("No"), vehicle_display_labels),
             "line": str(item.get("Line") or ""),
             "position": _p10_int_or_zero(item.get("Position")),
         }
@@ -1161,12 +1513,17 @@ def _p10_end_status_rows(response: dict) -> list[dict[str, object]]:
     return sorted(rows, key=lambda row: (row["line"], row["position"], row["vehicleNo"]))
 
 
-def _render_p10_diagnostics(summary, candidate_rows, rejection_reasons) -> None:
+def _render_p10_diagnostics(
+    summary,
+    candidate_rows,
+    rejection_reasons,
+    vehicle_display_labels: dict[str, str],
+) -> None:
     st.markdown("**CaseSummaryRow**")
-    st.json(asdict(summary))
+    st.json(_p10_annotate_known_vehicle_json(asdict(summary), vehicle_display_labels))
 
     reason_rows = [
-        {"reason": reason, "count": count}
+        {"reason": _p10_annotate_known_vehicle_text(reason, vehicle_display_labels), "count": count}
         for reason, count in sorted(rejection_reasons.items(), key=lambda item: (-item[1], item[0]))
     ]
     if reason_rows:
@@ -1196,12 +1553,12 @@ def _render_p10_diagnostics(summary, candidate_rows, rejection_reasons) -> None:
             "target": row["target_line"],
             "actionFamily": row["action_family"],
             "carCount": row["move_car_count"],
-            "moveCars": row["move_cars"].replace("|", " "),
+            "moveCars": _p10_format_vehicle_pipe(row["move_cars"], vehicle_display_labels),
             "hardViolationCount": row["hard_violation_count"],
-            "hardReasons": row["hard_violation_reasons"],
+            "hardReasons": _p10_annotate_known_vehicle_text(row["hard_violation_reasons"], vehicle_display_labels),
             "getRoute": row["get_route_exists"],
             "putRoute": row["put_route_exists"],
-            "generationReason": row["generation_reason"],
+            "generationReason": _p10_annotate_known_vehicle_text(row["generation_reason"], vehicle_display_labels),
         }
         for row in filtered
     ]
