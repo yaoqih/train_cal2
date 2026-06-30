@@ -50,6 +50,7 @@ STAGING_CANDIDATE_KINDS = {
     "spot_release_to_staging",
 }
 REMOTE_SESSION_CONTRACT_KINDS = {
+    "remote_tail_closeout_planlet",
     "remote_session_bundle_planlet",
     "remote_session_contract_planlet",
     "remote_corridor_planlet",
@@ -63,6 +64,7 @@ REMOTE_SESSION_CONTRACT_KINDS = {
     "corridor_closeout_planlet",
 }
 OWNER_BOUND_RECOVERY_KINDS = {
+    "remote_tail_closeout_planlet",
     "front_capacity_release_contract_planlet",
     "front_capacity_digest_planlet",
     "remote_session_contract_planlet",
@@ -108,6 +110,7 @@ REMOTE_SESSION_START_KINDS = {
     "short_chain_planlet",
 }
 REMOTE_SESSION_BODY_KINDS = {
+    "remote_tail_closeout_planlet",
     "remote_session_bundle_planlet",
     "remote_session_contract_planlet",
     "remote_session_planlet",
@@ -1287,6 +1290,7 @@ def candidate_ends_in_remote(candidate: HookCandidate) -> bool:
 
 def candidate_allowed_internal_remote_transitions(candidate: HookCandidate) -> int:
     if candidate.candidate_kind in {
+        "remote_tail_closeout_planlet",
         "remote_session_bundle_planlet",
         "remote_session_contract_planlet",
         "remote_exchange_planlet",
@@ -4944,6 +4948,138 @@ def filter_sources_by_nos(
     return filtered_sources, filtered_carry
 
 
+def remote_tail_closeout_planlets(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+    planned: Any,
+    satisfied: Any,
+    length_load_lookup: dict[str, float],
+    grouped: dict[str, list[dict[str, Any]]],
+) -> list[HookCandidate]:
+    remote_tail: dict[str, dict[str, Any]] = {}
+    remote_front_targets: set[str] = set()
+    for line, line_cars in grouped.items():
+        for car in line_cars:
+            if satisfied(car):
+                continue
+            target_line, _position, _reason = planned(car)
+            if not target_line:
+                continue
+            if line in REMOTE_INTERACTION_LINES or target_line in REMOTE_INTERACTION_LINES:
+                remote_tail[car_no(car)] = car
+                if line in REMOTE_INTERACTION_LINES and target_line not in REMOTE_INTERACTION_LINES:
+                    remote_front_targets.add(target_line)
+
+    if not 1 <= len(remote_tail) <= 4:
+        return []
+
+    release: dict[str, dict[str, Any]] = {}
+    for line in remote_front_targets:
+        for car in grouped.get(line, []):
+            no = car_no(car)
+            if no in remote_tail or satisfied(car):
+                continue
+            target_line, _position, _reason = planned(car)
+            if not target_line or target_line in REMOTE_INTERACTION_LINES or target_line in RUNNING_LINES:
+                continue
+            release[no] = car
+            if len(release) >= 4:
+                break
+
+    carry = sorted(
+        [*remote_tail.values(), *release.values()],
+        key=lambda car: (
+            car_no(car) not in remote_tail,
+            car["Line"] not in REMOTE_INTERACTION_LINES,
+            car["Line"],
+            int(car.get("Position") or 0),
+            car_no(car),
+        ),
+    )
+    if pull_equivalent(carry) > PULL_LIMIT_EQUIVALENT:
+        return []
+
+    source_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for car in carry:
+        source_groups[car["Line"]].append(car)
+    target_groups = target_groups_for_carry(carry, planned)
+    if not target_groups:
+        return []
+    remote_tail_nos = set(remote_tail)
+    remote_target_lines = {planned(car)[0] for car in remote_tail.values()}
+
+    def target_order_key(line: str) -> tuple[int, int, str]:
+        return (
+            0 if line not in remote_target_lines else 1,
+            0 if line in DEPOT_LINES else 1,
+            line,
+        )
+
+    def ordered_sources(remote_first: bool) -> list[tuple[str, list[dict[str, Any]]]]:
+        def source_key(line: str) -> tuple[int, int, str]:
+            return (
+                0 if ((line in REMOTE_INTERACTION_LINES) == remote_first) else 1,
+                0 if line == "存4线" else 1,
+                line,
+            )
+
+        return [(line, source_groups[line]) for line in sorted(source_groups, key=source_key)]
+
+    candidates: list[HookCandidate] = []
+    seen_ids: set[str] = set()
+    for mode, selected_sources in (
+        ("remote_first", ordered_sources(True)),
+        ("front_first", ordered_sources(False)),
+    ):
+        steps, filtered_carry = build_carry_drop_steps(
+            selected_sources=selected_sources,
+            target_groups=target_groups,
+            target_order=sorted(target_groups, key=target_order_key),
+            cars=cars,
+            depot_assignment=depot_assignment,
+            grouped=grouped,
+            length_load_lookup=length_load_lookup,
+            include_weigh_step=True,
+        )
+        filtered_nos = {car_no(car) for car in filtered_carry}
+        if not remote_tail_nos <= filtered_nos or len(steps) < 2:
+            continue
+        action_family = (
+            "REPAIR_INBOUND"
+            if any(line in REMOTE_INTERACTION_LINES for line in remote_target_lines)
+            else "DEPOT_OUTBOUND"
+        )
+        candidate = planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=steps[0].line,
+            target_line=steps[-1].line,
+            batch=filtered_carry,
+            generation_reason=(
+                "remote_tail_closeout_contract;"
+                f"mode={mode};"
+                f"remote_debt_count={len(remote_tail_nos)};"
+                f"release_count={len(filtered_nos - remote_tail_nos)};"
+                f"source_count={len([step for step in steps if step.action == 'Get'])};"
+                f"target_count={len([step for step in steps if step.action == 'Put'])};"
+                f"vehicle_count={len(filtered_carry)}"
+            ),
+            candidate_kind="remote_tail_closeout_planlet",
+            steps=tuple(steps),
+            action_family_override=action_family,
+        )
+        if candidate_internal_remote_transition_count(candidate) > 2:
+            continue
+        if candidate.candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate.candidate_id)
+        candidates.append(candidate)
+    return candidates
+
+
 def depot_digest_planlets(
     *,
     case_id: str,
@@ -5598,11 +5734,44 @@ def remote_session_bundle_planlets(
                 del clipped[source_index]
         return clipped, carry()
 
+    def append_remaining_remote_debt(
+        selected_sources: list[tuple[str, list[dict[str, Any]]]],
+        carry: list[dict[str, Any]],
+        source_maps: tuple[dict[str, list[dict[str, Any]]], ...],
+        *,
+        source_key: Any,
+        max_sources: int = 6,
+    ) -> tuple[list[tuple[str, list[dict[str, Any]]]], list[dict[str, Any]]]:
+        line_batches = {line: list(batch) for line, batch in selected_sources if batch}
+        selected_nos = {car_no(car) for car in carry}
+        for source_map in source_maps:
+            for line, batch in sorted(source_map.items(), key=source_key):
+                if line not in line_batches and len(line_batches) >= max_sources:
+                    continue
+                for car in batch:
+                    no = car_no(car)
+                    if no in selected_nos:
+                        continue
+                    target_line, _position, _reason = planned(car)
+                    if line not in REMOTE_INTERACTION_LINES and target_line not in REMOTE_INTERACTION_LINES:
+                        continue
+                    if pull_equivalent([*carry, car]) > PULL_LIMIT_EQUIVALENT:
+                        break
+                    line_batches.setdefault(line, []).append(car)
+                    carry.append(car)
+                    selected_nos.add(no)
+        return (
+            [(line, line_batches[line]) for line in sorted(line_batches, key=lambda line: source_key((line, line_batches[line])))],
+            carry,
+        )
+
     def add_bundle_candidate(
         *,
         mode: str,
         selected_sources: list[tuple[str, list[dict[str, Any]]]],
         carry: list[dict[str, Any]],
+        source_key: Any,
+        tail_source_maps: tuple[dict[str, list[dict[str, Any]]], ...],
         target_key: Any,
         family: str,
     ) -> None:
@@ -5610,6 +5779,12 @@ def remote_session_bundle_planlets(
             selected_sources, carry = clipped_bundle_sources(selected_sources)
         if pull_equivalent(carry) > PULL_LIMIT_EQUIVALENT:
             return
+        selected_sources, carry = append_remaining_remote_debt(
+            selected_sources,
+            carry,
+            tail_source_maps,
+            source_key=source_key,
+        )
         target_groups = target_groups_for_carry(carry, planned)
         target_order = sorted(target_groups, key=target_key)
         steps, filtered_carry = build_carry_drop_steps(
@@ -5656,6 +5831,8 @@ def remote_session_bundle_planlets(
         mode="outbound_then_inbound",
         selected_sources=[*selected_outbound, *selected_inbound],
         carry=[*outbound_carry, *inbound_carry],
+        source_key=lambda item: (item[0] not in REMOTE_INTERACTION_LINES, item[0]),
+        tail_source_maps=(outbound_sources, internal_sources, inbound_sources),
         target_key=lambda line: (line in REMOTE_INTERACTION_LINES, line != "存4线", line),
         family="REMOTE_SESSION_BUNDLE",
     )
@@ -5663,6 +5840,8 @@ def remote_session_bundle_planlets(
         mode="inbound_then_outbound",
         selected_sources=[*selected_inbound, *selected_internal, *selected_outbound],
         carry=[*inbound_carry, *internal_carry, *outbound_carry],
+        source_key=lambda item: (item[0] in REMOTE_INTERACTION_LINES, item[0]),
+        tail_source_maps=(inbound_sources, internal_sources, outbound_sources),
         target_key=lambda line: (line not in REMOTE_INTERACTION_LINES, line not in DEPOT_LINES, line),
         family="REMOTE_SESSION_BUNDLE",
     )
@@ -6925,6 +7104,7 @@ def candidate_sort_key(candidate: HookCandidate) -> tuple[int, tuple[int, str, s
     kind_priority = {
         "short_chain_planlet": 0,
         "short_chain_front_tail_planlet": 0,
+        "remote_tail_closeout_planlet": 1,
         "remote_session_contract_planlet": 1,
         "remote_session_bundle_planlet": 1,
         "depot_digest_planlet": 1,
@@ -7779,6 +7959,18 @@ def build_candidates(
             )
         )
     if enable_remote_session_contracts:
+        planlet_candidates.extend(
+            remote_tail_closeout_planlets(
+                case_id=case_id,
+                hook_index=hook_index,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                planned=planned,
+                satisfied=satisfied,
+                length_load_lookup=length_load_lookup(),
+                grouped=grouped,
+            )
+        )
         if enable_remote_session_bundle_contracts:
             planlet_candidates.extend(
                 remote_session_bundle_planlets(
@@ -8672,6 +8864,7 @@ def structural_intent(candidate: HookCandidate) -> str:
         "capacity_release_to_staging": "TARGET_CAPACITY_RELEASE_TO_STAGING",
         "spot_release_to_staging": "TARGET_SPOT_RELEASE_TO_STAGING",
         "blocker_relocation": "SOURCE_FRONT_BLOCKER_RELOCATION",
+        "remote_tail_closeout_planlet": "REMOTE_TAIL_CLOSEOUT_CONTRACT",
         "remote_session_contract_planlet": "REMOTE_SESSION_CONTRACT",
         "remote_session_bundle_planlet": "REMOTE_SESSION_BUNDLE_CONTRACT",
         "remote_corridor_planlet": "REMOTE_CORRIDOR_CONTRACT",
@@ -8853,7 +9046,8 @@ def tail_local_closeout_allowed(
 
 def owner_bound_remote_unlock_candidate(candidate: HookCandidate) -> bool:
     return (
-        candidate.candidate_kind in {"route_clear_session_planlet", "source_exit_session_planlet"}
+        candidate_touches_remote_interaction(candidate)
+        and candidate.candidate_kind in {"route_clear_session_planlet", "source_exit_session_planlet"}
         and candidate.action_family in {"REPAIR_INBOUND", "DEPOT_OUTBOUND", "DEPOT_SLOT"}
         and candidate_internal_remote_transition_count(candidate) <= 2
         and remote_cross_has_owner(candidate)
@@ -9336,6 +9530,7 @@ def contract_planlet_selection_key(
     phase_penalty = 1 if phase_reason else 0
     template_priority = 0 if candidate.candidate_kind in {
         "short_chain_planlet",
+        "remote_tail_closeout_planlet",
         "remote_session_contract_planlet",
         "depot_digest_planlet",
         "depot_slot_swap_planlet",
@@ -9402,18 +9597,32 @@ def remote_session_selection_key(
             role = 1
     if candidate.candidate_kind in REMOTE_SESSION_RESTORE_KINDS and (reduction <= 0 and non_depot_reduction <= 0):
         role = 10
+    mixed_bundle_front_exit_allowed = (
+        candidate.candidate_kind == "remote_session_bundle_planlet"
+        and profile == REMOTE_PROFILE_MIXED
+        and remote_reduction >= min(6, remote_session_state.debt)
+    )
     unfinished_exit_penalty = int(
         after_remote_debt > 0
         and not ends_remote
+        and not mixed_bundle_front_exit_allowed
         and (
             remote_session_state.active
             or remote_session_state.target_session_count <= 1
+        )
+    )
+    tail_closeout_priority = int(
+        not (
+            candidate.candidate_kind == "remote_tail_closeout_planlet"
+            and remote_session_state.debt <= 4
+            and after_remote_debt <= 0
         )
     )
     plan_rank = remote_session_plan_profile_rank(candidate, remote_session_plan, last_business_hook_remote)
     if remote_transition_first:
         return (
             1 if phase_reason else 0,
+            tail_closeout_priority,
             role,
             unfinished_exit_penalty,
             remote_transition_count,
@@ -9428,6 +9637,7 @@ def remote_session_selection_key(
         )
     return (
         1 if phase_reason else 0,
+        tail_closeout_priority,
         role,
         unfinished_exit_penalty,
         -remote_reduction,
