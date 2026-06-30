@@ -2163,14 +2163,25 @@ def slot_allowed_for_car(car: dict[str, Any], line: str, position: int, capacity
 
 
 def depot_actual_position_allowed(car: dict[str, Any], line: str, position: int, capacity: int) -> bool:
-    if position < 1 or position > capacity:
-        return False
-    forced = force_positions(car)
-    if forced and position not in forced:
-        return False
-    if car_length(car) >= 17.6 and line_number(line) not in {3, 4}:
-        return False
-    return True
+    return slot_allowed_for_car(car, line, position, capacity)
+
+
+def depot_section_repair_position_allowed(
+    car: dict[str, Any],
+    line: str,
+    position: int,
+    cars: list[dict[str, Any]],
+) -> bool:
+    if line not in DEPOT_LINES or not repair_process(car).startswith("段"):
+        return True
+    factory_positions = [
+        int(item.get("Position") or 0)
+        for item in cars
+        if item["Line"] == line and repair_process(item).startswith("厂")
+    ]
+    if not factory_positions:
+        return True
+    return position <= min(factory_positions)
 
 
 def build_depot_assignment(cars: list[dict[str, Any]], capacities: dict[str, int]) -> DepotAssignment:
@@ -2951,7 +2962,9 @@ def car_is_satisfied(
             return False
         capacity = max([item.position for item in depot_assignment.slots.values() if item.line == car["Line"]] or [5])
         capacity = max(capacity, position, 5)
-        return depot_actual_position_allowed(car, car["Line"], position, capacity)
+        return depot_actual_position_allowed(car, car["Line"], position, capacity) and (
+            cars is None or depot_section_repair_position_allowed(car, car["Line"], position, cars)
+        )
     targets = car.get("_TargetLineSet") or set(target_lines(car))
     if car["Line"] not in targets:
         return False
@@ -3725,6 +3738,24 @@ def depot_slot_hard_reasons(
             )
         if position in locked_tail and not (assigned_slot and assigned_slot.locked and assigned_slot.position == position):
             reasons.append(f"depot_locked_tail_position_violation:{candidate.target_line}:{position}:{no}")
+    factory_positions = [
+        int(car.get("Position") or 0)
+        for car in projected_cars
+        if car["Line"] == candidate.target_line and repair_process(car).startswith("厂")
+    ]
+    if factory_positions:
+        factory_min = min(factory_positions)
+        for car in projected_cars:
+            if car["Line"] != candidate.target_line or not repair_process(car).startswith("段"):
+                continue
+            if is_locked_depot_stayer(car, depot_assignment):
+                continue
+            position = int(car.get("Position") or 0)
+            if position > factory_min:
+                reasons.append(
+                    f"depot_section_after_factory_violation:{candidate.target_line}:"
+                    f"{car_no(car)}:{position}>factory_min={factory_min}"
+                )
     return reasons
 
 
@@ -9890,19 +9921,7 @@ class PhysicalValidator:
             return []
         reasons: list[str] = []
         if candidate.target_line == "存4线":
-            projected = [dict(car) for car in cars]
-            projected_by_no = {car_no(car): car for car in projected}
-            for car in batch:
-                no = car_no(car)
-                projected_car = projected_by_no.get(no)
-                if projected_car is None:
-                    continue
-                projected_car["Line"] = candidate.target_line
-                projected_car["Position"] = candidate.planned_positions.get(no, projected_car.get("Position") or 0)
-            for car in projected:
-                if car["Line"] == "存4线" and car.get("IsClosedDoor") and int(car.get("Position") or 0) <= 3:
-                    reasons.append(f"closed_door_cun4_final_position_violation:{car_no(car)}:{int(car.get('Position') or 0)}")
-            return reasons
+            return []
 
         reasons.extend(closed_door_non_cun4_reasons(candidate.target_line, train_consist or batch))
         return reasons

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict
 import hashlib
 import importlib
@@ -18,14 +18,20 @@ TRUTH2_DIR = ROOT_DIR / "data" / "truth2"
 P10_SCHEMATIC_LAYOUT_PATH = ROOT_DIR / "data" / "map" / "schematic_layout.json"
 P10_RUNTIME_SCRIPT_PATH = SCRIPTS_DIR / "generate_physical_runtime_trace.py"
 P10_PHASE_GATE_SCRIPT_PATH = SCRIPTS_DIR / "validate_phase_gates.py"
+VNEXT_RUNTIME_SCRIPT_PATH = SCRIPTS_DIR / "generate_vnext_runtime_trace.py"
+VNEXT_SOLVER_DIR = SCRIPTS_DIR / "solver_vnext"
 APP_P10_OUTPUT_DIR = ROOT_DIR / "artifacts" / "app_p10_runtime"
+APP_VNEXT_OUTPUT_DIR = ROOT_DIR / "artifacts" / "app_vnext_runtime"
 DEFAULT_EVAL_ARTIFACT = (
     Path(__file__).resolve().parent
     / "artifacts"
     / "l7_phase1234_truth_phase3_tail_run_preflight_20260614.json"
 )
 _P10_RUNTIME_CACHE = None
+_VNEXT_RUNTIME_CACHE = None
 P10_BUSINESS_HOOK_ACTIONS = {"Get", "Put"}
+SOLVER_P10 = "P10 runtime"
+SOLVER_VNEXT = "vNext 求解器"
 
 
 def _p10_file_mtime_ns(path: Path) -> int:
@@ -47,6 +53,24 @@ def _p10_runtime_version_text() -> str:
     return f"P10 runtime {digest}"
 
 
+def _vnext_runtime_fingerprint() -> tuple[tuple[str, int], ...]:
+    paths = [
+        VNEXT_RUNTIME_SCRIPT_PATH,
+        P10_RUNTIME_SCRIPT_PATH,
+        P10_PHASE_GATE_SCRIPT_PATH,
+        *sorted(VNEXT_SOLVER_DIR.glob("*.py")),
+    ]
+    return tuple(
+        (str(path.relative_to(ROOT_DIR)), _p10_file_mtime_ns(path))
+        for path in paths
+    )
+
+
+def _vnext_runtime_version_text() -> str:
+    digest = hashlib.sha1(repr(_vnext_runtime_fingerprint()).encode("utf-8")).hexdigest()[:8]
+    return f"vNext solver {digest}"
+
+
 def _p10_runtime_module():
     global _P10_RUNTIME_CACHE
     fingerprint = _p10_runtime_fingerprint()
@@ -65,6 +89,32 @@ def _p10_runtime_module():
 
     _P10_RUNTIME_CACHE = (fingerprint, p10_runtime)
     return p10_runtime
+
+
+def _vnext_runtime_module():
+    global _VNEXT_RUNTIME_CACHE
+    fingerprint = _vnext_runtime_fingerprint()
+    if _VNEXT_RUNTIME_CACHE is not None and _VNEXT_RUNTIME_CACHE[0] == fingerprint:
+        return _VNEXT_RUNTIME_CACHE[1]
+
+    scripts_path = str(SCRIPTS_DIR)
+    if scripts_path not in sys.path:
+        sys.path.insert(0, scripts_path)
+    if "validate_phase_gates" in sys.modules:
+        importlib.reload(sys.modules["validate_phase_gates"])
+    if "generate_physical_runtime_trace" in sys.modules:
+        importlib.reload(sys.modules["generate_physical_runtime_trace"])
+
+    for name in sorted(
+        [name for name in sys.modules if name == "solver_vnext" or name.startswith("solver_vnext.")],
+        key=lambda item: item.count("."),
+        reverse=True,
+    ):
+        del sys.modules[name]
+
+    vnext_engine = importlib.import_module("solver_vnext.engine")
+    _VNEXT_RUNTIME_CACHE = (fingerprint, vnext_engine)
+    return vnext_engine
 
 
 def _payload_cache_key(payload) -> str:
@@ -102,8 +152,15 @@ def _p10_track_graph(runtime_fingerprint: tuple[tuple[str, int], ...]):
 
 
 def _render_p10_runtime_page() -> None:
-    st.subheader("P10 求解演示")
-    st.caption("读取接口形态 JSON，调用 P10 runtime 输出 Operations 和 GeneratedEndStatus。")
+    st.subheader("求解演示")
+    st.caption("读取接口形态 JSON，调用 P10 runtime 或 vNext 求解器输出 Operations 和 GeneratedEndStatus。")
+
+    solver_kind = st.radio(
+        "求解器",
+        options=[SOLVER_VNEXT, SOLVER_P10],
+        horizontal=True,
+        key="p10-solver-kind",
+    )
 
     source_kind = st.radio(
         "计划来源",
@@ -146,8 +203,13 @@ def _render_p10_runtime_page() -> None:
         pasted_text = st.text_area("粘贴计划 JSON", height=260, key="p10-pasted-json")
         source_name = "pasted_plan_9999Z.json"
 
+    version_text = (
+        _vnext_runtime_version_text()
+        if solver_kind == SOLVER_VNEXT
+        else _p10_runtime_version_text()
+    )
     st.caption(
-        f"{_p10_runtime_version_text()}；业务对人工比较应看挂/摘勾数，"
+        f"{version_text}；业务对人工比较应看挂/摘勾数，"
         "runtime 内部的批次号只是一次取放搬运的分组。"
     )
     max_hooks = st.number_input(
@@ -158,11 +220,11 @@ def _render_p10_runtime_page() -> None:
         step=10,
         key="p10-max-hooks",
     )
-    run_requested = st.button("运行 P10 求解", type="primary", key="p10-run")
+    run_requested = st.button(f"运行 {solver_kind}", type="primary", key="p10-run")
     if not run_requested:
         last_result = st.session_state.get("p10_last_result")
         if last_result:
-            stale_reason = _p10_stale_result_reason(last_result, source_name)
+            stale_reason = _p10_stale_result_reason(last_result, source_name, solver_kind)
             st.divider()
             if stale_reason:
                 st.warning(stale_reason)
@@ -170,7 +232,7 @@ def _render_p10_runtime_page() -> None:
                     st.session_state.pop("p10_last_result", None)
                     st.rerun()
                 return
-            st.caption("显示上一次 P10 求解结果；修改输入后需要重新点击“运行 P10 求解”才会更新。")
+            st.caption(f"显示上一次 {solver_kind} 结果；修改输入后需要重新点击运行按钮才会更新。")
             if st.button("清空上一次结果", key="p10-clear-last-result"):
                 st.session_state.pop("p10_last_result", None)
                 st.rerun()
@@ -202,15 +264,24 @@ def _render_p10_runtime_page() -> None:
         return
 
     try:
-        with st.spinner("P10 求解中..."):
-            p10 = _p10_runtime_module()
-            summary, candidate_rows, operation_rows, rejection_reasons = p10.run_case(
-                truth_path=runtime_input_path,
-                output_dir=APP_P10_OUTPUT_DIR,
-                graph=_p10_track_graph(_p10_runtime_fingerprint()),
-                max_hooks=int(max_hooks),
-            )
-            response = _p10_load_response_or_build(summary, operation_rows, runtime_payload)
+        with st.spinner(f"{solver_kind} 求解中..."):
+            if solver_kind == SOLVER_VNEXT:
+                summary, candidate_rows, operation_rows, rejection_reasons, response = _run_vnext_case(
+                    truth_path=runtime_input_path,
+                    payload=runtime_payload,
+                    max_hooks=int(max_hooks),
+                )
+                runtime_fingerprint = _vnext_runtime_fingerprint()
+            else:
+                p10 = _p10_runtime_module()
+                summary, candidate_rows, operation_rows, rejection_reasons = p10.run_case(
+                    truth_path=runtime_input_path,
+                    output_dir=APP_P10_OUTPUT_DIR,
+                    graph=_p10_track_graph(_p10_runtime_fingerprint()),
+                    max_hooks=int(max_hooks),
+                )
+                response = _p10_load_response_or_build(summary, operation_rows, runtime_payload)
+                runtime_fingerprint = _p10_runtime_fingerprint()
     except Exception as exc:  # noqa: BLE001
         st.exception(exc)
         return
@@ -223,8 +294,9 @@ def _render_p10_runtime_page() -> None:
         "operation_rows": operation_rows,
         "rejection_reasons": rejection_reasons,
         "response": response,
-        "runtime_fingerprint": _p10_runtime_fingerprint(),
+        "runtime_fingerprint": runtime_fingerprint,
         "source_name": source_name,
+        "solver_kind": solver_kind,
     }
     st.session_state["p10_last_result"] = result
     st.session_state["p10_replay_frame_index"] = 0
@@ -244,12 +316,20 @@ def _p10_default_truth2_index(option_paths: list[str]) -> int:
     return 0
 
 
-def _p10_stale_result_reason(last_result: dict, source_name: str) -> str:
-    if last_result.get("runtime_fingerprint") != _p10_runtime_fingerprint():
-        return "上一次 P10 结果由旧 runtime 生成，已不再展示；请重新点击“运行 P10 求解”。"
+def _p10_stale_result_reason(last_result: dict, source_name: str, solver_kind: str = SOLVER_P10) -> str:
+    expected_fingerprint = (
+        _vnext_runtime_fingerprint()
+        if solver_kind == SOLVER_VNEXT
+        else _p10_runtime_fingerprint()
+    )
+    last_solver_kind = last_result.get("solver_kind") or SOLVER_P10
+    if last_solver_kind != solver_kind:
+        return f"上一次结果由 {last_solver_kind} 生成，当前选择的是 {solver_kind}；请重新点击运行按钮。"
+    if last_result.get("runtime_fingerprint") != expected_fingerprint:
+        return f"上一次 {solver_kind} 结果由旧代码生成，已不再展示；请重新点击运行按钮。"
     last_source = str(last_result.get("source_name") or "")
     if last_source and source_name and last_source != source_name:
-        return "上一次 P10 结果属于另一个计划，已不再展示；请重新点击“运行 P10 求解”。"
+        return f"上一次 {solver_kind} 结果属于另一个计划，已不再展示；请重新点击运行按钮。"
     return ""
 
 
@@ -296,6 +376,133 @@ def _p10_write_app_plan_input(payload: dict, source_name: str) -> Path:
     return path
 
 
+def _run_vnext_case(
+    *,
+    truth_path: Path,
+    payload: dict,
+    max_hooks: int,
+):
+    vnext_engine = _vnext_runtime_module()
+    solver = vnext_engine.VNextSolver(max_hooks=max_hooks)
+    case_result, step_traces, operation_rows = solver.solve_case(truth_path, APP_VNEXT_OUTPUT_DIR)
+    summary = _vnext_summary_for_p10_page(
+        case_result=case_result,
+        operation_rows=operation_rows,
+        step_traces=step_traces,
+        payload=payload,
+    )
+    response = _vnext_load_response_or_build(summary, operation_rows, payload)
+    rejection_reasons = Counter(
+        trace.gate_reason or "unknown"
+        for trace in step_traces
+        if not trace.selected
+    )
+    return summary, step_traces, operation_rows, rejection_reasons, response
+
+
+def _vnext_summary_for_p10_page(*, case_result, operation_rows, step_traces, payload: dict):
+    p10 = _p10_runtime_module()
+    get_operation_count = sum(1 for row in operation_rows if row.action == "Get")
+    put_operation_count = sum(1 for row in operation_rows if row.action == "Put")
+    weigh_operation_count = sum(1 for row in operation_rows if row.action == "Weigh")
+    remote_cross_count, remote_batch_count, remote_session_count = p10.remote_interaction_metrics(operation_rows)
+    final_cars = _vnext_final_cars_from_response_or_payload(
+        case_id=case_result.case_id,
+        payload=payload,
+    )
+    final_capacity_warnings = (
+        p10.final_line_capacity_warning_reasons(final_cars)
+        if case_result.status == "completed"
+        else []
+    )
+    response_path = str(APP_VNEXT_OUTPUT_DIR / "responses" / f"{case_result.case_id}.json")
+    return p10.CaseSummaryRow(
+        case_id=case_result.case_id,
+        solve_strategy="vnext_contract_resource_delta_episode",
+        status=case_result.status,
+        input_schema_passed=True,
+        vehicle_count=len(payload.get("StartStatus") or []),
+        initial_unsatisfied_vehicle_count=case_result.initial_unsatisfied,
+        final_unsatisfied_vehicle_count=case_result.final_unsatisfied,
+        business_get_put_hook_count=get_operation_count + put_operation_count,
+        internal_move_batch_count=len({row.hook_index for row in operation_rows}),
+        interface_operation_count=case_result.operation_count,
+        get_operation_count=get_operation_count,
+        put_operation_count=put_operation_count,
+        weigh_operation_count=weigh_operation_count,
+        remote_interaction_cross_count=remote_cross_count,
+        remote_business_transition_count=case_result.remote_business_transition_count,
+        remote_interaction_batch_count=remote_batch_count,
+        remote_interaction_session_count=remote_session_count,
+        generated_hook_count=len({row.hook_index for row in operation_rows}),
+        generated_operation_count=case_result.operation_count,
+        accepted_candidate_count=case_result.step_count,
+        rejected_candidate_count=sum(1 for trace in step_traces if not trace.selected),
+        blocked_candidate_count=1 if case_result.status == "blocked" else 0,
+        hard_physical_violation_accepted_count=case_result.hard_physical_violation_accepted_count,
+        unknown_route_count=sum(1 for trace in step_traces if "route_missing" in (trace.physical_reasons or "")),
+        depot_slot_failure_count=0,
+        state_loop_count=sum(1 for trace in step_traces if trace.gate_reason == "loop_reject"),
+        final_capacity_warning_count=len(final_capacity_warnings),
+        final_capacity_warning_reasons="|".join(final_capacity_warnings),
+        closed_door_replay_violation_count=_vnext_closed_door_violation_count(case_result.blocked_reason),
+        closed_door_replay_violation_reasons=_vnext_closed_door_violation_reasons(case_result.blocked_reason),
+        blocked_reason=case_result.blocked_reason,
+        response_path=response_path,
+    )
+
+
+def _vnext_final_cars_from_response_or_payload(*, case_id: str, payload: dict) -> list[dict]:
+    by_no = {
+        str(car.get("No") or ""): dict(car)
+        for car in payload.get("StartStatus") or []
+        if str(car.get("No") or "")
+    }
+    path = APP_VNEXT_OUTPUT_DIR / "responses" / f"{case_id}.json"
+    if not path.exists():
+        return list(by_no.values())
+    response = json.loads(path.read_text(encoding="utf-8"))
+    generated = (response.get("Data") or {}).get("GeneratedEndStatus") or []
+    for row in generated:
+        no = str(row.get("No") or "")
+        if not no:
+            continue
+        car = by_no.setdefault(no, {"No": no})
+        car["Line"] = row.get("Line")
+        car["Position"] = row.get("Position")
+    return list(by_no.values())
+
+
+def _vnext_closed_door_violation_reasons(blocked_reason: str) -> str:
+    return "|".join(
+        reason
+        for reason in str(blocked_reason or "").split("|")
+        if reason.startswith("closed_door_replay")
+    )
+
+
+def _vnext_closed_door_violation_count(blocked_reason: str) -> int:
+    reasons = _vnext_closed_door_violation_reasons(blocked_reason)
+    return len(_p10_split_pipe(reasons))
+
+
+def _vnext_load_response_or_build(summary, operation_rows, payload: dict) -> dict:
+    response_path = Path(summary.response_path) if summary.response_path else None
+    if response_path is not None and response_path.exists():
+        return json.loads(response_path.read_text(encoding="utf-8"))
+    p10 = _p10_runtime_module()
+    success = summary.status == "completed"
+    return {
+        "Success": success,
+        "Message": "" if success else summary.blocked_reason,
+        "StatusCode": 200 if success else 409,
+        "Data": {
+            "Operations": [p10.response_operation(row) for row in operation_rows],
+            "GeneratedEndStatus": _p10_generated_status_from_payload(payload),
+        },
+    }
+
+
 def _p10_load_response_or_build(summary, operation_rows, payload: dict) -> dict:
     response_path = Path(summary.response_path) if summary.response_path else None
     if response_path is not None and response_path.exists():
@@ -324,6 +531,7 @@ def _render_p10_result(
     response: dict,
     runtime_fingerprint=None,
     source_name: str = "",
+    solver_kind: str = SOLVER_P10,
 ) -> None:
     summary_dict = asdict(summary)
     vehicle_display_labels = _p10_vehicle_display_labels(payload)
@@ -332,11 +540,11 @@ def _render_p10_result(
     business_hook_count = _p10_business_hook_count(operation_rows)
     action_counts = _p10_action_counts(operation_rows)
     if status == "completed":
-        st.success("P10 已完成求解并生成接口响应。")
+        st.success(f"{solver_kind} 已完成求解并生成接口响应。")
     elif status == "invalid_input":
-        st.error("输入不符合 P10 runtime 当前接口要求。")
+        st.error(f"输入不符合 {solver_kind} 当前接口要求。")
     else:
-        st.warning("P10 未完成求解，页面展示当前阻塞诊断。")
+        st.warning(f"{solver_kind} 未完成求解，页面展示当前阻塞诊断。")
     if summary_dict["blocked_reason"]:
         st.info(f"阻塞原因：{_p10_format_blocked_reason(summary_dict['blocked_reason'])}")
 
@@ -394,7 +602,10 @@ def _render_p10_result(
     elif view == "终态":
         _render_p10_end_status(response, vehicle_display_labels)
     else:
-        _render_p10_diagnostics(summary, candidate_rows, rejection_reasons, vehicle_display_labels)
+        if solver_kind == SOLVER_VNEXT:
+            _render_vnext_diagnostics(summary, candidate_rows, rejection_reasons, vehicle_display_labels)
+        else:
+            _render_p10_diagnostics(summary, candidate_rows, rejection_reasons, vehicle_display_labels)
 
 
 def _p10_status_text(status: str) -> str:
@@ -1563,6 +1774,69 @@ def _render_p10_diagnostics(
         for row in filtered
     ]
     st.caption(f"当前显示 {len(display_rows)} / {len(candidate_dicts)} 条候选记录。")
+    st.dataframe(display_rows, width="stretch", hide_index=True)
+
+
+def _render_vnext_diagnostics(
+    summary,
+    step_traces,
+    rejection_reasons,
+    vehicle_display_labels: dict[str, str],
+) -> None:
+    st.markdown("**vNext CaseSummaryRow**")
+    st.json(_p10_annotate_known_vehicle_json(asdict(summary), vehicle_display_labels))
+
+    reason_rows = [
+        {"reason": _p10_annotate_known_vehicle_text(reason, vehicle_display_labels), "count": count}
+        for reason, count in sorted(rejection_reasons.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    if reason_rows:
+        st.markdown("**拒绝/阻塞原因分布**")
+        st.dataframe(reason_rows, width="stretch", hide_index=True)
+
+    trace_dicts = [asdict(row) for row in step_traces]
+    if not trace_dicts:
+        st.info("当前没有 vNext step trace。")
+        return
+
+    selected_filter = st.radio(
+        "vNext trace",
+        options=["selected", "accepted", "rejected", "all"],
+        horizontal=True,
+        key="vnext-trace-filter",
+    )
+    filtered = []
+    for row in trace_dicts:
+        if selected_filter == "selected" and not row["selected"]:
+            continue
+        if selected_filter == "accepted" and not row["gate_accepted"]:
+            continue
+        if selected_filter == "rejected" and row["gate_accepted"]:
+            continue
+        filtered.append(row)
+
+    display_rows = [
+        {
+            "hook": row["hook_index"],
+            "selected": row["selected"],
+            "gateAccepted": row["gate_accepted"],
+            "gateReason": row["gate_reason"],
+            "phase": row["phase"],
+            "family": row["family"],
+            "intent": row["intent"],
+            "template": row["template_name"],
+            "source": row["source_line"],
+            "target": row["target_line"],
+            "moveCars": _p10_format_vehicle_pipe(row["move_nos"], vehicle_display_labels),
+            "contractReduction": row["contract_reduction"],
+            "totalReduction": row["total_reduction"],
+            "physicalReasons": _p10_annotate_known_vehicle_text(row["physical_reasons"], vehicle_display_labels),
+            "resourceViolations": _p10_annotate_known_vehicle_text(row["resource_violations"], vehicle_display_labels),
+            "contract": _p10_annotate_known_vehicle_text(row["contract_id"], vehicle_display_labels),
+        }
+        for row in filtered
+    ]
+    st.caption(f"当前显示 {len(display_rows)} / {len(trace_dicts)} 条 vNext trace。")
     st.dataframe(display_rows, width="stretch", hide_index=True)
 
 

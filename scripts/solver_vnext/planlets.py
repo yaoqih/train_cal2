@@ -1,0 +1,191 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from . import legacy_adapter as legacy
+from .placement import planned_positions_for_batch
+
+
+@dataclass(frozen=True)
+class TailDigestPlan:
+    candidate: Any
+    progressed_nos: tuple[str, ...]
+    restored_nos: tuple[str, ...]
+    put_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SourceClearRestorePlan:
+    candidate: Any
+    progressed_nos: tuple[str, ...]
+    restored_nos: tuple[str, ...]
+    put_lines: tuple[str, ...]
+
+
+def build_source_clear_restore_planlet(
+    *,
+    case_id: str,
+    hook_index: int,
+    source_line: str,
+    blocker_batch: list[dict[str, Any]],
+    target_batch: list[dict[str, Any]],
+    target_line: str,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    reason: str,
+    candidate_kind: str,
+) -> SourceClearRestorePlan | None:
+    if not blocker_batch or not target_batch or not target_line or target_line == source_line:
+        return None
+    if any(car.get("IsWeigh") for car in blocker_batch):
+        return None
+    carry = [*blocker_batch, *target_batch]
+    if legacy.pull_equivalent(carry) > legacy.legacy.PULL_LIMIT_EQUIVALENT:
+        return None
+    if not legacy.legacy.reverse_length_fits(source_line, target_line, carry):
+        return None
+
+    batch_nos = {legacy.car_no(car) for car in carry}
+    positions = planned_positions_for_batch(
+        batch=target_batch,
+        target_line=target_line,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        batch_nos=batch_nos,
+    )
+    if len(positions) != len(target_batch):
+        return None
+    grouped = legacy.cars_by_line(cars)
+    if not legacy.legacy.candidate_positions_available(target_line, positions, cars, batch_nos, grouped):
+        return None
+    if not legacy.legacy.line_has_length_capacity(target_line, cars, target_batch, batch_nos, grouped=grouped):
+        return None
+
+    restore_positions = {
+        legacy.car_no(car): int(car.get("Position") or index)
+        for index, car in enumerate(blocker_batch, start=1)
+    }
+    if not legacy.legacy.candidate_positions_available(source_line, restore_positions, cars, batch_nos, grouped):
+        return None
+
+    target_nos = tuple(legacy.car_no(car) for car in target_batch)
+    blocker_nos = tuple(legacy.car_no(car) for car in blocker_batch)
+    steps = [
+        legacy.plan_step("Get", source_line, tuple(legacy.car_no(car) for car in carry)),
+        legacy.plan_step("Put", target_line, target_nos, positions),
+        legacy.plan_step("Put", source_line, blocker_nos, restore_positions),
+    ]
+    candidate = legacy.build_planlet_candidate(
+        case_id=case_id,
+        hook_index=hook_index,
+        source_line=source_line,
+        target_line=source_line,
+        batch=carry,
+        steps=tuple(steps),
+        reason=reason,
+        candidate_kind=candidate_kind,
+    )
+    return SourceClearRestorePlan(
+        candidate=candidate,
+        progressed_nos=target_nos,
+        restored_nos=blocker_nos,
+        put_lines=(target_line, source_line),
+    )
+
+
+def build_tail_digest_planlet(
+    *,
+    case_id: str,
+    hook_index: int,
+    source_line: str,
+    prefix: list[dict[str, Any]],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    target_line_for_car: Any,
+    restore_remaining_to_source: bool,
+    reason: str,
+    candidate_kind: str,
+) -> TailDigestPlan | None:
+    if not prefix:
+        return None
+    carried = [legacy.car_no(car) for car in prefix]
+    remaining = list(carried)
+    steps = [legacy.plan_step("Get", source_line, tuple(carried))]
+    progressed_nos: list[str] = []
+    put_lines: list[str] = []
+
+    while remaining:
+        tail_no = remaining[-1]
+        tail_car = next(car for car in prefix if legacy.car_no(car) == tail_no)
+        target_line = target_line_for_car(tail_car)
+        if not target_line or target_line == source_line:
+            break
+        drop: list[str] = []
+        for no in reversed(remaining):
+            car = next(item for item in prefix if legacy.car_no(item) == no)
+            if target_line_for_car(car) != target_line:
+                break
+            drop.append(no)
+        drop = list(reversed(drop))
+        group = [car for car in prefix if legacy.car_no(car) in set(drop)]
+        group_nos = {legacy.car_no(car) for car in group}
+        positions = planned_positions_for_batch(
+            batch=group,
+            target_line=target_line,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            batch_nos=group_nos,
+        )
+        if len(positions) != len(group):
+            return None
+        group_candidate = legacy.build_direct_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=source_line,
+            target_line=target_line,
+            batch=group,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            reason="vnext:tail_digest_position_probe",
+            candidate_kind="vnext_position_probe",
+            planned_positions=positions,
+        )
+        if group_candidate is None:
+            return None
+        steps.append(legacy.plan_step("Put", target_line, tuple(drop), group_candidate.planned_positions))
+        put_lines.append(target_line)
+        progressed_nos.extend(drop)
+        remaining = remaining[: -len(drop)]
+
+    if not progressed_nos:
+        return None
+
+    restored_nos: tuple[str, ...] = ()
+    if remaining:
+        if not restore_remaining_to_source:
+            return None
+        restored_nos = tuple(remaining)
+        restored_positions = {
+            no: int(next(car for car in prefix if legacy.car_no(car) == no).get("Position") or 0)
+            for no in restored_nos
+        }
+        steps.append(legacy.plan_step("Put", source_line, restored_nos, restored_positions))
+        put_lines.append(source_line)
+
+    candidate = legacy.build_planlet_candidate(
+        case_id=case_id,
+        hook_index=hook_index,
+        source_line=source_line,
+        target_line=steps[-1].line,
+        batch=prefix,
+        steps=tuple(steps),
+        reason=reason,
+        candidate_kind=candidate_kind,
+    )
+    return TailDigestPlan(
+        candidate=candidate,
+        progressed_nos=tuple(progressed_nos),
+        restored_nos=restored_nos,
+        put_lines=tuple(dict.fromkeys(put_lines)),
+    )
