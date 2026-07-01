@@ -1148,7 +1148,7 @@ class TrackGraph:
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
-        effective_occupied = expand_occupied_lines_for_route(occupied_lines)
+        effective_occupied = {normalize_line(line) for line in occupied_lines if normalize_line(line)}
         cache_key = (source, target, tuple(sorted(effective_occupied)))
         cached = self._occupied_route_cache.get(cache_key)
         if cached is not None:
@@ -3073,11 +3073,11 @@ def line_length_loads(cars: list[dict[str, Any]]) -> Counter[str]:
 
 
 def occupied_lines_for_route(cars: list[dict[str, Any]], moving_nos: set[str]) -> set[str]:
-    return expand_occupied_lines_for_route({
-        car["Line"]
+    return {
+        normalize_line(car["Line"])
         for car in cars
-        if car["Line"] and car_no(car) not in moving_nos
-    })
+        if normalize_line(car["Line"]) and car_no(car) not in moving_nos
+    }
 
 
 def expand_occupied_lines_for_route(occupied_lines: set[str]) -> set[str]:
@@ -3128,7 +3128,7 @@ def active_serial_blockers_for_line(
 
 def occupied_lines_for_get_route(cars: list[dict[str, Any]], moving_nos: set[str], source_line: str) -> set[str]:
     occupied = occupied_lines_for_route(cars, moving_nos)
-    occupied.discard(source_line)
+    occupied.discard(normalize_line(source_line))
     return occupied
 
 
@@ -3662,6 +3662,36 @@ def candidate_positions_available(
 def line_length_load(cars: list[dict[str, Any]], line: str, excluded_nos: set[str] | None = None) -> float:
     excluded_nos = excluded_nos or set()
     return sum(car_length(car) for car in cars if car["Line"] == line and car_no(car) not in excluded_nos)
+
+
+def pre_repair_reversal_available_length(cars: list[dict[str, Any]], moving_nos: set[str]) -> float:
+    spec = TRACK_SPECS.get("预修线")
+    if not spec:
+        return 0.0
+    return max(0.0, spec.length_m - line_length_load(cars, "预修线", moving_nos))
+
+
+def pre_repair_reversal_required(path: tuple[str, ...] | list[str]) -> bool:
+    normalized_path = [normalize_line(item) for item in path]
+    return any(
+        {left, right} == {"Z2", "Z3"}
+        for left, right in zip(normalized_path, normalized_path[1:])
+    )
+
+
+def pre_repair_reversal_reasons(
+    path: tuple[str, ...] | list[str],
+    cars: list[dict[str, Any]],
+    moving_nos: set[str],
+    train_length_m: float,
+) -> list[str]:
+    if not path or not pre_repair_reversal_required(path):
+        return []
+    available = pre_repair_reversal_available_length(cars, moving_nos)
+    required = train_length_m + LOCO_LENGTH_M
+    if required <= available + LINE_LENGTH_TOLERANCE_M:
+        return []
+    return [f"pre_repair_reversal_length_violation:{required:.1f}>{available:.1f}"]
 
 
 def final_capacity_infeasible_reasons(cars: list[dict[str, Any]]) -> list[str]:
@@ -7895,7 +7925,13 @@ def route_blocking_lines(
     blockers: list[str] = []
     route_endpoints = {normalize_line(start_node), normalize_line(target_line)}
     for left, right in zip(static_path, static_path[1:]):
-        for line in (left, right, *SWITCH_EDGE_TRACKS.get(frozenset((left, right)), ())):
+        edge_key = frozenset((left, right))
+        for line in (
+            left,
+            right,
+            *SWITCH_EDGE_TRACKS.get(edge_key, ()),
+            *SERIAL_ROUTE_EDGE_BLOCKERS.get(edge_key, ()),
+        ):
             if line in occupied and line not in route_endpoints and line not in blockers:
                 blockers.append(line)
     return static_path, [], tuple(blockers)
@@ -9717,11 +9753,24 @@ class PhysicalValidator:
                 reasons.append(get_order_reason)
         if candidate.has_weigh and not weigh_path:
             reasons.append("weigh_route_blocked_by_occupied_line" if weigh_static_path else "weigh_route_missing")
+        elif candidate.has_weigh:
+            reasons.extend(pre_repair_reversal_reasons(
+                weigh_path,
+                cars,
+                set(candidate.move_car_nos),
+                candidate.train_length_m,
+            ))
         if not put_path:
             reasons.append("put_route_blocked_by_occupied_line" if put_static_path else "put_route_missing")
             reasons.extend(line_entry_blocking_reasons(candidate.target_line, cars, set(candidate.move_car_nos)))
         else:
             reasons.extend(line_entry_blocking_reasons(candidate.target_line, cars, set(candidate.move_car_nos)))
+            reasons.extend(pre_repair_reversal_reasons(
+                put_path,
+                cars,
+                set(candidate.move_car_nos),
+                candidate.train_length_m,
+            ))
         if candidate.source_line in RUNNING_LINES or candidate.target_line in RUNNING_LINES:
             reasons.append("running_line_stop_violation")
         if candidate.source_line not in TRACK_SPECS:
@@ -9851,6 +9900,14 @@ class PhysicalValidator:
                 if step.line not in TRACK_SPECS:
                     reasons.append("source_line_unknown")
                     break
+                reasons.extend(pre_repair_reversal_reasons(
+                    path,
+                    working_cars,
+                    step_nos | carried,
+                    sum(car_length(car) for car in step_cars),
+                ))
+                if reasons:
+                    break
                 operation_paths.append(path)
                 if not get_path:
                     get_path = path
@@ -9894,6 +9951,14 @@ class PhysicalValidator:
                     break
                 if step.line not in TRACK_SPECS:
                     reasons.append("target_line_unknown")
+                    break
+                reasons.extend(pre_repair_reversal_reasons(
+                    path,
+                    working_cars,
+                    carried,
+                    sum(car_length(car) for car in batch),
+                ))
+                if reasons:
                     break
                 step_candidate = replace(
                     candidate,
@@ -9955,6 +10020,10 @@ class PhysicalValidator:
                 path = tuple(route_with_line_prefix(current_loco.line, raw_path))
                 if not path:
                     reasons.append("weigh_route_blocked_by_occupied_line" if static_path else "weigh_route_missing")
+                    break
+                train_length = sum(car_length(by_no[no]) for no in carried if no in by_no)
+                reasons.extend(pre_repair_reversal_reasons(path, working_cars, carried, train_length))
+                if reasons:
                     break
                 operation_paths.append(path)
                 current_loco = operation_stand_location(path, WEIGH_LINE)

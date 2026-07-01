@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import legacy_adapter as legacy
-from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, PhaseKind, PhaseState, ResourceDelta, SolverState
+from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, IntentKind, PhaseKind, PhaseState, ResourceDelta, SolverState
+from .phase import HumanPhaseGate
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,7 @@ class PolicyContext:
     last_business_remote: bool | None
     non_remote_unsatisfied: int
     remote_unsatisfied: int
+    cun4_count: int
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,13 @@ class BaselinePolicy:
     Mechanisms generate and validate candidates.  This policy only chooses
     which contracts to consider first and how accepted candidates are ranked.
     """
+
+    SUPPORT_OPEN_CUN4_COUNT_MAX = 14
+    SUPPORT_OPEN_BATCH_MIN = 5
+    SUPPORT_OPEN_BATCH_MAX = 6
+
+    def __init__(self) -> None:
+        self.phase_gate = HumanPhaseGate()
 
     def context(self, state: SolverState) -> PolicyContext:
         unsatisfied = legacy.unsatisfied_cars(state.cars, state.depot_assignment)
@@ -69,7 +78,7 @@ class BaselinePolicy:
                 front_count += 1
             else:
                 closeout_count += 1
-        phase_state = self._phase_state(
+        phase_state = self.phase_gate.classify_state(
             front_debt=front_count,
             cun4_port_debt=cun4_count,
             remote_debt=remote_count,
@@ -84,6 +93,7 @@ class BaselinePolicy:
             last_business_remote=state.last_business_remote,
             non_remote_unsatisfied=front_count + cun4_count + closeout_count,
             remote_unsatisfied=remote_count,
+            cun4_count=sum(1 for car in state.cars if car["Line"] == "存4线"),
         )
 
     def order_contracts(self, contracts: list[FlowContract], context: PolicyContext) -> list[FlowContract]:
@@ -146,6 +156,8 @@ class BaselinePolicy:
             return 0
         if self.releases_depot_slot(candidate, context):
             return 1
+        if self.supports_remote_depot_access(candidate, context):
+            return 2
         if self.digests_remote_session_batch(candidate, context):
             return 2
         if self.digests_depot_inbound_batch(candidate, context):
@@ -172,6 +184,34 @@ class BaselinePolicy:
         ):
             return True
         return False
+
+    def supports_remote_depot_access(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        if not context.remote_session_open:
+            return False
+        envelope = candidate.envelope
+        request = candidate.resource_delta.request
+        delta = candidate.contract_delta
+        if envelope.intent not in {IntentKind.BORROWED_BLOCKER_CLEAR, IntentKind.DEPOT_OUTER_CLEAR}:
+            return False
+        if envelope.contract.family not in {
+            ContractFamily.REPAIR_INBOUND,
+            ContractFamily.DEPOT_SLOT,
+            ContractFamily.DEPOT_OUTBOUND,
+            ContractFamily.CUN4_PORT_STAGING,
+        }:
+            return False
+        if delta.contract_reduction != 0 or delta.support_gain <= 0 or delta.total_reduction < 0:
+            return False
+        if request.source_line != "调梁棚" or request.target_line != "存4线":
+            return False
+        if context.cun4_count > self.SUPPORT_OPEN_CUN4_COUNT_MAX:
+            return False
+        batch_size = len(envelope.candidate.move_car_nos)
+        if not self.SUPPORT_OPEN_BATCH_MIN <= batch_size <= self.SUPPORT_OPEN_BATCH_MAX:
+            return False
+        return True
 
     def releases_depot_slot(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         envelope = candidate.envelope
@@ -334,36 +374,3 @@ class BaselinePolicy:
         if not steps:
             return 2
         return sum(1 for step in steps if step.action in {"Get", "Put"})
-
-    def _phase_state(
-        self,
-        *,
-        front_debt: int,
-        cun4_port_debt: int,
-        remote_debt: int,
-        closeout_debt: int,
-        remote_session_open: bool,
-    ) -> PhaseState:
-        if remote_session_open and remote_debt:
-            phase = PhaseKind.H4_REMOTE_DEPOT
-            reason = "remote_session_continuation"
-        elif front_debt > 6 and front_debt > int(remote_debt * 0.6):
-            phase = PhaseKind.H1_FRONT_SERVICE
-            reason = "front_service_debt_open"
-        elif cun4_port_debt and remote_debt:
-            phase = PhaseKind.H2_CUN4_PORT
-            reason = "cun4_port_before_remote_session"
-        elif remote_debt:
-            phase = PhaseKind.H4_REMOTE_DEPOT
-            reason = "remote_session_debt_open"
-        else:
-            phase = PhaseKind.H5_CLOSEOUT
-            reason = "primary_debt_closed"
-        return PhaseState(
-            phase=phase,
-            front_debt=front_debt,
-            cun4_port_debt=cun4_port_debt,
-            remote_debt=remote_debt,
-            closeout_debt=closeout_debt,
-            reason=reason,
-        )

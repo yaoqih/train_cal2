@@ -48,6 +48,7 @@ class ResourceKind(str, Enum):
     CUN4_NORTH_BUFFER = "CUN4_NORTH_BUFFER"
     GLOBAL_GATE = "GLOBAL_GATE"
     WEIGH_STAND = "WEIGH_STAND"
+    SERIAL_LINE_GATE = "SERIAL_LINE_GATE"
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,8 @@ class StepTrace:
     before_contract_debt: int
     after_contract_debt: int
     contract_reduction: int
+    support_gain: int
+    effective_gain: int
     total_reduction: int
 
 

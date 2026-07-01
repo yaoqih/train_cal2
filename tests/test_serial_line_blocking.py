@@ -10,6 +10,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from generate_physical_runtime_trace import (  # noqa: E402
+    LOCO_LENGTH_M,
     PhysicalValidator,
     SERIAL_LINE_BLOCKERS,
     TrackGraph,
@@ -19,6 +20,8 @@ from generate_physical_runtime_trace import (  # noqa: E402
     line_entry_blocking_reasons,
     line_end_node,
     physical_positions_after_put,
+    pre_repair_reversal_available_length,
+    route_blocking_lines,
     LocoLocation,
 )
 
@@ -90,28 +93,20 @@ def test_all_serial_blockers_report_full_name_entry_reasons() -> None:
 
 def test_all_serial_blockers_block_physical_routes() -> None:
     graph = TrackGraph()
-    source_lines = [
-        "存2线",
-        "存5线北",
-        "机库线",
-        "预修线",
-        "联7",
-        "卸轮线",
-        "洗罐站",
-    ]
 
     for blocked_line, blocker_lines in SERIAL_LINE_BLOCKERS.items():
         for blocker_line in blocker_lines:
-            for source_line in source_lines:
-                if source_line in {blocked_line, blocker_line}:
-                    continue
-                if not graph.route(source_line, blocked_line):
-                    continue
-                path = graph.route_avoiding_occupied(source_line, blocked_line, {blocker_line})
-                assert path == [], (
-                    f"{blocker_line} should block route from {source_line} "
-                    f"to {blocked_line}, got {path}"
-                )
+            static_path, available_path, route_blockers = route_blocking_lines(
+                graph,
+                [car("B", blocker_line, 1)],
+                "存2线",
+                blocked_line,
+                set(),
+            )
+            entry_reasons = line_entry_blocking_reasons(blocked_line, [car("B", blocker_line, 1)], set())
+            assert static_path or entry_reasons
+            assert not available_path or entry_reasons
+            assert blocker_line in route_blockers or entry_reasons
 
 
 def test_direct_put_to_blocked_lines_is_rejected() -> None:
@@ -149,6 +144,26 @@ def test_machine_shed_blocks_machine_south_and_wash_oil_north_routes() -> None:
         cars = [car("M", "存2线", 1, target_line), car("B", "机走棚", 1, "机走棚")]
         result = validate(candidate("存2线", target_line, cars, kind), cars)
         assert not result.accepted
+
+
+def test_serial_blockers_do_not_overblock_unrelated_detour_routes() -> None:
+    graph = TrackGraph()
+    path = graph.route_avoiding_occupied("存2线", "机库线", {"机北1"})
+    assert path == ["存2线", "L4", "Z3", "Z2", "Z1", "L6", "L7", "机库线"]
+
+
+def test_pre_repair_remaining_length_is_required_for_detour_reversal() -> None:
+    moving = car("M", "存2线", 1, "机库线")
+    blocker = car("B", "机北1", 1, "机北1")
+    result = validate(candidate("存2线", "机库线", [moving, blocker]), [moving, blocker])
+    assert result.accepted
+
+    filler_length = pre_repair_reversal_available_length([moving, blocker], {"M"}) - LOCO_LENGTH_M
+    filler = car("P", "预修线", 1, "预修线")
+    filler["Length"] = filler_length + 0.1
+    blocked = validate(candidate("存2线", "机库线", [moving, blocker, filler]), [moving, blocker, filler])
+    assert not blocked.accepted
+    assert any(reason.startswith("pre_repair_reversal_length_violation:") for reason in blocked.reasons)
 
 
 def test_get_put_order_is_always_from_north_end() -> None:

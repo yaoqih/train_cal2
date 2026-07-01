@@ -31,12 +31,16 @@ def run(args: argparse.Namespace) -> int:
     solver = VNextSolver(max_hooks=args.max_hooks)
     results = []
     traces = []
+    phase_records = []
+    frontier_records = []
     for truth_path in truth_paths:
-        result, case_traces, _operations = solver.solve_case(truth_path, output_dir)
+        result, case_traces, _operations, case_phase_records, case_frontier_records = solver.solve_case(truth_path, output_dir)
         results.append(result)
         traces.extend(case_traces)
+        phase_records.extend(case_phase_records)
+        frontier_records.extend(case_frontier_records)
 
-    write_artifacts(output_dir, results, traces)
+    write_artifacts(output_dir, results, traces, phase_records, frontier_records)
     completed = sum(1 for row in results if row.status == "completed")
     blocked = sum(1 for row in results if row.status == "blocked")
     print(
@@ -59,4 +63,3 @@ def run(args: argparse.Namespace) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run(parse_args()))
-

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +9,9 @@ from .contracts import build_contracts
 from .delta import build_contract_delta, simulate_candidate
 from .domain import BorrowedBlockerDebt, CaseResult, CandidateEnvelope, SolverState, StepTrace
 from .episodes import EPISODES
+from .frontier import AccessFrontier, AccessFrontierRecord
 from .gate import AcceptRejectGate
+from .phase import HumanPhaseGate, PhaseGateRecord
 from .policy import BaselinePolicy, EvaluatedCandidate, PolicyContext
 from .resources import StationResourceGraph
 
@@ -80,7 +82,9 @@ def _trace_row(
         after_unsatisfied=contract_delta.after_unsatisfied if contract_delta else 0,
         before_contract_debt=contract_delta.before_contract_debt if contract_delta else 0,
         after_contract_debt=contract_delta.after_contract_debt if contract_delta else 0,
-        contract_reduction=contract_delta.effective_gain if contract_delta else 0,
+        contract_reduction=contract_delta.contract_reduction if contract_delta else 0,
+        support_gain=contract_delta.support_gain if contract_delta else 0,
+        effective_gain=contract_delta.effective_gain if contract_delta else 0,
         total_reduction=contract_delta.total_reduction if contract_delta else 0,
     )
 
@@ -91,23 +95,47 @@ class VNextSolver:
         self.physical = legacy.PhysicalAdapter()
         self.resources = StationResourceGraph()
         self.gate = AcceptRejectGate()
+        self.frontier = AccessFrontier()
+        self.phase_gate = HumanPhaseGate()
         self.policy = BaselinePolicy()
 
-    def solve_case(self, truth_path: Path, output_dir: Path) -> tuple[CaseResult, list[StepTrace], list[Any]]:
+    def solve_case(
+        self,
+        truth_path: Path,
+        output_dir: Path,
+    ) -> tuple[CaseResult, list[StepTrace], list[Any], list[PhaseGateRecord], list[AccessFrontierRecord]]:
         case_id, _payload, cars, depot_assignment, loco_location = legacy.read_case(truth_path)
         state = SolverState(case_id=case_id, cars=cars, depot_assignment=depot_assignment, loco_location=loco_location)
         state.visited_signatures.add(legacy.state_signature(state.cars, state.loco_location))
         initial_unsatisfied = len(legacy.unsatisfied_cars(state.cars, state.depot_assignment))
         traces: list[StepTrace] = []
+        phase_records: list[PhaseGateRecord] = []
+        frontier_records: list[AccessFrontierRecord] = []
         operations: list[Any] = []
         blocked_reason = ""
         hard_physical_accepted = 0
+        accepted_without_phase_permission = 0
+        phase_gate_bypass = 0
+        previous_phase = ""
+        hook_count_by_phase: dict[str, int] = {}
+        last_policy_context: PolicyContext | None = None
 
         while state.hook_index <= self.max_hooks:
             if not legacy.unsatisfied_cars(state.cars, state.depot_assignment):
                 break
             selected: EvaluatedCandidate | None = None
             policy_context = self.policy.context(state)
+            last_policy_context = policy_context
+            frontier_records.append(
+                self.frontier.snapshot(
+                    case_id=state.case_id,
+                    hook_index=state.hook_index,
+                    cars=state.cars,
+                    depot_assignment=state.depot_assignment,
+                    graph=self.physical.graph,
+                    loco_location=state.loco_location,
+                )
+            )
             contracts = self.policy.order_contracts(
                 build_contracts(state.cars, state.depot_assignment),
                 policy_context,
@@ -238,6 +266,39 @@ class VNextSolver:
                     break
             if validation.reasons:
                 hard_physical_accepted += 1
+            current_phase = self.phase_gate.active_phase(
+                previous_phase=previous_phase,
+                proposed=policy_context.phase_state,
+            )
+            active_phase_state = replace(
+                policy_context.phase_state,
+                phase=self.phase_gate.phase_kind(current_phase),
+            )
+            hook_count_by_phase[current_phase] = hook_count_by_phase.get(current_phase, 0) + 1
+            phase_permission = self.phase_gate.permission(
+                phase_state=active_phase_state,
+                envelope=envelope,
+                contract_delta=selected.contract_delta,
+                resource_delta=selected.resource_delta,
+                remote_session_open=policy_context.remote_session_open,
+            )
+            if not phase_permission.allowed:
+                accepted_without_phase_permission += 1
+            phase_record = self.phase_gate.record(
+                case_id=state.case_id,
+                step_index=state.hook_index,
+                previous_phase=previous_phase,
+                current_phase=current_phase,
+                phase_state=active_phase_state,
+                envelope=envelope,
+                contract_delta=selected.contract_delta,
+                permission=phase_permission,
+                hook_count_in_phase=hook_count_by_phase[current_phase],
+            )
+            if phase_record.transition_type == "fail":
+                phase_gate_bypass += 1
+            phase_records.append(phase_record)
+            previous_phase = current_phase
             start_operation_index = len(operations) + 1
             operations.extend(self.physical.operation_rows(envelope.candidate, validation, start_operation_index))
             state.cars = prospective
@@ -248,12 +309,12 @@ class VNextSolver:
                 for line in envelope.resource_request.touched_lines
             )
             state.remote_session_open = bool(
-                (
+                _remote_unsatisfied_count(state.cars, state.depot_assignment)
+                and touched_remote
+                and (
                     state.remote_session_open
                     or self.policy.opens_remote_session(selected)
                 )
-                and touched_remote
-                and _remote_unsatisfied_count(state.cars, state.depot_assignment)
             )
             business_lines = [
                 step.line
@@ -285,6 +346,19 @@ class VNextSolver:
         if state.hook_index > self.max_hooks and final_unsatisfied:
             blocked_reason = "max_hook_limit_reached"
             status = "blocked"
+        if status == "blocked":
+            final_context = last_policy_context or self.policy.context(state)
+            current_phase = previous_phase or self.phase_gate.phase_code(final_context.phase_state.phase)
+            phase_records.append(
+                self.phase_gate.fail_record(
+                    case_id=state.case_id,
+                    step_index=state.hook_index,
+                    phase_state=final_context.phase_state,
+                    current_phase=current_phase,
+                    blocked_reason=blocked_reason or "blocked",
+                    hook_count_in_phase=hook_count_by_phase.get(current_phase, 0),
+                )
+            )
 
         output_dir.mkdir(parents=True, exist_ok=True)
         if operations:
@@ -322,18 +396,28 @@ class VNextSolver:
             step_count=len(accepted_traces),
             accepted_without_contract_delta_count=0,
             accepted_without_resource_delta_count=0,
-            accepted_without_phase_permission_count=0,
-            phase_gate_bypass_count=0,
+            accepted_without_phase_permission_count=accepted_without_phase_permission,
+            phase_gate_bypass_count=phase_gate_bypass,
             orphan_resource_request_count=0,
             hard_physical_violation_accepted_count=hard_physical_accepted,
         )
-        return result, traces, operations
+        return result, traces, operations, phase_records, frontier_records
 
 
-def write_artifacts(output_dir: Path, results: list[CaseResult], traces: list[StepTrace]) -> None:
+def write_artifacts(
+    output_dir: Path,
+    results: list[CaseResult],
+    traces: list[StepTrace],
+    phase_records: list[PhaseGateRecord],
+    frontier_records: list[AccessFrontierRecord],
+) -> None:
     adapter = legacy.PhysicalAdapter()
     adapter.write_csv(output_dir / "case_summary.csv", [asdict(row) for row in results])
     adapter.write_csv(output_dir / "step_trace.csv", [asdict(row) for row in traces])
+    adapter.write_csv(output_dir / "phase_gate_records.csv", [asdict(row) for row in phase_records])
+    adapter.write_csv(output_dir / "access_frontier_records.csv", [asdict(row) for row in frontier_records])
+    route_blocked_counts = [row.route_blocked_line_count for row in frontier_records]
+    serial_blocker_counts = [row.serial_blocker_line_count for row in frontier_records]
     summary = {
         "case_count": len(results),
         "completed": sum(1 for row in results if row.status == "completed"),
@@ -346,5 +430,9 @@ def write_artifacts(output_dir: Path, results: list[CaseResult], traces: list[St
         "hard_physical_violation_accepted_count": sum(row.hard_physical_violation_accepted_count for row in results),
         "hook_count": sum(row.hook_count for row in results),
         "remote_business_transition_count": sum(row.remote_business_transition_count for row in results),
+        "phase_gate_record_count": len(phase_records),
+        "access_frontier_record_count": len(frontier_records),
+        "max_route_blocked_line_count": max(route_blocked_counts, default=0),
+        "max_serial_blocker_line_count": max(serial_blocker_counts, default=0),
     }
     adapter.write_json(output_dir / "vnext_summary.json", summary)

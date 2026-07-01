@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import legacy_adapter as legacy
+from . import serial
 from .contracts import contract_debt
 from .domain import CandidateEnvelope, ContractDelta, IntentKind
 
@@ -33,6 +34,12 @@ def build_contract_delta(
         fulfilled.append("contract_debt_complete")
     if after_contract_debt < before_contract_debt:
         reduced.append("contract_debt_reduced")
+    serial_releases = _serial_blocker_releases(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective_cars,
+        depot_assignment=depot_assignment,
+    )
     if after_contract_debt > before_contract_debt:
         broken.append("contract_debt_increased")
     if after_unsatisfied > before_unsatisfied:
@@ -52,6 +59,9 @@ def build_contract_delta(
             added.append("restore_borrowed_blocker")
         if envelope.resource_request.restored_borrowed_blockers:
             fulfilled.append("borrowed_blocker_restored")
+    if serial_releases:
+        support_gain = max(support_gain, len(serial_releases))
+        reduced.append("serial_line_gate_released")
     if envelope.intent == IntentKind.DEPOT_REPACK:
         reduced.append("depot_repack_ordered")
         if after_contract_debt < before_contract_debt:
@@ -71,3 +81,38 @@ def build_contract_delta(
         added=tuple(added),
         support_gain=support_gain,
     )
+
+
+def _serial_blocker_releases(
+    envelope: CandidateEnvelope,
+    *,
+    cars: list[dict[str, Any]],
+    prospective_cars: list[dict[str, Any]],
+    depot_assignment: Any,
+) -> tuple[str, ...]:
+    move_nos = set(envelope.resource_request.move_nos)
+    releases: list[str] = []
+    for blocker_line in serial.serial_blocker_lines():
+        before_nos = {
+            legacy.car_no(car)
+            for car in cars
+            if car["Line"] == blocker_line
+        }
+        if not before_nos or not before_nos <= move_nos:
+            continue
+        after_nos = {
+            legacy.car_no(car)
+            for car in prospective_cars
+            if car["Line"] == blocker_line
+        }
+        if after_nos:
+            continue
+        debt_nos = serial.downstream_debt_nos(
+            blocker_line=blocker_line,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            moving_nos=move_nos,
+        )
+        if debt_nos:
+            releases.append(blocker_line)
+    return tuple(releases)
