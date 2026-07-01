@@ -444,11 +444,8 @@ class VNextSolver:
             final_unsatisfied=final_unsatisfied,
             blocked_reason=blocked_reason,
             step_count=len(accepted_traces),
-            accepted_without_contract_delta_count=0,
-            accepted_without_resource_delta_count=0,
             accepted_without_phase_permission_count=accepted_without_phase_permission,
             phase_gate_bypass_count=phase_gate_bypass,
-            orphan_resource_request_count=0,
             hard_physical_violation_accepted_count=hard_physical_accepted,
         )
         return result, traces, operations, phase_records, frontier_records, staging_records
@@ -474,11 +471,8 @@ def write_artifacts(
         "case_count": len(results),
         "completed": sum(1 for row in results if row.status == "completed"),
         "blocked": sum(1 for row in results if row.status == "blocked"),
-        "accepted_without_contract_delta_count": sum(row.accepted_without_contract_delta_count for row in results),
-        "accepted_without_resource_delta_count": sum(row.accepted_without_resource_delta_count for row in results),
         "accepted_without_phase_permission_count": sum(row.accepted_without_phase_permission_count for row in results),
         "phase_gate_bypass_count": sum(row.phase_gate_bypass_count for row in results),
-        "orphan_resource_request_count": sum(row.orphan_resource_request_count for row in results),
         "hard_physical_violation_accepted_count": sum(row.hard_physical_violation_accepted_count for row in results),
         "hook_count": sum(row.hook_count for row in results),
         "remote_business_transition_count": sum(row.remote_business_transition_count for row in results),

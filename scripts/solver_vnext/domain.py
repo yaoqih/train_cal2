@@ -27,7 +27,6 @@ class IntentKind(str, Enum):
     PREFIX_DIGEST = "PREFIX_DIGEST"
     CUN4_RELEASE_ACCEPT = "CUN4_RELEASE_ACCEPT"
     REMOTE_DEPOT = "REMOTE_DEPOT"
-    SHORT_CHAIN_DEPOT = "SHORT_CHAIN_DEPOT"
     TAIL_CLOSEOUT = "TAIL_CLOSEOUT"
     DEPOT_REPACK = "DEPOT_REPACK"
 
@@ -226,9 +225,6 @@ class CaseResult:
     final_unsatisfied: int
     blocked_reason: str
     step_count: int
-    accepted_without_contract_delta_count: int
-    accepted_without_resource_delta_count: int
     accepted_without_phase_permission_count: int
     phase_gate_bypass_count: int
-    orphan_resource_request_count: int
     hard_physical_violation_accepted_count: int

@@ -392,7 +392,7 @@ class RemoteSessionEpisode(Episode):
 
 
 class DepotOutboundSessionEpisode(Episode):
-    intent = IntentKind.REMOTE_SESSION
+    intent = IntentKind.CUN4_RELEASE_ACCEPT
     template_name = "depot_outbound_session"
 
     source_order = (

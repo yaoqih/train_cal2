@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import legacy_adapter as legacy
-from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, PhaseKind, PhaseState, ResourceDelta, SolverState
+from . import plan_facts
+from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, IntentKind, PhaseKind, PhaseState, ResourceDelta, SolverState
 from .phase import HumanPhaseGate
 
 
@@ -14,9 +15,6 @@ class PolicyContext:
     remote_open: bool
     remote_session_open: bool
     last_business_remote: bool | None
-    non_remote_unsatisfied: int
-    remote_unsatisfied: int
-    cun4_count: int
 
 
 @dataclass(frozen=True)
@@ -87,9 +85,6 @@ class BaselinePolicy:
             remote_open=remote_open,
             remote_session_open=state.remote_session_open,
             last_business_remote=state.last_business_remote,
-            non_remote_unsatisfied=front_count + cun4_count + closeout_count,
-            remote_unsatisfied=remote_count,
-            cun4_count=sum(1 for car in state.cars if car["Line"] == "存4线"),
         )
 
     def order_contracts(self, contracts: list[FlowContract], context: PolicyContext) -> list[FlowContract]:
@@ -112,9 +107,9 @@ class BaselinePolicy:
         envelope = candidate.envelope
         hook = envelope.candidate
         delta = candidate.contract_delta
-        touched_remote = any(line in legacy.REMOTE_INTERACTION_LINES for line in candidate.resource_delta.request.touched_lines)
-        remote_transition_cost = self._remote_transition_cost(hook, context)
-        hook_count = max(1, self._planlet_hook_count(hook))
+        touched_remote = plan_facts.touches_remote(candidate.resource_delta.request)
+        remote_transition_cost = plan_facts.remote_transition_cost(hook, context.last_business_remote)
+        hook_count = max(1, plan_facts.hook_count(hook))
         lane = self._candidate_lane(candidate, context)
         if envelope.contract.family == ContractFamily.REMOTE_SESSION:
             return (
@@ -142,7 +137,7 @@ class BaselinePolicy:
             self._remote_penalty(touched_remote, context),
             remote_transition_cost,
             -len(hook.move_car_nos),
-            self._planlet_put_count(hook),
+            plan_facts.put_count(hook),
             self._contract_key(envelope.contract, context),
             hook.candidate_id,
         )
@@ -166,10 +161,7 @@ class BaselinePolicy:
         delta = candidate.contract_delta
         request = candidate.resource_delta.request
         if (
-            envelope.template_name == "depot_outbound_session"
-            and envelope.contract.family == ContractFamily.REMOTE_SESSION
-            and request.target_line == "存4线"
-            and hook.source_line in legacy.REMOTE_INTERACTION_LINES
+            plan_facts.is_remote_outbound_session_release(envelope, request)
             and delta.contract_reduction >= self.LARGE_DEPOT_OUTBOUND_RELEASE_MIN
             and len(hook.move_car_nos) >= self.LARGE_DEPOT_OUTBOUND_CAR_MIN
         ):
@@ -198,7 +190,7 @@ class BaselinePolicy:
         delta = candidate.contract_delta
         return (
             envelope.contract.family == ContractFamily.REMOTE_SESSION
-            and envelope.template_name == "remote_session_directional_digest"
+            and envelope.intent == IntentKind.REMOTE_SESSION
             and any(line in legacy.DEPOT_LINES for line in request.put_lines)
             and delta.contract_reduction >= 3
         )
@@ -211,12 +203,10 @@ class BaselinePolicy:
         delta = candidate.contract_delta
         return (
             envelope.contract.family == ContractFamily.REPAIR_INBOUND
+            and envelope.intent == IntentKind.REMOTE_DEPOT
             and any(line in legacy.DEPOT_LINES for line in request.put_lines)
-            and envelope.template_name
-            in {
-                "depot_multi_drop_accessible_prefix",
-                "remote_session_directional_digest",
-            }
+            and not request.same_plan_source_return_nos
+            and plan_facts.depot_put_line_count(request) >= 2
             and (
                 delta.contract_reduction >= 2
                 or len(envelope.candidate.move_car_nos) >= 3
@@ -230,9 +220,11 @@ class BaselinePolicy:
         request = candidate.resource_delta.request
         delta = candidate.contract_delta
         return (
-            envelope.template_name == "remote_depot_direct_accessible_prefix"
-            and envelope.contract.family == ContractFamily.REPAIR_INBOUND
+            envelope.contract.family == ContractFamily.REPAIR_INBOUND
+            and envelope.intent == IntentKind.REMOTE_DEPOT
             and any(line in legacy.DEPOT_LINES for line in request.put_lines)
+            and plan_facts.depot_put_line_count(request) == 1
+            and plan_facts.put_count(envelope.candidate) == 1
             and delta.contract_reduction <= 1
             and len(envelope.candidate.move_car_nos) <= 2
         )
@@ -313,26 +305,3 @@ class BaselinePolicy:
         if context.remote_open:
             return 0 if touched_remote else 1
         return 1 if touched_remote else 0
-
-    def _remote_transition_cost(self, candidate: Any, context: PolicyContext) -> int:
-        lines = [
-            step.line
-            for step in legacy.candidate_plan_steps(candidate)
-            if step.action in {"Get", "Put"}
-        ]
-        if not lines:
-            return 0
-        remote_flags = [line in legacy.REMOTE_INTERACTION_LINES for line in lines]
-        cost = sum(1 for left, right in zip(remote_flags, remote_flags[1:]) if left != right)
-        if context.last_business_remote is not None and remote_flags[0] != context.last_business_remote:
-            cost += 1
-        return cost
-
-    def _planlet_put_count(self, candidate: Any) -> int:
-        return sum(1 for step in legacy.candidate_plan_steps(candidate) if step.action == "Put")
-
-    def _planlet_hook_count(self, candidate: Any) -> int:
-        steps = legacy.candidate_plan_steps(candidate)
-        if not steps:
-            return 2
-        return sum(1 for step in steps if step.action in {"Get", "Put"})

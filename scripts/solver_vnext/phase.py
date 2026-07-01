@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import legacy_adapter as legacy
+from . import plan_facts
 from .domain import ContractDelta, ContractFamily, IntentKind, PhaseKind, PhaseState, ResourceDelta
 
 
@@ -194,8 +195,7 @@ class HumanPhaseGate:
         family = envelope.contract.family
         request = resource_delta.request
         if (
-            envelope.template_name == "depot_outbound_session"
-            and family == ContractFamily.REMOTE_SESSION
+            plan_facts.is_remote_outbound_session_release(envelope, request)
             and not remote_session_open
         ):
             return "H3"
