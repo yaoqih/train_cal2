@@ -37,6 +37,79 @@ DEPOT_INNER_BLOCKERS = {
     f"修{index}库内": f"修{index}库外"
     for index in range(1, 5)
 }
+# Internal line keys follow the existing runtime model. LINE_FULL_NAMES records
+# the full table names used by operations for diagnostics and new rules.
+LINE_FULL_NAMES = {
+    "机北1": "机走北1线",
+    "存1线": "存1线",
+    "存2线": "存2线",
+    "存3线": "存3线",
+    "存4线": "存4线",
+    "存4南": "存4线南",
+    "存5线北": "存5线北",
+    "存5线南": "存5线南",
+    "机北2": "机走北2线",
+    "机库线": "机库线",
+    "调梁线北": "调梁线北",
+    "调梁棚": "调梁棚",
+    "机走北": "机走北",
+    "机走棚": "机走棚",
+    "预修线": "预修线",
+    "洗油北": "洗罐油漆北",
+    "机南": "机走线南",
+    "洗罐线北": "洗罐线北",
+    "洗罐站": "洗罐站",
+    "抛丸线": "抛丸线",
+    "油漆线": "油漆线",
+    "联7": "联7线",
+    "卸轮线": "卸轮线",
+    "修1库外": "修1库外",
+    "修1库内": "修1库内",
+    "修2库外": "修2库外",
+    "修2库内": "修2库内",
+    "修3库外": "修3库外",
+    "修3库内": "修3库内",
+    "修4库外": "修4库外",
+    "修4库内": "修4库内",
+}
+SERIAL_LINE_BLOCKERS: dict[str, tuple[str, ...]] = {
+    **{inner_line: (outer_line,) for inner_line, outer_line in DEPOT_INNER_BLOCKERS.items()},
+    "机南": ("机走棚",),
+    "机走棚": ("机走北",),
+    "洗油北": ("机走棚",),
+    "洗罐线北": ("洗油北",),
+    "油漆线": ("洗油北",),
+    "洗罐站": ("洗罐线北",),
+    "调梁棚": ("调梁线北",),
+    "存4南": ("存4线", "存3线"),
+    "存5线南": ("存5线北",),
+    "存1线": ("机北1",),
+    "机北2": ("机北1",),
+}
+SERIAL_ROUTE_EDGE_BLOCKERS: dict[frozenset[str], tuple[str, ...]] = {
+    frozenset(("L19", "修1库内")): ("修1库外",),
+    frozenset(("L17", "修2库内")): ("修2库外",),
+    frozenset(("L18", "修3库内")): ("修3库外",),
+    frozenset(("L18", "修4库内")): ("修4库外",),
+    frozenset(("L6", "L7")): ("机北2",),
+    frozenset(("L6", "Z1")): ("机北2",),
+    frozenset(("L5", "L6")): ("机北1",),
+    frozenset(("L5", "Z2")): ("机北1",),
+    frozenset(("L5", "存1线")): ("机北1",),
+    frozenset(("L9", "洗罐站")): ("洗罐线北",),
+    frozenset(("L9", "洗罐线北")): ("洗油北",),
+    frozenset(("L9", "油漆线")): ("洗油北",),
+    frozenset(("L8", "洗油北")): ("机走棚",),
+    frozenset(("L8", "机南")): ("机走棚",),
+    frozenset(("Z1", "机走棚")): ("机走北",),
+    frozenset(("L8", "机走棚")): ("机走北",),
+    frozenset(("L7", "调梁棚")): ("调梁线北",),
+    frozenset(("Z4", "存4南")): ("存4线", "存3线"),
+    frozenset(("L12", "存4南")): ("存4线", "存3线"),
+    frozenset(("L12", "存5线南")): ("存5线北",),
+    frozenset(("L6", "机北2")): ("机北1",),
+    frozenset(("L5", "机北2")): ("机北1",),
+}
 REMOTE_INTERACTION_LINES = DEPOT_TARGET_LINES | {"卸轮线"}
 REMOTE_CORRIDOR_LINES = {"机走棚", "预修线", "存4线"}
 SHORT_DIRECT_DEPOT_CASE_IDS = {"0213W", "0306W", "0327W"}
@@ -1075,11 +1148,12 @@ class TrackGraph:
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
-        cache_key = (source, target, tuple(sorted(occupied_lines)))
+        effective_occupied = expand_occupied_lines_for_route(occupied_lines)
+        cache_key = (source, target, tuple(sorted(effective_occupied)))
         cached = self._occupied_route_cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        route = self._route(source, target, occupied_lines=occupied_lines)
+        route = self._route(source, target, occupied_lines=effective_occupied)
         self._occupied_route_cache[cache_key] = list(route)
         return route
 
@@ -1159,7 +1233,11 @@ class TrackGraph:
             return True
         if node in occupied_lines and node not in route_endpoints:
             return True
-        edge_tracks = SWITCH_EDGE_TRACKS.get(frozenset((node, next_node)), ())
+        edge_key = frozenset((node, next_node))
+        edge_tracks = (
+            *SWITCH_EDGE_TRACKS.get(edge_key, ()),
+            *SERIAL_ROUTE_EDGE_BLOCKERS.get(edge_key, ()),
+        )
         return any(line in occupied_lines and line not in route_endpoints for line in edge_tracks)
 
 
@@ -1239,6 +1317,11 @@ def route_for_output(path: tuple[str, ...] | list[str]) -> list[str]:
             if not output or output[-1] != track:
                 output.append(track)
     return output
+
+
+def line_full_name(line: str) -> str:
+    normalized = normalize_line(line)
+    return LINE_FULL_NAMES.get(normalized, normalized)
 
 
 def candidate_plan_steps(candidate: HookCandidate) -> tuple[PlanStep, ...]:
@@ -2990,11 +3073,57 @@ def line_length_loads(cars: list[dict[str, Any]]) -> Counter[str]:
 
 
 def occupied_lines_for_route(cars: list[dict[str, Any]], moving_nos: set[str]) -> set[str]:
-    return {
+    return expand_occupied_lines_for_route({
         car["Line"]
         for car in cars
         if car["Line"] and car_no(car) not in moving_nos
-    }
+    })
+
+
+def expand_occupied_lines_for_route(occupied_lines: set[str]) -> set[str]:
+    expanded = {normalize_line(line) for line in occupied_lines if normalize_line(line)}
+    changed = True
+    while changed:
+        changed = False
+        for blocked_line, blocker_lines in SERIAL_LINE_BLOCKERS.items():
+            if blocked_line in expanded:
+                continue
+            if any(blocker_line in expanded for blocker_line in blocker_lines):
+                expanded.add(blocked_line)
+                changed = True
+    return expanded
+
+
+def active_serial_blockers_for_line(
+    line: str,
+    cars: list[dict[str, Any]],
+    moving_nos: set[str],
+) -> list[tuple[str, list[str]]]:
+    normalized_line = normalize_line(line)
+    occupied_by_line: dict[str, list[str]] = defaultdict(list)
+    for car in sorted(cars, key=lambda item: (normalize_line(item.get("Line")), int(item.get("Position") or 0), car_no(item))):
+        no = car_no(car)
+        car_line = normalize_line(car.get("Line"))
+        if not car_line or no in moving_nos:
+            continue
+        occupied_by_line[car_line].append(no)
+
+    blockers: list[tuple[str, list[str]]] = []
+    seen_blocker_lines: set[str] = set()
+    pending = [normalized_line]
+    seen_lines: set[str] = set()
+    while pending:
+        blocked_line = pending.pop(0)
+        if blocked_line in seen_lines:
+            continue
+        seen_lines.add(blocked_line)
+        for blocker_line in SERIAL_LINE_BLOCKERS.get(blocked_line, ()):
+            blocker_nos = occupied_by_line.get(blocker_line, [])
+            if blocker_nos and blocker_line not in seen_blocker_lines:
+                blockers.append((blocker_line, blocker_nos))
+                seen_blocker_lines.add(blocker_line)
+            pending.append(blocker_line)
+    return blockers
 
 
 def occupied_lines_for_get_route(cars: list[dict[str, Any]], moving_nos: set[str], source_line: str) -> set[str]:
@@ -3016,15 +3145,11 @@ def line_access_order(
         if car["Line"] == line and car_no(car) not in excluded_nos
     ]
     line_cars.sort(key=lambda item: (int(item.get("Position") or 0), car_no(item)))
-    attachments = LINE_ATTACHMENTS.get(normalize_line(line)) or ()
-    if len(attachments) > 1 and access_node == attachments[-1]:
-        line_cars.reverse()
     return [car_no(car) for car in line_cars]
 
 
 def access_is_south_end(line: str, access_node: str) -> bool:
-    attachments = LINE_ATTACHMENTS.get(normalize_line(line)) or ()
-    return len(attachments) > 1 and access_node == attachments[-1]
+    return False
 
 
 def physical_positions_after_put(
@@ -3125,20 +3250,13 @@ def line_entry_blocking_reasons(
     cars: list[dict[str, Any]],
     moving_nos: set[str],
 ) -> list[str]:
-    blocker_line = DEPOT_INNER_BLOCKERS.get(line)
-    if not blocker_line:
-        return []
-    blocker_nos = [
-        car_no(car)
-        for car in sorted(
-            cars,
-            key=lambda item: (int(item.get("Position") or 0), car_no(item)),
+    return [
+        (
+            f"serial_line_entry_blocked:{line_full_name(line)}:"
+            f"{line_full_name(blocker_line)}:{','.join(blocker_nos)}"
         )
-        if car["Line"] == blocker_line and car_no(car) not in moving_nos
+        for blocker_line, blocker_nos in active_serial_blockers_for_line(line, cars, moving_nos)
     ]
-    if not blocker_nos:
-        return []
-    return [f"inner_depot_entry_blocked_by_outer:{line}:{blocker_line}:{','.join(blocker_nos)}"]
 
 
 def depot_access_sort_key(line: str) -> tuple[int, str]:
@@ -9584,6 +9702,7 @@ class PhysicalValidator:
 
         if not get_path:
             reasons.append("get_route_blocked_by_occupied_line" if get_static_path else "get_route_missing")
+            reasons.extend(line_entry_blocking_reasons(candidate.source_line, cars, set(candidate.move_car_nos)))
         else:
             reasons.extend(line_entry_blocking_reasons(candidate.source_line, cars, set(candidate.move_car_nos)))
             get_order_reason = inaccessible_get_reason(
@@ -9600,7 +9719,8 @@ class PhysicalValidator:
             reasons.append("weigh_route_blocked_by_occupied_line" if weigh_static_path else "weigh_route_missing")
         if not put_path:
             reasons.append("put_route_blocked_by_occupied_line" if put_static_path else "put_route_missing")
-        elif candidate.target_line in DEPOT_INNER_BLOCKERS:
+            reasons.extend(line_entry_blocking_reasons(candidate.target_line, cars, set(candidate.move_car_nos)))
+        else:
             reasons.extend(line_entry_blocking_reasons(candidate.target_line, cars, set(candidate.move_car_nos)))
         if candidate.source_line in RUNNING_LINES or candidate.target_line in RUNNING_LINES:
             reasons.append("running_line_stop_violation")
@@ -9707,6 +9827,7 @@ class PhysicalValidator:
                 path = tuple(route_with_line_prefix(current_loco.line, raw_path))
                 if not path:
                     reasons.append("get_route_blocked_by_occupied_line" if static_path else "get_route_missing")
+                    reasons.extend(line_entry_blocking_reasons(step.line, working_cars, step_nos | carried))
                     break
                 source_location = operation_stand_location(path, step.line)
                 entry_reasons = line_entry_blocking_reasons(step.line, working_cars, step_nos | carried)
@@ -9762,6 +9883,7 @@ class PhysicalValidator:
                 path = tuple(route_with_line_prefix(current_loco.line, raw_path))
                 if not path:
                     reasons.append("put_route_blocked_by_occupied_line" if static_path else "put_route_missing")
+                    reasons.extend(line_entry_blocking_reasons(step.line, working_cars, carried))
                     break
                 entry_reasons = line_entry_blocking_reasons(step.line, working_cars, carried)
                 if entry_reasons:

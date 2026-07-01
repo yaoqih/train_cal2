@@ -68,6 +68,14 @@ class StationResourceGraph:
             violations.extend(f"physical:{reason}" for reason in validation.reasons)
         if any(line in legacy.RUNNING_LINES for line in request.touched_lines):
             violations.append("running_line_storage")
+        violations.extend(
+            self._serial_blocker_storage_violations(
+                request,
+                candidate=candidate,
+                cars=cars,
+                depot_assignment=depot_assignment,
+            )
+        )
         if "存4线" in request.put_lines and request.family not in {
             ContractFamily.REMOTE_SESSION,
             ContractFamily.REPAIR_INBOUND,
@@ -106,3 +114,60 @@ class StationResourceGraph:
             released_lines=released,
             violations=tuple(violations),
         )
+
+    def _serial_blocker_storage_violations(
+        self,
+        request: ResourceRequest,
+        *,
+        candidate: Any,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+    ) -> list[str]:
+        reverse_blockers: dict[str, set[str]] = {}
+        for blocked_line, blocker_lines in legacy.legacy.SERIAL_LINE_BLOCKERS.items():
+            for blocker_line in blocker_lines:
+                reverse_blockers.setdefault(blocker_line, set()).add(blocked_line)
+
+        def downstream_lines(blocker_line: str) -> set[str]:
+            pending = list(reverse_blockers.get(blocker_line, ()))
+            seen: set[str] = set()
+            while pending:
+                line = pending.pop(0)
+                if line in seen:
+                    continue
+                seen.add(line)
+                pending.extend(reverse_blockers.get(line, ()))
+            return seen
+
+        protected_blockers = {
+            "存4线",
+            "存3线",
+            "修1库外",
+            "修2库外",
+            "修3库外",
+            "修4库外",
+        }
+        move_nos = set(request.move_nos)
+        loads = legacy.line_loads(cars)
+        unsatisfied = legacy.unsatisfied_cars(cars, depot_assignment)
+        violations: list[str] = []
+        for put_line in request.put_lines:
+            if put_line in protected_blockers or put_line == request.source_line:
+                continue
+            blocked = downstream_lines(put_line)
+            if not blocked:
+                continue
+            downstream_debt = []
+            for car in unsatisfied:
+                no = legacy.car_no(car)
+                if no in move_nos:
+                    continue
+                target_line, _position, _reason = legacy.planned_target_for_car(car, cars, depot_assignment, loads)
+                if car["Line"] in blocked or target_line in blocked:
+                    downstream_debt.append(no)
+            if downstream_debt:
+                violations.append(
+                    "serial_blocker_storage_before_downstream_clear:"
+                    f"{put_line}:{','.join(sorted(blocked))}:{','.join(sorted(downstream_debt)[:8])}"
+                )
+        return violations

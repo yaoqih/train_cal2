@@ -409,6 +409,7 @@ def _vnext_summary_for_p10_page(*, case_result, operation_rows, step_traces, pay
     final_cars = _vnext_final_cars_from_response_or_payload(
         case_id=case_result.case_id,
         payload=payload,
+        use_response=bool(operation_rows),
     )
     final_capacity_warnings = (
         p10.final_line_capacity_warning_reasons(final_cars)
@@ -452,14 +453,14 @@ def _vnext_summary_for_p10_page(*, case_result, operation_rows, step_traces, pay
     )
 
 
-def _vnext_final_cars_from_response_or_payload(*, case_id: str, payload: dict) -> list[dict]:
+def _vnext_final_cars_from_response_or_payload(*, case_id: str, payload: dict, use_response: bool) -> list[dict]:
     by_no = {
         str(car.get("No") or ""): dict(car)
         for car in payload.get("StartStatus") or []
         if str(car.get("No") or "")
     }
     path = APP_VNEXT_OUTPUT_DIR / "responses" / f"{case_id}.json"
-    if not path.exists():
+    if not use_response or not path.exists():
         return list(by_no.values())
     response = json.loads(path.read_text(encoding="utf-8"))
     generated = (response.get("Data") or {}).get("GeneratedEndStatus") or []
@@ -488,7 +489,7 @@ def _vnext_closed_door_violation_count(blocked_reason: str) -> int:
 
 def _vnext_load_response_or_build(summary, operation_rows, payload: dict) -> dict:
     response_path = Path(summary.response_path) if summary.response_path else None
-    if response_path is not None and response_path.exists():
+    if operation_rows and response_path is not None and response_path.exists():
         return json.loads(response_path.read_text(encoding="utf-8"))
     p10 = _p10_runtime_module()
     success = summary.status == "completed"
