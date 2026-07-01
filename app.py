@@ -384,7 +384,7 @@ def _run_vnext_case(
 ):
     vnext_engine = _vnext_runtime_module()
     solver = vnext_engine.VNextSolver(max_hooks=max_hooks)
-    case_result, step_traces, operation_rows = solver.solve_case(truth_path, APP_VNEXT_OUTPUT_DIR)
+    case_result, step_traces, operation_rows, *_diagnostic_rows = solver.solve_case(truth_path, APP_VNEXT_OUTPUT_DIR)
     summary = _vnext_summary_for_p10_page(
         case_result=case_result,
         operation_rows=operation_rows,
