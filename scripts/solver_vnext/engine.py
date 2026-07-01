@@ -7,13 +7,14 @@ from typing import Any
 from . import legacy_adapter as legacy
 from .contracts import build_contracts
 from .delta import build_contract_delta, simulate_candidate
-from .domain import BorrowedBlockerDebt, CaseResult, CandidateEnvelope, SolverState, StepTrace
+from .domain import CaseResult, CandidateEnvelope, ResourceDelta, SolverState, StepTrace
 from .episodes import EPISODES
 from .frontier import AccessFrontier, AccessFrontierRecord
 from .gate import AcceptRejectGate
 from .phase import HumanPhaseGate, PhaseGateRecord
 from .policy import BaselinePolicy, EvaluatedCandidate, PolicyContext
 from .resources import StationResourceGraph
+from .staging import StagingIntentBuilder, StagingIntentRecord
 
 
 def _remote_unsatisfied_count(cars: list[dict[str, Any]], depot_assignment: Any) -> int:
@@ -61,8 +62,7 @@ def _trace_row(
         touched_lines="|".join(request.touched_lines),
         put_lines="|".join(request.put_lines),
         move_nos="|".join(candidate.move_car_nos),
-        borrowed_blockers="|".join(request.borrowed_blockers),
-        restored_borrowed_blockers="|".join(request.restored_borrowed_blockers),
+        same_plan_restore_nos="|".join(request.same_plan_restore_nos),
         gate_accepted=gate_accepted,
         selected=selected,
         gate_reason=gate_reason,
@@ -90,20 +90,35 @@ def _trace_row(
 
 
 class VNextSolver:
-    def __init__(self, max_hooks: int = 300) -> None:
+    def __init__(
+        self,
+        max_hooks: int = 300,
+        trace_all_candidates: bool = False,
+        trace_frontier: bool = False,
+    ) -> None:
         self.max_hooks = max_hooks
+        self.trace_all_candidates = trace_all_candidates
+        self.trace_frontier = trace_frontier
         self.physical = legacy.PhysicalAdapter()
         self.resources = StationResourceGraph()
         self.gate = AcceptRejectGate()
         self.frontier = AccessFrontier()
         self.phase_gate = HumanPhaseGate()
+        self.staging = StagingIntentBuilder()
         self.policy = BaselinePolicy()
 
     def solve_case(
         self,
         truth_path: Path,
         output_dir: Path,
-    ) -> tuple[CaseResult, list[StepTrace], list[Any], list[PhaseGateRecord], list[AccessFrontierRecord]]:
+    ) -> tuple[
+        CaseResult,
+        list[StepTrace],
+        list[Any],
+        list[PhaseGateRecord],
+        list[AccessFrontierRecord],
+        list[StagingIntentRecord],
+    ]:
         case_id, _payload, cars, depot_assignment, loco_location = legacy.read_case(truth_path)
         state = SolverState(case_id=case_id, cars=cars, depot_assignment=depot_assignment, loco_location=loco_location)
         state.visited_signatures.add(legacy.state_signature(state.cars, state.loco_location))
@@ -111,6 +126,7 @@ class VNextSolver:
         traces: list[StepTrace] = []
         phase_records: list[PhaseGateRecord] = []
         frontier_records: list[AccessFrontierRecord] = []
+        staging_records: list[StagingIntentRecord] = []
         operations: list[Any] = []
         blocked_reason = ""
         hard_physical_accepted = 0
@@ -123,19 +139,21 @@ class VNextSolver:
         while state.hook_index <= self.max_hooks:
             if not legacy.unsatisfied_cars(state.cars, state.depot_assignment):
                 break
+            legacy.clear_access_order_cache()
             selected: EvaluatedCandidate | None = None
             policy_context = self.policy.context(state)
             last_policy_context = policy_context
-            frontier_records.append(
-                self.frontier.snapshot(
-                    case_id=state.case_id,
-                    hook_index=state.hook_index,
-                    cars=state.cars,
-                    depot_assignment=state.depot_assignment,
-                    graph=self.physical.graph,
-                    loco_location=state.loco_location,
+            if self.trace_frontier:
+                frontier_records.append(
+                    self.frontier.snapshot(
+                        case_id=state.case_id,
+                        hook_index=state.hook_index,
+                        cars=state.cars,
+                        depot_assignment=state.depot_assignment,
+                        graph=self.physical.graph,
+                        loco_location=state.loco_location,
+                    )
                 )
-            )
             contracts = self.policy.order_contracts(
                 build_contracts(state.cars, state.depot_assignment),
                 policy_context,
@@ -150,6 +168,8 @@ class VNextSolver:
                 selected_candidate: EvaluatedCandidate | None = None
                 rejected_count = 0
                 generated_count = 0
+                validation_cache: dict[str, Any] = {}
+                prospective_cache: dict[str, tuple[list[dict[str, Any]], Any, tuple[str, str, tuple[tuple[str, str, int], ...]]]] = {}
                 for contract in contracts:
                     for episode in episodes:
                         if not episode.applies(contract):
@@ -172,39 +192,53 @@ class VNextSolver:
                                 resource_request=resource_request,
                                 template_name=envelope.template_name,
                             )
-                            validation = self.physical.validate(
-                                envelope.candidate,
-                                state.cars,
-                                state.loco_location,
-                                state.depot_assignment,
-                            )
+                            validation = validation_cache.get(envelope.candidate.candidate_id)
+                            if validation is None:
+                                validation = self.physical.validate(
+                                    envelope.candidate,
+                                    state.cars,
+                                    state.loco_location,
+                                    state.depot_assignment,
+                                )
+                                validation_cache[envelope.candidate.candidate_id] = validation
+                            if validation.reasons:
+                                resource_delta = ResourceDelta(
+                                    request=resource_request,
+                                    acquired=(),
+                                    released_lines=(),
+                                    violations=tuple(f"physical:{reason}" for reason in validation.reasons),
+                                )
+                                if self.trace_all_candidates:
+                                    traces.append(
+                                        _trace_row(
+                                            state=state,
+                                            policy_context=policy_context,
+                                            envelope=envelope,
+                                            gate_accepted=False,
+                                            selected=False,
+                                            gate_reason="physical_reject",
+                                            physical_reasons=tuple(validation.reasons),
+                                            contract_delta=None,
+                                            resource_delta=resource_delta,
+                                        )
+                                    )
+                                rejected_count += 1
+                                continue
                             resource_delta = self.resources.acquire(
                                 resource_request,
                                 candidate=envelope.candidate,
                                 validation=validation,
                                 cars=state.cars,
                                 depot_assignment=state.depot_assignment,
-                                borrowed_debts=state.borrowed_blocker_debts,
                             )
-                            if validation.reasons:
-                                traces.append(
-                                    _trace_row(
-                                        state=state,
-                                        policy_context=policy_context,
-                                        envelope=envelope,
-                                        gate_accepted=False,
-                                        selected=False,
-                                        gate_reason="physical_reject",
-                                        physical_reasons=tuple(validation.reasons),
-                                        contract_delta=None,
-                                        resource_delta=resource_delta,
-                                    )
-                                )
-                                rejected_count += 1
-                                continue
-                            prospective = simulate_candidate(envelope.candidate, state.cars, validation)
-                            next_loco_location = self.physical.next_loco_location(envelope.candidate, validation)
-                            prospective_signature = legacy.state_signature(prospective, next_loco_location)
+                            cached_prospective = prospective_cache.get(envelope.candidate.candidate_id)
+                            if cached_prospective is None:
+                                prospective = simulate_candidate(envelope.candidate, state.cars, validation)
+                                next_loco_location = self.physical.next_loco_location(envelope.candidate, validation)
+                                prospective_signature = legacy.state_signature(prospective, next_loco_location)
+                                cached_prospective = (prospective, next_loco_location, prospective_signature)
+                                prospective_cache[envelope.candidate.candidate_id] = cached_prospective
+                            prospective, next_loco_location, prospective_signature = cached_prospective
                             contract_delta = build_contract_delta(
                                 envelope,
                                 cars=state.cars,
@@ -214,19 +248,20 @@ class VNextSolver:
                             decision = self.gate.decide(contract_delta, resource_delta)
                             if decision.accepted and prospective_signature in state.visited_signatures:
                                 decision = self.gate.loop_reject(contract_delta, resource_delta)
-                            traces.append(
-                                _trace_row(
-                                    state=state,
-                                    policy_context=policy_context,
-                                    envelope=envelope,
-                                    gate_accepted=decision.accepted,
-                                    selected=False,
-                                    gate_reason=decision.reason,
-                                    physical_reasons=(),
-                                    contract_delta=contract_delta,
-                                    resource_delta=resource_delta,
+                            if self.trace_all_candidates:
+                                traces.append(
+                                    _trace_row(
+                                        state=state,
+                                        policy_context=policy_context,
+                                        envelope=envelope,
+                                        gate_accepted=decision.accepted,
+                                        selected=False,
+                                        gate_reason=decision.reason,
+                                        physical_reasons=(),
+                                        contract_delta=contract_delta,
+                                        resource_delta=resource_delta,
+                                    )
                                 )
-                            )
                             if not decision.accepted:
                                 rejected_count += 1
                                 continue
@@ -257,13 +292,30 @@ class VNextSolver:
             prospective = selected.prospective_cars
             next_loco_location = selected.next_loco_location
             prospective_signature = selected.prospective_signature
-            for index in range(len(traces) - 1, -1, -1):
-                if traces[index].candidate_id == envelope.candidate.candidate_id and traces[index].hook_index == state.hook_index:
-                    trace = traces[index]
-                    traces[index] = StepTrace(
-                        **{**asdict(trace), "selected": True}
+            selected_trace_written = False
+            if self.trace_all_candidates:
+                for index in range(len(traces) - 1, -1, -1):
+                    if traces[index].candidate_id == envelope.candidate.candidate_id and traces[index].hook_index == state.hook_index:
+                        trace = traces[index]
+                        traces[index] = StepTrace(
+                            **{**asdict(trace), "selected": True}
+                        )
+                        selected_trace_written = True
+                        break
+            if not selected_trace_written:
+                traces.append(
+                    _trace_row(
+                        state=state,
+                        policy_context=policy_context,
+                        envelope=envelope,
+                        gate_accepted=True,
+                        selected=True,
+                        gate_reason="accepted",
+                        physical_reasons=(),
+                        contract_delta=selected.contract_delta,
+                        resource_delta=selected.resource_delta,
                     )
-                    break
+                )
             if validation.reasons:
                 hard_physical_accepted += 1
             current_phase = self.phase_gate.active_phase(
@@ -298,6 +350,16 @@ class VNextSolver:
             if phase_record.transition_type == "fail":
                 phase_gate_bypass += 1
             phase_records.append(phase_record)
+            staging_records.extend(
+                self.staging.records_for_selected(
+                    case_id=state.case_id,
+                    hook_index=state.hook_index,
+                    phase=current_phase,
+                    envelope=envelope,
+                    resource_delta=selected.resource_delta,
+                    phase_permission=phase_permission,
+                )
+            )
             previous_phase = current_phase
             start_operation_index = len(operations) + 1
             operations.extend(self.physical.operation_rows(envelope.candidate, validation, start_operation_index))
@@ -323,18 +385,6 @@ class VNextSolver:
             ]
             if business_lines:
                 state.last_business_remote = business_lines[-1] in legacy.REMOTE_INTERACTION_LINES
-            if envelope.resource_request.restored_borrowed_blockers:
-                restored_key = tuple(sorted(envelope.resource_request.restored_borrowed_blockers))
-                state.borrowed_blocker_debts.pop(restored_key, None)
-            if envelope.resource_request.borrowed_blockers:
-                debt_key = tuple(sorted(envelope.resource_request.borrowed_blockers))
-                state.borrowed_blocker_debts[debt_key] = BorrowedBlockerDebt(
-                    debt_key=debt_key,
-                    blocker_nos=debt_key,
-                    origin_line=envelope.candidate.source_line,
-                    owner_contract_id=envelope.contract.contract_id,
-                    opened_hook_index=state.hook_index,
-                )
             state.accepted_candidate_ids.add(envelope.candidate.candidate_id)
             state.hook_index += 1
 
@@ -401,7 +451,7 @@ class VNextSolver:
             orphan_resource_request_count=0,
             hard_physical_violation_accepted_count=hard_physical_accepted,
         )
-        return result, traces, operations, phase_records, frontier_records
+        return result, traces, operations, phase_records, frontier_records, staging_records
 
 
 def write_artifacts(
@@ -410,12 +460,14 @@ def write_artifacts(
     traces: list[StepTrace],
     phase_records: list[PhaseGateRecord],
     frontier_records: list[AccessFrontierRecord],
+    staging_records: list[StagingIntentRecord],
 ) -> None:
     adapter = legacy.PhysicalAdapter()
     adapter.write_csv(output_dir / "case_summary.csv", [asdict(row) for row in results])
     adapter.write_csv(output_dir / "step_trace.csv", [asdict(row) for row in traces])
     adapter.write_csv(output_dir / "phase_gate_records.csv", [asdict(row) for row in phase_records])
     adapter.write_csv(output_dir / "access_frontier_records.csv", [asdict(row) for row in frontier_records])
+    adapter.write_csv(output_dir / "staging_intent_records.csv", [asdict(row) for row in staging_records])
     route_blocked_counts = [row.route_blocked_line_count for row in frontier_records]
     serial_blocker_counts = [row.serial_blocker_line_count for row in frontier_records]
     summary = {
@@ -432,6 +484,7 @@ def write_artifacts(
         "remote_business_transition_count": sum(row.remote_business_transition_count for row in results),
         "phase_gate_record_count": len(phase_records),
         "access_frontier_record_count": len(frontier_records),
+        "staging_intent_record_count": len(staging_records),
         "max_route_blocked_line_count": max(route_blocked_counts, default=0),
         "max_serial_blocker_line_count": max(serial_blocker_counts, default=0),
     }

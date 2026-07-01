@@ -12,11 +12,109 @@ if str(SCRIPT_DIR) not in sys.path:
 import generate_physical_runtime_trace as legacy  # noqa: E402
 
 
+_original_car_no = legacy.car_no
+_original_normalize_line = legacy.normalize_line
+_original_active_serial_blockers_for_line = legacy.active_serial_blockers_for_line
+_original_occupied_lines_for_route = legacy.occupied_lines_for_route
+_original_cars_by_line = legacy.cars_by_line
+_normalize_line_cache: dict[Any, str] = {}
+
+
+def _fast_car_no(car: dict[str, Any]) -> str:
+    try:
+        return car["_No"]
+    except KeyError:
+        return _original_car_no(car)
+
+
+def _cached_normalize_line(value: Any) -> str:
+    try:
+        cached = _normalize_line_cache.get(value)
+    except TypeError:
+        return _original_normalize_line(value)
+    if cached is not None:
+        return cached
+    normalized = _original_normalize_line(value)
+    _normalize_line_cache[value] = normalized
+    return normalized
+
+
+def _fast_active_serial_blockers_for_line(
+    line: str,
+    cars: list[dict[str, Any]],
+    moving_nos: set[str],
+) -> list[tuple[str, list[str]]]:
+    normalized_line = legacy.normalize_line(line)
+    occupied_by_line: dict[str, list[str]] = {}
+    try:
+        ordered_cars = sorted(cars, key=lambda item: (item["Line"], int(item.get("Position") or 0), item["_No"]))
+        for car in ordered_cars:
+            no = car["_No"]
+            car_line = car["Line"]
+            if not car_line or no in moving_nos:
+                continue
+            occupied_by_line.setdefault(car_line, []).append(no)
+    except KeyError:
+        return _original_active_serial_blockers_for_line(line, cars, moving_nos)
+
+    blockers: list[tuple[str, list[str]]] = []
+    seen_blocker_lines: set[str] = set()
+    pending = [normalized_line]
+    seen_lines: set[str] = set()
+    while pending:
+        blocked_line = pending.pop(0)
+        if blocked_line in seen_lines:
+            continue
+        seen_lines.add(blocked_line)
+        for blocker_line in legacy.SERIAL_LINE_BLOCKERS.get(blocked_line, ()):
+            blocker_nos = occupied_by_line.get(blocker_line, [])
+            if blocker_nos and blocker_line not in seen_blocker_lines:
+                blockers.append((blocker_line, blocker_nos))
+                seen_blocker_lines.add(blocker_line)
+            pending.append(blocker_line)
+    return blockers
+
+
+def _fast_occupied_lines_for_route(cars: list[dict[str, Any]], moving_nos: set[str]) -> set[str]:
+    try:
+        return {car["Line"] for car in cars if car["Line"] and car["_No"] not in moving_nos}
+    except KeyError:
+        return _original_occupied_lines_for_route(cars, moving_nos)
+
+
+def _fast_cars_by_line(cars: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    try:
+        for car in cars:
+            grouped.setdefault(car["Line"], []).append(car)
+        for line_cars in grouped.values():
+            line_cars.sort(key=lambda item: (int(item.get("Position") or 0), item["_No"]))
+        return grouped
+    except KeyError:
+        return _original_cars_by_line(cars)
+
+
+legacy.car_no = _fast_car_no
+legacy.normalize_line = _cached_normalize_line
+legacy.active_serial_blockers_for_line = _fast_active_serial_blockers_for_line
+legacy.occupied_lines_for_route = _fast_occupied_lines_for_route
+legacy.cars_by_line = _fast_cars_by_line
+
 REMOTE_INTERACTION_LINES = legacy.REMOTE_INTERACTION_LINES
 DEPOT_LINES = legacy.DEPOT_LINES
 DEPOT_TARGET_LINES = legacy.DEPOT_TARGET_LINES
 FRONT_SERVICE_TARGET_LINES = legacy.FRONT_SERVICE_TARGET_LINES
 RUNNING_LINES = legacy.RUNNING_LINES
+
+_access_order_cache: dict[tuple[int, int, str, str, str], list[dict[str, Any]]] = {}
+_unsatisfied_cache: dict[tuple[int, int], tuple[dict[str, Any], ...]] = {}
+_line_loads_cache: dict[int, Any] = {}
+
+
+def clear_access_order_cache() -> None:
+    _access_order_cache.clear()
+    _unsatisfied_cache.clear()
+    _line_loads_cache.clear()
 
 
 def read_case(path: Path) -> tuple[str, dict[str, Any], list[dict[str, Any]], Any, Any]:
@@ -58,7 +156,13 @@ def car_is_satisfied(car: dict[str, Any], depot_assignment: Any, cars: list[dict
 
 
 def unsatisfied_cars(cars: list[dict[str, Any]], depot_assignment: Any) -> list[dict[str, Any]]:
-    return legacy.unsatisfied_cars(cars, depot_assignment)
+    key = (id(cars), id(depot_assignment))
+    cached = _unsatisfied_cache.get(key)
+    if cached is not None:
+        return list(cached)
+    unsatisfied = tuple(legacy.unsatisfied_cars(cars, depot_assignment))
+    _unsatisfied_cache[key] = unsatisfied
+    return list(unsatisfied)
 
 
 def state_signature(cars: list[dict[str, Any]], loco_location: Any) -> tuple[str, str, tuple[tuple[str, str, int], ...]]:
@@ -66,7 +170,12 @@ def state_signature(cars: list[dict[str, Any]], loco_location: Any) -> tuple[str
 
 
 def line_loads(cars: list[dict[str, Any]]) -> Any:
-    return legacy.line_loads(cars)
+    key = id(cars)
+    cached = _line_loads_cache.get(key)
+    if cached is None:
+        cached = legacy.line_loads(cars)
+        _line_loads_cache[key] = cached
+    return cached.copy()
 
 
 def cars_by_line(cars: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -80,11 +189,23 @@ def line_cars_in_access_order(
     graph: Any,
     loco_location: Any,
 ) -> list[dict[str, Any]]:
-    return legacy.line_cars_in_access_order(
+    key = (
+        id(cars),
+        id(graph),
+        line,
+        str(getattr(loco_location, "line", "")),
+        str(getattr(loco_location, "node", "")),
+    )
+    cached = _access_order_cache.get(key)
+    if cached is not None:
+        return list(cached)
+    ordered = legacy.line_cars_in_access_order(
         cars=cars,
         line=line,
         access_context=legacy.PhysicalAccessContext(graph=graph, loco_location=loco_location),
     )
+    _access_order_cache[key] = list(ordered)
+    return ordered
 
 
 def pull_equivalent(cars: list[dict[str, Any]]) -> int:

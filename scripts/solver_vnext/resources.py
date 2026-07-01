@@ -4,8 +4,8 @@ from typing import Any
 
 from . import legacy_adapter as legacy
 from . import serial
-from .domain import BorrowedBlockerDebt, ContractFamily
-from .domain import CandidateEnvelope, IntentKind, ResourceDelta, ResourceKind, ResourceRequest
+from .domain import ContractFamily
+from .domain import CandidateEnvelope, ResourceDelta, ResourceKind, ResourceRequest
 
 
 class StationResourceGraph:
@@ -39,24 +39,18 @@ class StationResourceGraph:
             for line in tuple(dict.fromkeys((*touched_lines, *put_lines)))
         ):
             resources.append(ResourceKind.SERIAL_LINE_GATE)
-        target_line = (
-            envelope.resource_request.target_line
-            if envelope.intent == IntentKind.SOURCE_CLEAR_RESTORE
-            else candidate.target_line
-        )
         return ResourceRequest(
             contract_id=envelope.contract.contract_id,
             family=envelope.contract.family,
             candidate_id=candidate.candidate_id,
             resources=tuple(dict.fromkeys(resources)),
             source_line=candidate.source_line,
-            target_line=target_line,
+            target_line=envelope.resource_request.target_line or candidate.target_line,
             move_nos=tuple(candidate.move_car_nos),
             touched_lines=touched_lines,
             put_lines=put_lines,
             intent=envelope.intent,
-            borrowed_blockers=envelope.resource_request.borrowed_blockers,
-            restored_borrowed_blockers=envelope.resource_request.restored_borrowed_blockers,
+            same_plan_restore_nos=envelope.resource_request.same_plan_restore_nos,
         )
 
     def acquire(
@@ -67,7 +61,6 @@ class StationResourceGraph:
         validation: Any,
         cars: list[dict[str, Any]],
         depot_assignment: Any,
-        borrowed_debts: dict[tuple[str, ...], BorrowedBlockerDebt] | None = None,
     ) -> ResourceDelta:
         violations: list[str] = []
         if validation.reasons:
@@ -98,20 +91,9 @@ class StationResourceGraph:
             ContractFamily.DEPOT_OUTBOUND,
         }:
             violations.append("depot_outer_requires_depot_owner")
-        if request.intent == IntentKind.BLOCKER_CLEAR:
-            moved = {legacy.car_no(car): car for car in cars if legacy.car_no(car) in set(request.move_nos)}
-            loads = legacy.line_loads(cars)
-            for no, car in moved.items():
-                target_line, _position, _reason = legacy.planned_target_for_car(car, cars, depot_assignment, loads)
-                if target_line and target_line != request.target_line:
-                    violations.append(f"blocker_has_own_target:{no}:{target_line}")
-        if request.intent in {IntentKind.BORROWED_BLOCKER_CLEAR, IntentKind.DEPOT_OUTER_CLEAR}:
-            debt_key = tuple(sorted(request.borrowed_blockers or request.move_nos))
-            if borrowed_debts and debt_key in borrowed_debts:
-                violations.append("borrowed_blocker_debt_already_open:" + ",".join(debt_key))
         released = (
             ()
-            if request.intent == IntentKind.SOURCE_CLEAR_RESTORE
+            if request.same_plan_restore_nos
             else (request.source_line,) if request.source_line != request.target_line else ()
         )
         return ResourceDelta(

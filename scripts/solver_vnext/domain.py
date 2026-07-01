@@ -29,12 +29,7 @@ class IntentKind(str, Enum):
     REMOTE_DEPOT = "REMOTE_DEPOT"
     SHORT_CHAIN_DEPOT = "SHORT_CHAIN_DEPOT"
     TAIL_CLOSEOUT = "TAIL_CLOSEOUT"
-    SOURCE_CLEAR_RESTORE = "SOURCE_CLEAR_RESTORE"
-    BLOCKER_CLEAR = "BLOCKER_CLEAR"
-    BORROWED_BLOCKER_CLEAR = "BORROWED_BLOCKER_CLEAR"
-    DEPOT_OUTER_CLEAR = "DEPOT_OUTER_CLEAR"
     DEPOT_REPACK = "DEPOT_REPACK"
-    BORROWED_BLOCKER_RESTORE = "BORROWED_BLOCKER_RESTORE"
 
 
 class ResourceKind(str, Enum):
@@ -95,17 +90,7 @@ class ResourceRequest:
     touched_lines: tuple[str, ...] = ()
     put_lines: tuple[str, ...] = ()
     intent: IntentKind | None = None
-    borrowed_blockers: tuple[str, ...] = ()
-    restored_borrowed_blockers: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class BorrowedBlockerDebt:
-    debt_key: tuple[str, ...]
-    blocker_nos: tuple[str, ...]
-    origin_line: str
-    owner_contract_id: str
-    opened_hook_index: int
+    same_plan_restore_nos: tuple[str, ...] = ()
 
 
 class PhaseKind(str, Enum):
@@ -187,7 +172,6 @@ class SolverState:
     hook_index: int = 1
     accepted_candidate_ids: set[str] = field(default_factory=set)
     visited_signatures: set[tuple[str, str, tuple[tuple[str, str, int], ...]]] = field(default_factory=set)
-    borrowed_blocker_debts: dict[tuple[str, ...], BorrowedBlockerDebt] = field(default_factory=dict)
     remote_session_open: bool = False
     last_business_remote: bool | None = None
 
@@ -213,8 +197,7 @@ class StepTrace:
     touched_lines: str
     put_lines: str
     move_nos: str
-    borrowed_blockers: str
-    restored_borrowed_blockers: str
+    same_plan_restore_nos: str
     gate_accepted: bool
     selected: bool
     gate_reason: str

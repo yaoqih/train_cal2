@@ -37,6 +37,7 @@ DEPOT_INNER_BLOCKERS = {
     f"修{index}库内": f"修{index}库外"
     for index in range(1, 5)
 }
+CUN5_SPLIT_NODE = "存5标识桩分界"
 # Internal line keys follow the existing runtime model. LINE_FULL_NAMES records
 # the full table names used by operations for diagnostics and new rules.
 LINE_FULL_NAMES = {
@@ -106,7 +107,7 @@ SERIAL_ROUTE_EDGE_BLOCKERS: dict[frozenset[str], tuple[str, ...]] = {
     frozenset(("L7", "调梁棚")): ("调梁线北",),
     frozenset(("Z4", "存4南")): ("存4线", "存3线"),
     frozenset(("L12", "存4南")): ("存4线", "存3线"),
-    frozenset(("L12", "存5线南")): ("存5线北",),
+    frozenset(("L2", CUN5_SPLIT_NODE)): ("存5线北",),
     frozenset(("L6", "机北2")): ("机北1",),
     frozenset(("L5", "机北2")): ("机北1",),
 }
@@ -391,8 +392,8 @@ LINE_ATTACHMENTS = {
     "存3线": ("L4", "Z4"),
     "存4线": ("L2", "Z4"),
     "存4南": ("Z4", "L12"),
-    "存5线北": ("L2",),
-    "存5线南": ("L12",),
+    "存5线北": ("L2", CUN5_SPLIT_NODE),
+    "存5线南": (CUN5_SPLIT_NODE,),
     "机北2": ("L5", "L6"),
     "机库线": ("L7",),
     "调梁线北": ("L7",),
@@ -421,6 +422,7 @@ SWITCH_EDGES = (
     ("L1", "L2", 37.0),
     ("L1", "L3", 45.5),
     ("L3", "L4", 45.4),
+    ("L2", CUN5_SPLIT_NODE, 367.0),
     ("L2", "L12", 626.3),
     ("L2", "Z4", 417.7),
     ("L4", "Z4", 359.2),
@@ -450,6 +452,7 @@ SWITCH_EDGE_TRACKS: dict[frozenset[str], tuple[str, ...]] = {
     frozenset(("L1", "L2")): ("渡1",),
     frozenset(("L1", "L3")): ("渡2",),
     frozenset(("L3", "L4")): ("渡3",),
+    frozenset(("L2", CUN5_SPLIT_NODE)): ("存5线北",),
     frozenset(("L2", "L12")): ("存4线", "存4南"),
     frozenset(("L2", "Z4")): ("存4线",),
     frozenset(("L4", "Z4")): ("存3线",),
@@ -3662,6 +3665,10 @@ def candidate_positions_available(
 def line_length_load(cars: list[dict[str, Any]], line: str, excluded_nos: set[str] | None = None) -> float:
     excluded_nos = excluded_nos or set()
     return sum(car_length(car) for car in cars if car["Line"] == line and car_no(car) not in excluded_nos)
+
+
+def train_length_for_nos(cars: list[dict[str, Any]], nos: set[str]) -> float:
+    return sum(car_length(car) for car in cars if car_no(car) in nos)
 
 
 def pre_repair_reversal_available_length(cars: list[dict[str, Any]], moving_nos: set[str]) -> float:
@@ -9904,7 +9911,7 @@ class PhysicalValidator:
                     path,
                     working_cars,
                     step_nos | carried,
-                    sum(car_length(car) for car in step_cars),
+                    train_length_for_nos(working_cars, step_nos | carried),
                 ))
                 if reasons:
                     break
@@ -9956,7 +9963,7 @@ class PhysicalValidator:
                     path,
                     working_cars,
                     carried,
-                    sum(car_length(car) for car in batch),
+                    train_length_for_nos(working_cars, carried),
                 ))
                 if reasons:
                     break
@@ -10021,7 +10028,7 @@ class PhysicalValidator:
                 if not path:
                     reasons.append("weigh_route_blocked_by_occupied_line" if static_path else "weigh_route_missing")
                     break
-                train_length = sum(car_length(by_no[no]) for no in carried if no in by_no)
+                train_length = train_length_for_nos(working_cars, carried)
                 reasons.extend(pre_repair_reversal_reasons(path, working_cars, carried, train_length))
                 if reasons:
                     break

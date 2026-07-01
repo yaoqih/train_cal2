@@ -10,7 +10,9 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from generate_physical_runtime_trace import (  # noqa: E402
+    CUN5_SPLIT_NODE,
     LOCO_LENGTH_M,
+    PlanStep,
     PhysicalValidator,
     SERIAL_LINE_BLOCKERS,
     TrackGraph,
@@ -50,6 +52,22 @@ def candidate(source: str, target: str, cars: list[dict[str, object]], kind: str
         planned_positions={str(batch[0]["No"]): 1},
         generation_reason="serial_line_blocking_test",
         candidate_kind=kind,
+    )
+
+
+def planlet_candidate(batch: list[dict[str, object]], steps: tuple[PlanStep, ...]):
+    first_line = next((step.line for step in steps if step.action == "Get"), str(batch[0]["Line"]))
+    last_line = next((step.line for step in reversed(steps) if step.action == "Put"), first_line)
+    return hook_candidate(
+        case_id="SERIAL",
+        hook_index=2,
+        source_line=first_line,
+        target_line=last_line,
+        batch=batch,
+        planned_positions={},
+        generation_reason="serial_line_blocking_planlet_test",
+        candidate_kind="audit_planlet",
+        plan_steps=steps,
     )
 
 
@@ -152,6 +170,18 @@ def test_serial_blockers_do_not_overblock_unrelated_detour_routes() -> None:
     assert path == ["存2线", "L4", "Z3", "Z2", "Z1", "L6", "L7", "机库线"]
 
 
+def test_cun5_south_is_operated_from_north_split_not_l12() -> None:
+    graph = TrackGraph()
+
+    assert line_end_node("存5线南", "North") == CUN5_SPLIT_NODE
+    assert line_end_node("存5线南", "South") == CUN5_SPLIT_NODE
+
+    path_from_l12 = graph.route("L12", "存5线南")
+    assert path_from_l12[-2:] == [CUN5_SPLIT_NODE, "存5线南"]
+    assert "L2" in path_from_l12[: path_from_l12.index(CUN5_SPLIT_NODE)]
+    assert graph.route_avoiding_occupied("存2线", "存5线南", {"存5线北"}) == []
+
+
 def test_pre_repair_remaining_length_is_required_for_detour_reversal() -> None:
     moving = car("M", "存2线", 1, "机库线")
     blocker = car("B", "机北1", 1, "机北1")
@@ -164,6 +194,53 @@ def test_pre_repair_remaining_length_is_required_for_detour_reversal() -> None:
     blocked = validate(candidate("存2线", "机库线", [moving, blocker, filler]), [moving, blocker, filler])
     assert not blocked.accepted
     assert any(reason.startswith("pre_repair_reversal_length_violation:") for reason in blocked.reasons)
+
+
+def test_planlet_get_reversal_length_uses_whole_carried_train() -> None:
+    long_car = car("A", "存2线", 1, "存5线北")
+    long_car["Length"] = 120.0
+    next_car = car("B", "机库线", 1, "存5线北")
+    next_car["Length"] = 14.0
+    blocker = car("C", "机北1", 1, "机北1")
+    filler = car("P", "预修线", 1, "预修线")
+    filler["Length"] = 160.0
+    cars = [long_car, next_car, blocker, filler]
+    cand = planlet_candidate(
+        [long_car, next_car],
+        (
+            PlanStep("Get", "存2线", ("A",)),
+            PlanStep("Get", "机库线", ("B",)),
+            PlanStep("Put", "存5线北", ("A", "B"), {"A": 1, "B": 2}),
+        ),
+    )
+
+    result = validate(cand, cars)
+    assert not result.accepted
+    assert any(reason.startswith("pre_repair_reversal_length_violation:") for reason in result.reasons)
+
+
+def test_planlet_put_reversal_length_uses_whole_carried_train() -> None:
+    long_car = car("A", "存2线", 1, "存5线北")
+    long_car["Length"] = 120.0
+    put_car = car("B", "存2线", 2, "机库线")
+    put_car["Length"] = 14.0
+    blocker = car("C", "机北1", 1, "机北1")
+    filler = car("P", "预修线", 1, "预修线")
+    filler["Length"] = 160.0
+    cars = [long_car, put_car, blocker, filler]
+    cand = planlet_candidate(
+        [long_car, put_car],
+        (
+            PlanStep("Get", "存2线", ("A",)),
+            PlanStep("Get", "存2线", ("B",)),
+            PlanStep("Put", "机库线", ("B",), {"B": 1}),
+            PlanStep("Put", "存5线北", ("A",), {"A": 1}),
+        ),
+    )
+
+    result = validate(cand, cars)
+    assert not result.accepted
+    assert any(reason.startswith("pre_repair_reversal_length_violation:") for reason in result.reasons)
 
 
 def test_get_put_order_is_always_from_north_end() -> None:

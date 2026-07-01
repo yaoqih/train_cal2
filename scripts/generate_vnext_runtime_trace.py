@@ -15,6 +15,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="artifacts/vnext_runtime_trace")
     parser.add_argument("--case-id", nargs="*")
     parser.add_argument("--max-hooks", type=int, default=300)
+    parser.add_argument(
+        "--trace-all-candidates",
+        action="store_true",
+        help="Write rejected/non-selected candidate rows. Default writes selected steps only for faster full runs.",
+    )
+    parser.add_argument(
+        "--trace-frontier",
+        action="store_true",
+        help="Write per-hook AccessFrontier records. Useful for blocking diagnostics, slower on full runs.",
+    )
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()
 
@@ -28,19 +38,25 @@ def run(args: argparse.Namespace) -> int:
         wanted = {item.upper() for item in args.case_id}
         truth_paths = [path for path in truth_paths if legacy.case_id_from_path(path) in wanted]
 
-    solver = VNextSolver(max_hooks=args.max_hooks)
+    solver = VNextSolver(
+        max_hooks=args.max_hooks,
+        trace_all_candidates=args.trace_all_candidates,
+        trace_frontier=args.trace_frontier,
+    )
     results = []
     traces = []
     phase_records = []
     frontier_records = []
+    staging_records = []
     for truth_path in truth_paths:
-        result, case_traces, _operations, case_phase_records, case_frontier_records = solver.solve_case(truth_path, output_dir)
+        result, case_traces, _operations, case_phase_records, case_frontier_records, case_staging_records = solver.solve_case(truth_path, output_dir)
         results.append(result)
         traces.extend(case_traces)
         phase_records.extend(case_phase_records)
         frontier_records.extend(case_frontier_records)
+        staging_records.extend(case_staging_records)
 
-    write_artifacts(output_dir, results, traces, phase_records, frontier_records)
+    write_artifacts(output_dir, results, traces, phase_records, frontier_records, staging_records)
     completed = sum(1 for row in results if row.status == "completed")
     blocked = sum(1 for row in results if row.status == "blocked")
     print(

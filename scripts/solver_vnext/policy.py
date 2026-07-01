@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import legacy_adapter as legacy
-from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, IntentKind, PhaseKind, PhaseState, ResourceDelta, SolverState
+from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, PhaseKind, PhaseState, ResourceDelta, SolverState
 from .phase import HumanPhaseGate
 
 
@@ -36,10 +36,6 @@ class BaselinePolicy:
     Mechanisms generate and validate candidates.  This policy only chooses
     which contracts to consider first and how accepted candidates are ranked.
     """
-
-    SUPPORT_OPEN_CUN4_COUNT_MAX = 14
-    SUPPORT_OPEN_BATCH_MIN = 5
-    SUPPORT_OPEN_BATCH_MAX = 6
 
     def __init__(self) -> None:
         self.phase_gate = HumanPhaseGate()
@@ -156,8 +152,6 @@ class BaselinePolicy:
             return 0
         if self.releases_depot_slot(candidate, context):
             return 1
-        if self.supports_remote_depot_access(candidate, context):
-            return 2
         if self.digests_remote_session_batch(candidate, context):
             return 2
         if self.digests_depot_inbound_batch(candidate, context):
@@ -172,10 +166,7 @@ class BaselinePolicy:
         delta = candidate.contract_delta
         request = candidate.resource_delta.request
         if (
-            envelope.template_name in {
-                "depot_outbound_session",
-                "depot_port_release_outbound_session",
-            }
+            envelope.template_name == "depot_outbound_session"
             and envelope.contract.family == ContractFamily.REMOTE_SESSION
             and request.target_line == "存4线"
             and hook.source_line in legacy.REMOTE_INTERACTION_LINES
@@ -184,34 +175,6 @@ class BaselinePolicy:
         ):
             return True
         return False
-
-    def supports_remote_depot_access(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
-        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
-            return False
-        if not context.remote_session_open:
-            return False
-        envelope = candidate.envelope
-        request = candidate.resource_delta.request
-        delta = candidate.contract_delta
-        if envelope.intent not in {IntentKind.BORROWED_BLOCKER_CLEAR, IntentKind.DEPOT_OUTER_CLEAR}:
-            return False
-        if envelope.contract.family not in {
-            ContractFamily.REPAIR_INBOUND,
-            ContractFamily.DEPOT_SLOT,
-            ContractFamily.DEPOT_OUTBOUND,
-            ContractFamily.CUN4_PORT_STAGING,
-        }:
-            return False
-        if delta.contract_reduction != 0 or delta.support_gain <= 0 or delta.total_reduction < 0:
-            return False
-        if request.source_line != "调梁棚" or request.target_line != "存4线":
-            return False
-        if context.cun4_count > self.SUPPORT_OPEN_CUN4_COUNT_MAX:
-            return False
-        batch_size = len(envelope.candidate.move_car_nos)
-        if not self.SUPPORT_OPEN_BATCH_MIN <= batch_size <= self.SUPPORT_OPEN_BATCH_MAX:
-            return False
-        return True
 
     def releases_depot_slot(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         envelope = candidate.envelope
@@ -252,7 +215,6 @@ class BaselinePolicy:
             and envelope.template_name
             in {
                 "depot_multi_drop_accessible_prefix",
-                "borrowed_prefix_depot_multi_drop_restore",
                 "remote_session_directional_digest",
             }
             and (

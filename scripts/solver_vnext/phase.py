@@ -186,13 +186,7 @@ class HumanPhaseGate:
             resource_delta=resource_delta,
         ):
             return PhasePermission(True, "support", target_phase, "support_contract_allowed")
-        if resource_delta.request.intent in {
-            IntentKind.BORROWED_BLOCKER_CLEAR,
-            IntentKind.BLOCKER_CLEAR,
-            IntentKind.SOURCE_CLEAR_RESTORE,
-            IntentKind.DEPOT_OUTER_CLEAR,
-            IntentKind.DEPOT_REPACK,
-        } and contract_delta.effective_gain > 0:
+        if resource_delta.request.intent == IntentKind.DEPOT_REPACK and contract_delta.effective_gain > 0:
             return PhasePermission(True, "support", target_phase, "positive_support_delta")
         return PhasePermission(False, "veto_candidate", target_phase, "phase_family_not_allowed")
 
@@ -200,7 +194,7 @@ class HumanPhaseGate:
         family = envelope.contract.family
         request = resource_delta.request
         if (
-            envelope.template_name in {"depot_outbound_session", "depot_port_release_outbound_session"}
+            envelope.template_name == "depot_outbound_session"
             and family == ContractFamily.REMOTE_SESSION
             and not remote_session_open
         ):
