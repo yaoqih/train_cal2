@@ -11,7 +11,7 @@ from .placement import planned_positions_for_batch
 class TailDigestPlan:
     candidate: Any
     progressed_nos: tuple[str, ...]
-    restored_nos: tuple[str, ...]
+    source_return_nos: tuple[str, ...]
     put_lines: tuple[str, ...]
 
 
@@ -82,16 +82,16 @@ def build_tail_digest_planlet(
     if not progressed_nos:
         return None
 
-    restored_nos: tuple[str, ...] = ()
+    source_return_nos: tuple[str, ...] = ()
     if remaining:
         if not restore_remaining_to_source:
             return None
-        restored_nos = tuple(remaining)
+        source_return_nos = tuple(remaining)
         restored_positions = {
             no: int(next(car for car in prefix if legacy.car_no(car) == no).get("Position") or 0)
-            for no in restored_nos
+            for no in source_return_nos
         }
-        steps.append(legacy.plan_step("Put", source_line, restored_nos, restored_positions))
+        steps.append(legacy.plan_step("Put", source_line, source_return_nos, restored_positions))
         put_lines.append(source_line)
 
     candidate = legacy.build_planlet_candidate(
@@ -107,6 +107,6 @@ def build_tail_digest_planlet(
     return TailDigestPlan(
         candidate=candidate,
         progressed_nos=tuple(progressed_nos),
-        restored_nos=restored_nos,
+        source_return_nos=source_return_nos,
         put_lines=tuple(dict.fromkeys(put_lines)),
     )

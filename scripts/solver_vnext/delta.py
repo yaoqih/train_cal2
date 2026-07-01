@@ -47,8 +47,8 @@ def build_contract_delta(
     if serial_releases:
         support_gain = max(support_gain, len(serial_releases))
         reduced.append("serial_line_gate_released")
-    if envelope.resource_request.same_plan_restore_nos:
-        fulfilled.append("same_plan_prefix_restored")
+    if envelope.resource_request.same_plan_source_return_nos:
+        fulfilled.append("same_plan_prefix_returned_to_source")
     if envelope.intent == IntentKind.DEPOT_REPACK:
         reduced.append("depot_repack_ordered")
         if after_contract_debt < before_contract_debt:

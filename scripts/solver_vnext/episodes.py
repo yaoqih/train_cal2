@@ -39,7 +39,7 @@ class Episode:
             target_line=candidate.target_line,
             move_nos=tuple(candidate.move_car_nos),
             intent=self.intent,
-            same_plan_restore_nos=(),
+            same_plan_source_return_nos=(),
         )
         return CandidateEnvelope(
             candidate=candidate,
@@ -198,7 +198,7 @@ class DirectMoveEpisode(Episode):
             target_line=target_line,
             move_nos=tuple(plan.candidate.move_car_nos),
             intent=self.intent,
-            same_plan_restore_nos=plan.restored_nos,
+            same_plan_source_return_nos=plan.source_return_nos,
         )
         return CandidateEnvelope(
             candidate=plan.candidate,
@@ -721,7 +721,7 @@ class PrefixDigestEpisode(Episode):
             target_line=plan.candidate.target_line,
             move_nos=tuple(plan.candidate.move_car_nos),
             intent=self.intent,
-            same_plan_restore_nos=plan.restored_nos,
+            same_plan_source_return_nos=plan.source_return_nos,
         )
         yield CandidateEnvelope(
             candidate=plan.candidate,
@@ -875,7 +875,7 @@ class DepotRepackWithInboundTailEpisode(Episode):
                 target_line=target_line,
                 move_nos=tuple(candidate.move_car_nos),
                 intent=self.intent,
-                same_plan_restore_nos=blocker_nos,
+                same_plan_source_return_nos=blocker_nos,
             )
             yield CandidateEnvelope(
                 candidate=candidate,

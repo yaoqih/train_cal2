@@ -50,7 +50,7 @@ class StationResourceGraph:
             touched_lines=touched_lines,
             put_lines=put_lines,
             intent=envelope.intent,
-            same_plan_restore_nos=envelope.resource_request.same_plan_restore_nos,
+            same_plan_source_return_nos=envelope.resource_request.same_plan_source_return_nos,
         )
 
     def acquire(
@@ -93,7 +93,7 @@ class StationResourceGraph:
             violations.append("depot_outer_requires_depot_owner")
         released = (
             ()
-            if request.same_plan_restore_nos
+            if request.same_plan_source_return_nos
             else (request.source_line,) if request.source_line != request.target_line else ()
         )
         return ResourceDelta(

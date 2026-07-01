@@ -262,33 +262,6 @@ def build_direct_candidate(
     )
 
 
-def build_staging_candidate(
-    *,
-    case_id: str,
-    hook_index: int,
-    source_line: str,
-    preferred_target_line: str,
-    batch: list[dict[str, Any]],
-    cars: list[dict[str, Any]],
-    reason: str,
-    candidate_kind: str = "vnext_blocker_clear",
-    depot_aware_staging: bool = True,
-    staging_priority: tuple[str, ...] | None = None,
-) -> Any | None:
-    return legacy.staging_candidate_for_batch(
-        case_id=case_id,
-        hook_index=hook_index,
-        source_line=source_line,
-        preferred_target_line=preferred_target_line,
-        batch=batch,
-        cars=cars,
-        reason=reason,
-        candidate_kind=candidate_kind,
-        depot_aware_staging=depot_aware_staging,
-        staging_priority=staging_priority or legacy.STAGING_LINE_PRIORITY,
-    )
-
-
 def build_planlet_candidate(
     *,
     case_id: str,

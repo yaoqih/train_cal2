@@ -11,7 +11,7 @@ from .placement import planned_positions_for_batch
 class PrefixAccessLeasePlan:
     candidate: Any
     progressed_nos: tuple[str, ...]
-    restored_nos: tuple[str, ...]
+    source_return_nos: tuple[str, ...]
 
 
 def build_prefix_access_lease_planlet(
@@ -80,5 +80,5 @@ def build_prefix_access_lease_planlet(
     return PrefixAccessLeasePlan(
         candidate=candidate,
         progressed_nos=target_nos,
-        restored_nos=blocker_nos,
+        source_return_nos=blocker_nos,
     )

@@ -90,7 +90,7 @@ class ResourceRequest:
     touched_lines: tuple[str, ...] = ()
     put_lines: tuple[str, ...] = ()
     intent: IntentKind | None = None
-    same_plan_restore_nos: tuple[str, ...] = ()
+    same_plan_source_return_nos: tuple[str, ...] = ()
 
 
 class PhaseKind(str, Enum):
@@ -197,7 +197,7 @@ class StepTrace:
     touched_lines: str
     put_lines: str
     move_nos: str
-    same_plan_restore_nos: str
+    same_plan_source_return_nos: str
     gate_accepted: bool
     selected: bool
     gate_reason: str

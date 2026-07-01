@@ -46,7 +46,7 @@ class StagingIntentBuilder:
         records: list[StagingIntentRecord] = []
         request = resource_delta.request
         target_phase = phase_permission.target_phase
-        if request.same_plan_restore_nos:
+        if request.same_plan_source_return_nos:
             records.append(
                 self._record(
                     case_id=case_id,
@@ -56,10 +56,10 @@ class StagingIntentBuilder:
                     target_phase=target_phase,
                     envelope=envelope,
                     staging_line=request.source_line,
-                    vehicle_order=request.same_plan_restore_nos,
-                    expiry_condition="same_planlet_restore_required",
-                    release_condition="same_planlet_restores_unconsumed_prefix",
-                    reason="same_planlet_temporary_restore",
+                    vehicle_order=request.same_plan_source_return_nos,
+                    expiry_condition="same_planlet_source_return_required",
+                    release_condition="same_planlet_returns_unconsumed_prefix",
+                    reason="same_planlet_temporary_source_return",
                 )
             )
         records.extend(

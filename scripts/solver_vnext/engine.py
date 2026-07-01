@@ -62,7 +62,7 @@ def _trace_row(
         touched_lines="|".join(request.touched_lines),
         put_lines="|".join(request.put_lines),
         move_nos="|".join(candidate.move_car_nos),
-        same_plan_restore_nos="|".join(request.same_plan_restore_nos),
+        same_plan_source_return_nos="|".join(request.same_plan_source_return_nos),
         gate_accepted=gate_accepted,
         selected=selected,
         gate_reason=gate_reason,
