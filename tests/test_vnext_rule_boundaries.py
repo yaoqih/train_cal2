@@ -137,6 +137,62 @@ def test_weigh_requires_pending_tail_car() -> None:
     assert reasons and reasons[0].startswith("weigh_requires_pending_tail_car")
 
 
+def test_single_hook_weigh_requires_empty_weigh_line() -> None:
+    cars = [
+        car("W1", line="存1线", position=1, target_lines=["存2线"], weigh=True),
+        car("B1", line=physical.WEIGH_LINE, position=1, target_lines=[physical.WEIGH_LINE]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=2,
+        source_line="存1线",
+        target_line="存2线",
+        batch=[cars[0]],
+        planned_positions={"W1": 1},
+        generation_reason="test",
+        candidate_kind="target_move",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert not validation.accepted
+    assert f"weigh_line_not_empty:{physical.WEIGH_LINE}:B1" in validation.reasons
+
+
+def test_planlet_weigh_requires_empty_weigh_line() -> None:
+    cars = [
+        car("W1", line="存1线", position=1, target_lines=["存2线"], weigh=True),
+        car("B1", line=physical.WEIGH_LINE, position=1, target_lines=[physical.WEIGH_LINE]),
+    ]
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=3,
+        source_line="存1线",
+        target_line="存2线",
+        batch=[cars[0]],
+        steps=(
+            physical.plan_step("Get", "存1线", ("W1",)),
+            physical.plan_step("Weigh", physical.WEIGH_LINE, ("W1",)),
+            physical.plan_step("Put", "存2线", ("W1",), {"W1": 1}),
+        ),
+        reason="test",
+        candidate_kind="test_planlet",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert not validation.accepted
+    assert f"weigh_line_not_empty:{physical.WEIGH_LINE}:B1" in validation.reasons
+
+
 def test_reversal_triplet_rule_uses_loco_plus_train_length() -> None:
     static_cars = [car("B1", line="机北2", position=1)]
     reasons = physical.pre_repair_reversal_reasons(

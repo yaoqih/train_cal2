@@ -4,7 +4,6 @@ from typing import Any, Iterable
 
 from . import physical
 from . import release
-from . import remote_prefix
 from . import serial
 from .access import build_prefix_access_lease_planlet
 from .domain import CandidateEnvelope, ContractFamily, FlowContract, IntentKind, ResourceRequest
@@ -53,7 +52,6 @@ class Episode:
         graph: Any,
         loco_location: Any,
         serial_gate_leases: dict[str, Any] | None = None,
-        remote_prefix_leases: dict[str, Any] | None = None,
         contract: FlowContract,
     ) -> Iterable[CandidateEnvelope]:
         raise NotImplementedError
@@ -108,7 +106,6 @@ class DirectMoveEpisode(Episode):
         graph: Any,
         loco_location: Any,
         serial_gate_leases: dict[str, Any] | None = None,
-        remote_prefix_leases: dict[str, Any] | None = None,
         contract: FlowContract,
     ) -> Iterable[CandidateEnvelope]:
         by_no = {physical.car_no(car): car for car in cars}
@@ -146,7 +143,6 @@ class DirectMoveEpisode(Episode):
                 graph=graph,
                 loco_location=loco_location,
                 serial_gate_leases=serial_gate_leases or {},
-                remote_prefix_leases=remote_prefix_leases or {},
             )
             if access_envelope:
                 yield access_envelope
@@ -247,7 +243,6 @@ class DirectMoveEpisode(Episode):
             graph=graph,
             loco_location=loco_location,
             serial_gate_leases=serial_gate_leases or {},
-            remote_prefix_leases=remote_prefix_leases or {},
         )
         if access_envelope:
             yield access_envelope
@@ -266,7 +261,6 @@ class DirectMoveEpisode(Episode):
         graph: Any,
         loco_location: Any,
         serial_gate_leases: dict[str, Any] | None = None,
-        remote_prefix_leases: dict[str, Any] | None = None,
     ) -> CandidateEnvelope | None:
         contract_nos = set(contract.subject_nos)
         blocker_batch: list[dict[str, Any]] = []
@@ -372,225 +366,7 @@ class RemoteDepotEpisode(DirectMoveEpisode):
     def applies(self, contract: FlowContract) -> bool:
         return contract.family in self.allowed_families
 
-    def _prefix_access_lease_envelope(
-        self,
-        *,
-        case_id: str,
-        hook_index: int,
-        cars: list[dict[str, Any]],
-        depot_assignment: Any,
-        contract: FlowContract,
-        line_cars: list[dict[str, Any]],
-        source_line: str,
-        target_line: str,
-        graph: Any,
-        loco_location: Any,
-        serial_gate_leases: dict[str, Any] | None = None,
-        remote_prefix_leases: dict[str, Any] | None = None,
-    ) -> CandidateEnvelope | None:
-        return None
-        if remote_prefix.lease_key(source_line) in (remote_prefix_leases or {}):
-            return None
-        blocker_batch, target_batch = self._source_access_batch(line_cars, contract)
-        if not blocker_batch or not target_batch:
-            return None
-        if any(car.get("IsWeigh") for car in blocker_batch):
-            return None
-        if spotting_nonforced_prefix_would_pollute(
-            contract=contract,
-            target_line=target_line,
-            batch=target_batch,
-            cars=cars,
-            depot_assignment=depot_assignment,
-        ):
-            return None
-
-        blocker_nos = tuple(physical.car_no(car) for car in blocker_batch)
-        debt_nos = remote_prefix.open_debt_nos(
-            contract,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            moving_nos=set(blocker_nos),
-        )
-        if not debt_nos:
-            return None
-
-        for staging_line in self._remote_prefix_staging_lines(
-            source_line=source_line,
-            target_line=target_line,
-            blocker_batch=blocker_batch,
-            cars=cars,
-            depot_assignment=depot_assignment,
-        ):
-            candidate = self._remote_prefix_open_candidate(
-                case_id=case_id,
-                hook_index=hook_index,
-                source_line=source_line,
-                staging_line=staging_line,
-                blocker_batch=blocker_batch,
-                debt_nos=debt_nos,
-                cars=cars,
-                depot_assignment=depot_assignment,
-                graph=graph,
-                loco_location=loco_location,
-                serial_gate_leases=serial_gate_leases or {},
-                contract=contract,
-            )
-            if candidate is None:
-                continue
-            request = ResourceRequest(
-                contract_id=contract.contract_id,
-                family=contract.family,
-                candidate_id=candidate.candidate_id,
-                resources=(),
-                source_line=source_line,
-                target_line=source_line,
-                move_nos=tuple(candidate.move_car_nos),
-                intent=IntentKind.REMOTE_PREFIX_LEASE,
-                same_plan_source_return_nos=(),
-            )
-            return CandidateEnvelope(
-                candidate=candidate,
-                contract=contract,
-                intent=IntentKind.REMOTE_PREFIX_LEASE,
-                resource_request=request,
-                template_name="remote_prefix_lease_open",
-            )
-        return None
-
-    def _remote_prefix_open_candidate(
-        self,
-        *,
-        case_id: str,
-        hook_index: int,
-        source_line: str,
-        staging_line: str,
-        blocker_batch: list[dict[str, Any]],
-        debt_nos: tuple[str, ...],
-        cars: list[dict[str, Any]],
-        depot_assignment: Any,
-        graph: Any,
-        loco_location: Any,
-        serial_gate_leases: dict[str, Any],
-        contract: FlowContract,
-    ) -> Any | None:
-        blocker_nos = tuple(physical.car_no(car) for car in blocker_batch)
-        positions = planned_positions_for_batch(
-            batch=blocker_batch,
-            target_line=staging_line,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            batch_nos=set(blocker_nos),
-        )
-        if len(positions) != len(blocker_batch):
-            return None
-        grouped = physical.cars_by_line(cars)
-        if not physical.candidate_positions_available(staging_line, positions, cars, set(blocker_nos), grouped):
-            return None
-        if not physical.line_has_length_capacity(staging_line, cars, blocker_batch, set(blocker_nos), grouped=grouped):
-            return None
-        steps = (
-            physical.plan_step("Get", source_line, blocker_nos),
-            physical.plan_step("Put", staging_line, blocker_nos, positions),
-        )
-        validation = self.frontier.plan_steps_reachability(
-            steps=steps,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            graph=graph,
-            loco_location=loco_location,
-            serial_gate_leases=serial_gate_leases,
-            candidate_kind="vnext_remote_prefix_lease_open",
-        )
-        if not validation.accepted:
-            return None
-        candidate = physical.build_planlet_candidate(
-            case_id=case_id,
-            hook_index=hook_index,
-            source_line=source_line,
-            target_line=staging_line,
-            batch=blocker_batch,
-            steps=steps,
-            reason=(
-                f"vnext:remote_prefix_lease_open;owner_contract={contract.contract_id};"
-                f"source={source_line};staging={staging_line};"
-                f"blockers={','.join(blocker_nos)};debt={','.join(debt_nos[:8])}"
-            ),
-            candidate_kind="vnext_remote_prefix_lease_open",
-        )
-        projected = [dict(car) for car in cars]
-        physical.apply_candidate(candidate, projected, validation)
-        projected_by_no = {physical.car_no(car): car for car in projected}
-        if any(
-            not physical.car_is_satisfied(projected_by_no[no], depot_assignment, projected)
-            for no in blocker_nos
-            if no in projected_by_no
-        ):
-            return None
-        return candidate
-
-    def _remote_prefix_staging_lines(
-        self,
-        *,
-        source_line: str,
-        target_line: str,
-        blocker_batch: list[dict[str, Any]],
-        cars: list[dict[str, Any]],
-        depot_assignment: Any,
-    ) -> tuple[str, ...]:
-        loads = physical.line_loads(cars)
-        target_lines = {
-            physical.planned_target_for_car(car, cars, depot_assignment, loads)[0]
-            for car in blocker_batch
-        }
-        if len(target_lines) != 1:
-            return ()
-        blocker_target = next(iter(target_lines))
-        if not blocker_target or blocker_target in {source_line, target_line}:
-            return ()
-        if blocker_target in physical.RUNNING_LINES or blocker_target not in physical.TRACK_SPECS:
-            return ()
-        return (blocker_target,)
-
-
-class RemotePrefixLeaseServiceEpisode(DirectMoveEpisode):
-    intent = IntentKind.REMOTE_DEPOT
-    template_name = "remote_prefix_lease_service"
-    allowed_families = {ContractFamily.REPAIR_INBOUND, ContractFamily.DEPOT_SLOT, ContractFamily.DEPOT_OUTBOUND}
-
-    def applies(self, contract: FlowContract) -> bool:
-        return contract.family in self.allowed_families
-
-    def generate(
-        self,
-        *,
-        case_id: str,
-        hook_index: int,
-        cars: list[dict[str, Any]],
-        depot_assignment: Any,
-        graph: Any,
-        loco_location: Any,
-        serial_gate_leases: dict[str, Any] | None = None,
-        remote_prefix_leases: dict[str, Any] | None = None,
-        contract: FlowContract,
-    ) -> Iterable[CandidateEnvelope]:
-        source_line = contract.source_lines[0]
-        lease = (remote_prefix_leases or {}).get(remote_prefix.lease_key(source_line))
-        if not lease or not remote_prefix.lease_has_owner_debt(lease, contract, cars, depot_assignment):
-            return
-        yield from super().generate(
-            case_id=case_id,
-            hook_index=hook_index,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            graph=graph,
-            loco_location=loco_location,
-            serial_gate_leases=serial_gate_leases or {},
-            remote_prefix_leases=remote_prefix_leases or {},
-            contract=contract,
-        )
-
-    def _prefix_access_lease_envelope(self, **kwargs: Any) -> CandidateEnvelope | None:
+    def _prefix_access_lease_envelope(self, **_: Any) -> CandidateEnvelope | None:
         return None
 
 

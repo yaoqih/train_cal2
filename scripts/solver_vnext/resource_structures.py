@@ -6,10 +6,9 @@ from typing import Any
 
 from . import physical
 from . import release
-from . import remote_prefix
 from . import serial
 from .contracts import build_car_refs
-from .domain import ContractFamily, IntentKind, RemotePrefixLease, SerialGateLease
+from .domain import ContractFamily, IntentKind, SerialGateLease
 
 
 @dataclass(frozen=True)
@@ -34,10 +33,8 @@ def hook_resource_records(
     cars: list[dict[str, Any]],
     depot_assignment: Any,
     serial_gate_leases: dict[str, SerialGateLease] | None = None,
-    remote_prefix_leases: dict[str, RemotePrefixLease] | None = None,
 ) -> list[ResourceStructureRecord]:
     serial_gate_leases = serial_gate_leases or {}
-    remote_prefix_leases = remote_prefix_leases or {}
     return [
         _cun4_record(case_id=case_id, hook_index=hook_index, cars=cars, depot_assignment=depot_assignment),
         _depot_slot_record(case_id=case_id, hook_index=hook_index, cars=cars, depot_assignment=depot_assignment),
@@ -47,13 +44,6 @@ def hook_resource_records(
             cars=cars,
             depot_assignment=depot_assignment,
             serial_gate_leases=serial_gate_leases,
-        ),
-        _remote_prefix_record(
-            case_id=case_id,
-            hook_index=hook_index,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            remote_prefix_leases=remote_prefix_leases,
         ),
     ]
 
@@ -69,7 +59,6 @@ def selected_resource_records(
     resource_delta: Any,
     contract_delta: Any,
     serial_gate_leases: dict[str, SerialGateLease],
-    remote_prefix_leases: dict[str, RemotePrefixLease],
 ) -> list[ResourceStructureRecord]:
     records = [
         _loco_carry_record(
@@ -105,12 +94,6 @@ def selected_resource_records(
             envelope=envelope,
             resource_delta=resource_delta,
         ),
-        _remote_prefix_lease_record(
-            case_id=case_id,
-            hook_index=hook_index,
-            envelope=envelope,
-            contract_delta=contract_delta,
-        ),
     ]
     records.extend(
         _serial_gate_lifecycle_records(
@@ -122,18 +105,6 @@ def selected_resource_records(
             envelope=envelope,
             contract_delta=contract_delta,
             serial_gate_leases=serial_gate_leases,
-        )
-    )
-    records.extend(
-        _remote_prefix_lifecycle_records(
-            case_id=case_id,
-            hook_index=hook_index,
-            cars=cars,
-            prospective_cars=prospective_cars,
-            depot_assignment=depot_assignment,
-            envelope=envelope,
-            contract_delta=contract_delta,
-            remote_prefix_leases=remote_prefix_leases,
         )
     )
     return records
@@ -178,56 +149,6 @@ def next_serial_gate_leases(
                 blocker_nos=tuple(envelope.candidate.move_car_nos),
                 debt_nos=tuple(sorted(debt_nos)),
             )
-    return next_leases
-
-
-def next_remote_prefix_leases(
-    *,
-    case_id: str,
-    hook_index: int,
-    cars: list[dict[str, Any]],
-    prospective_cars: list[dict[str, Any]],
-    depot_assignment: Any,
-    envelope: Any,
-    contract_delta: Any,
-    remote_prefix_leases: dict[str, RemotePrefixLease],
-) -> dict[str, RemotePrefixLease]:
-    next_leases = dict(remote_prefix_leases)
-    for source_line, lease in list(next_leases.items()):
-        remaining = remote_prefix.remaining_debt_nos(
-            lease,
-            cars=prospective_cars,
-            depot_assignment=depot_assignment,
-        )
-        staged = remote_prefix.blockers_on_staging(lease, prospective_cars)
-        if not remaining or not staged:
-            del next_leases[source_line]
-
-    if envelope.intent == IntentKind.REMOTE_PREFIX_LEASE and "remote_prefix_lease_opened" in contract_delta.fulfilled:
-        source_line = envelope.candidate.source_line
-        steps = physical.candidate_plan_steps(envelope.candidate)
-        if len(steps) >= 2:
-            blocker_nos = tuple(steps[0].move_car_nos)
-            staging_line = steps[1].line
-            restore_positions = {
-                no: int(car.get("Position") or 0)
-                for car in cars
-                for no in (physical.car_no(car),)
-                if no in set(blocker_nos)
-            }
-            lease = remote_prefix.build_lease(
-                case_id=case_id,
-                hook_index=hook_index,
-                contract=envelope.contract,
-                source_line=source_line,
-                staging_line=staging_line,
-                blocker_nos=blocker_nos,
-                restore_positions=restore_positions,
-                cars=cars,
-                depot_assignment=depot_assignment,
-            )
-            if lease:
-                next_leases[remote_prefix.lease_key(source_line)] = lease
     return next_leases
 
 
@@ -362,49 +283,6 @@ def _serial_gate_record(
     )
 
 
-def _remote_prefix_record(
-    *,
-    case_id: str,
-    hook_index: int,
-    cars: list[dict[str, Any]],
-    depot_assignment: Any,
-    remote_prefix_leases: dict[str, RemotePrefixLease],
-) -> ResourceStructureRecord:
-    active: list[str] = []
-    refilled: list[str] = []
-    for source_line, lease in sorted(remote_prefix_leases.items()):
-        remaining = remote_prefix.remaining_debt_nos(
-            lease,
-            cars=cars,
-            depot_assignment=depot_assignment,
-        )
-        staged = remote_prefix.blockers_on_staging(lease, cars)
-        source_blockers = remote_prefix.blockers_on_source(lease, cars)
-        if remaining and source_blockers:
-            refilled.append(f"{source_line}:{','.join(source_blockers)}->{','.join(remaining[:8])}")
-        elif remaining and staged:
-            active.append(f"{source_line}:{','.join(staged)}->{','.join(remaining[:8])}")
-    if refilled:
-        mode = "refilled_before_served"
-    elif active:
-        mode = "active"
-    else:
-        mode = "clear"
-    return ResourceStructureRecord(
-        case_id=case_id,
-        hook_index=hook_index,
-        structure="REMOTE_PREFIX_LEASE",
-        status="fail" if refilled else "pass",
-        owner_contract_id="",
-        candidate_id="",
-        mode=mode,
-        resource_key="remote_prefix",
-        subject_nos="",
-        violation="remote_prefix_lease_refilled_before_debt_clear" if refilled else "",
-        detail="|".join(refilled or active),
-    )
-
-
 def _loco_carry_record(
     *,
     case_id: str,
@@ -466,30 +344,6 @@ def _serial_gate_lease_record(
         resource_key=envelope.candidate.source_line,
         subject_nos="|".join(envelope.candidate.move_car_nos),
         violation="" if status == "pass" else "serial_gate_clear_without_lease_delta",
-        detail="|".join((*contract_delta.fulfilled, *contract_delta.reduced)),
-    )
-
-
-def _remote_prefix_lease_record(
-    *,
-    case_id: str,
-    hook_index: int,
-    envelope: Any,
-    contract_delta: Any,
-) -> ResourceStructureRecord:
-    opened = envelope.intent == IntentKind.REMOTE_PREFIX_LEASE
-    status = "pass" if (not opened or "remote_prefix_lease_opened" in contract_delta.fulfilled) else "fail"
-    return ResourceStructureRecord(
-        case_id=case_id,
-        hook_index=hook_index,
-        structure="REMOTE_PREFIX_LEASE_DELTA",
-        status=status,
-        owner_contract_id=envelope.contract.contract_id,
-        candidate_id=envelope.candidate.candidate_id,
-        mode="opened" if opened else "not_applicable",
-        resource_key=envelope.candidate.source_line,
-        subject_nos="|".join(envelope.candidate.move_car_nos),
-        violation="" if status == "pass" else "remote_prefix_open_without_lease_delta",
         detail="|".join((*contract_delta.fulfilled, *contract_delta.reduced)),
     )
 
@@ -730,92 +584,6 @@ def _serial_gate_lifecycle_records(
                     f"opened={opened};after_debt={len(after_debt)};"
                     f"after_blockers={','.join(after_blockers)}"
                 ),
-            )
-        )
-    return records
-
-
-def _remote_prefix_lifecycle_records(
-    *,
-    case_id: str,
-    hook_index: int,
-    cars: list[dict[str, Any]],
-    prospective_cars: list[dict[str, Any]],
-    depot_assignment: Any,
-    envelope: Any,
-    contract_delta: Any,
-    remote_prefix_leases: dict[str, RemotePrefixLease],
-) -> list[ResourceStructureRecord]:
-    records: list[ResourceStructureRecord] = []
-    for source_line, lease in sorted(remote_prefix_leases.items()):
-        before_remaining = remote_prefix.remaining_debt_nos(
-            lease,
-            cars=cars,
-            depot_assignment=depot_assignment,
-        )
-        after_remaining = remote_prefix.remaining_debt_nos(
-            lease,
-            cars=prospective_cars,
-            depot_assignment=depot_assignment,
-        )
-        after_staged = remote_prefix.blockers_on_staging(lease, prospective_cars)
-        after_source = remote_prefix.blockers_on_source(lease, prospective_cars)
-        served = max(0, len(before_remaining) - len(after_remaining))
-        if after_remaining and after_source:
-            mode = "refilled_before_served"
-            status = "fail"
-            violation = "remote_prefix_lease_refilled_before_debt_clear"
-        elif not after_remaining:
-            mode = "closed_debt_clear"
-            status = "pass"
-            violation = ""
-        elif served:
-            mode = "serving"
-            status = "pass"
-            violation = ""
-        elif after_staged:
-            mode = "holding"
-            status = "pass"
-            violation = ""
-        else:
-            mode = "lost_blockers"
-            status = "warn"
-            violation = ""
-        records.append(
-            ResourceStructureRecord(
-                case_id=case_id,
-                hook_index=hook_index,
-                structure="REMOTE_PREFIX_LEASE_LIFECYCLE",
-                status=status,
-                owner_contract_id=lease.owner_contract_id,
-                candidate_id=envelope.candidate.candidate_id,
-                mode=mode,
-                resource_key=source_line,
-                subject_nos="|".join(lease.blocker_nos),
-                violation=violation,
-                detail=(
-                    f"lease_id={lease.lease_id};age={hook_index - lease.opened_hook};"
-                    f"before_debt={len(before_remaining)};after_debt={len(after_remaining)};"
-                    f"served={served};staged={','.join(after_staged)};source={','.join(after_source)}"
-                ),
-            )
-        )
-
-    if envelope.intent == IntentKind.REMOTE_PREFIX_LEASE:
-        opened = "remote_prefix_lease_opened" in contract_delta.fulfilled
-        records.append(
-            ResourceStructureRecord(
-                case_id=case_id,
-                hook_index=hook_index,
-                structure="REMOTE_PREFIX_LEASE_LIFECYCLE",
-                status="pass" if opened else "fail",
-                owner_contract_id=envelope.contract.contract_id,
-                candidate_id=envelope.candidate.candidate_id,
-                mode="opened",
-                resource_key=envelope.candidate.source_line,
-                subject_nos="|".join(envelope.candidate.move_car_nos),
-                violation="" if opened else "remote_prefix_open_without_lease_delta",
-                detail=f"opened={opened};fulfilled={','.join(contract_delta.fulfilled)}",
             )
         )
     return records

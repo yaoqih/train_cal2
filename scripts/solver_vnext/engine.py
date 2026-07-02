@@ -27,7 +27,6 @@ from .policy import BaselinePolicy, EvaluatedCandidate, PolicyContext
 from .resource_structures import (
     ResourceStructureRecord,
     hook_resource_records,
-    next_remote_prefix_leases,
     next_serial_gate_leases,
     selected_resource_records,
 )
@@ -45,7 +44,6 @@ def _generate_episode_candidates(
     graph: Any,
     loco_location: Any,
     serial_gate_leases: dict[str, Any],
-    remote_prefix_leases: dict[str, Any],
     contract: Any,
 ) -> Any:
     kwargs = {
@@ -58,8 +56,6 @@ def _generate_episode_candidates(
         "serial_gate_leases": serial_gate_leases,
         "contract": contract,
     }
-    if "remote_prefix_leases" in signature(episode.generate).parameters:
-        kwargs["remote_prefix_leases"] = remote_prefix_leases
     return episode.generate(**kwargs)
 
 
@@ -232,7 +228,6 @@ class VNextSolver:
                     cars=state.cars,
                     depot_assignment=state.depot_assignment,
                     serial_gate_leases=state.serial_gate_leases,
-                    remote_prefix_leases=state.remote_prefix_leases,
                 )
             )
             if self.trace_frontier:
@@ -276,7 +271,6 @@ class VNextSolver:
                             graph=self.graph,
                             loco_location=state.loco_location,
                             serial_gate_leases=state.serial_gate_leases,
-                            remote_prefix_leases=state.remote_prefix_leases,
                             contract=contract,
                         ):
                             generated_count += 1
@@ -330,7 +324,6 @@ class VNextSolver:
                                 cars=state.cars,
                                 depot_assignment=state.depot_assignment,
                                 serial_gate_leases=state.serial_gate_leases,
-                                remote_prefix_leases=state.remote_prefix_leases,
                             )
                             cached_prospective = prospective_cache.get(envelope.candidate.candidate_id)
                             if cached_prospective is None:
@@ -530,7 +523,6 @@ class VNextSolver:
                     resource_delta=selected.resource_delta,
                     contract_delta=selected.contract_delta,
                     serial_gate_leases=state.serial_gate_leases,
-                    remote_prefix_leases=state.remote_prefix_leases,
                 )
             )
             structure_node_records.append(
@@ -565,16 +557,6 @@ class VNextSolver:
                 envelope=envelope,
                 contract_delta=selected.contract_delta,
                 serial_gate_leases=state.serial_gate_leases,
-            )
-            state.remote_prefix_leases = next_remote_prefix_leases(
-                case_id=state.case_id,
-                hook_index=state.hook_index,
-                cars=state.cars,
-                prospective_cars=prospective,
-                depot_assignment=state.depot_assignment,
-                envelope=envelope,
-                contract_delta=selected.contract_delta,
-                remote_prefix_leases=state.remote_prefix_leases,
             )
             state.cars = prospective
             state.loco_location = next_loco_location
@@ -725,6 +707,7 @@ def write_artifacts(
     output_dir: Path,
     results: list[CaseResult],
     traces: list[StepTrace],
+    operations: list[Any],
     phase_records: list[PhaseGateRecord],
     frontier_records: list[AccessFrontierRecord],
     staging_records: list[StagingIntentRecord],
@@ -736,6 +719,7 @@ def write_artifacts(
 ) -> None:
     physical.write_csv(output_dir / "case_summary.csv", [asdict(row) for row in results])
     physical.write_csv(output_dir / "step_trace.csv", [asdict(row) for row in traces])
+    physical.write_csv(output_dir / "operation_trace.csv", [asdict(row) for row in operations])
     physical.write_csv(output_dir / "phase_gate_records.csv", [asdict(row) for row in phase_records])
     physical.write_csv(output_dir / "access_frontier_records.csv", [asdict(row) for row in frontier_records])
     physical.write_csv(output_dir / "staging_intent_records.csv", [asdict(row) for row in staging_records])

@@ -87,7 +87,6 @@ WEIGH_LINE = "机库线"
 STAGING_CANDIDATE_KINDS = {
     "blocker_relocation",
     "capacity_release_to_staging",
-    "vnext_remote_prefix_lease_open",
     "same_line_stage_out",
     "spot_release_to_staging",
 }
@@ -543,7 +542,7 @@ class TrackGraph:
         while queue:
             distance, _sequence, node, path = heapq.heappop(queue)
             if node == target:
-                if not occupied_lines and not target_approach_lines:
+                if not occupied_lines and not source_departure_lines and not target_approach_lines:
                     self._route_cache[(source, target)] = path
                 return path
             if distance > best.get(node, 10**9):
@@ -1951,6 +1950,20 @@ def single_hook_weigh_reasons(
     return []
 
 
+def weigh_line_not_empty_reasons(
+    cars: list[dict[str, Any]],
+    moving_nos: set[str],
+) -> list[str]:
+    blockers = sorted(
+        car_no(car)
+        for car in cars
+        if car["Line"] == WEIGH_LINE and car_no(car) not in moving_nos
+    )
+    if not blockers:
+        return []
+    return [f"weigh_line_not_empty:{WEIGH_LINE}:{','.join(blockers)}"]
+
+
 def pending_single_hook_weigh_cars(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [car for car in batch if car.get("IsWeigh") and not car.get("_Weighed")]
 
@@ -2632,6 +2645,8 @@ def validate_candidate(
     if candidate.pull_equivalent_count > PULL_LIMIT_EQUIVALENT:
         reasons.append("pull_limit_violation")
     reasons.extend(single_hook_weigh_reasons(candidate, batch))
+    if candidate.has_weigh:
+        reasons.extend(weigh_line_not_empty_reasons(cars, move_nos))
 
     active_depot_assignment = current_depot_assignment(depot_assignment, cars)
     put_order = carried_order_after_get(
@@ -2858,6 +2873,9 @@ def validate_planlet(
                 break
             if by_no.get(weigh_no, {}).get("_Weighed"):
                 reasons.append(f"planlet_weigh_car_already_complete:step={index}:{weigh_no}")
+                break
+            reasons.extend(weigh_line_not_empty_reasons(working_cars, carried))
+            if reasons:
                 break
             occupied_lines = occupied_lines_for_route(working_cars, carried)
             raw_path = graph.route_avoiding_occupied(

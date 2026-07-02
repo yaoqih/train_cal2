@@ -53,11 +53,12 @@ def run(args: argparse.Namespace) -> int:
     structure_node_records = []
     resource_structure_records = []
     generation_gap_records = []
+    operations = []
     for truth_path in truth_paths:
         (
             result,
             case_traces,
-            _operations,
+            case_operations,
             case_phase_records,
             case_frontier_records,
             case_staging_records,
@@ -69,6 +70,7 @@ def run(args: argparse.Namespace) -> int:
         ) = solver.solve_case(truth_path, output_dir)
         results.append(result)
         traces.extend(case_traces)
+        operations.extend(case_operations)
         phase_records.extend(case_phase_records)
         frontier_records.extend(case_frontier_records)
         staging_records.extend(case_staging_records)
@@ -82,6 +84,7 @@ def run(args: argparse.Namespace) -> int:
         output_dir,
         results,
         traces,
+        operations,
         phase_records,
         frontier_records,
         staging_records,

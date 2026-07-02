@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 from . import physical
-from . import remote_prefix
 from . import serial
 from .domain import ContractFamily, IntentKind
 from .domain import CandidateEnvelope, ResourceDelta, ResourceKind, ResourceRequest
@@ -41,8 +40,6 @@ class StationResourceGraph:
             for line in tuple(dict.fromkeys((*touched_lines, *put_lines)))
         ):
             resources.append(ResourceKind.SERIAL_LINE_GATE)
-        if envelope.intent == IntentKind.REMOTE_PREFIX_LEASE:
-            resources.append(ResourceKind.REMOTE_PREFIX_GATE)
         return ResourceRequest(
             contract_id=envelope.contract.contract_id,
             family=envelope.contract.family,
@@ -66,7 +63,6 @@ class StationResourceGraph:
         cars: list[dict[str, Any]],
         depot_assignment: Any,
         serial_gate_leases: dict[str, Any] | None = None,
-        remote_prefix_leases: dict[str, Any] | None = None,
     ) -> ResourceDelta:
         violations: list[str] = []
         if validation.reasons:
@@ -101,16 +97,6 @@ class StationResourceGraph:
                 depot_assignment=depot_assignment,
             )
         )
-        violations.extend(
-            self._remote_prefix_lease_violations(
-                request,
-                candidate=candidate,
-                validation=validation,
-                cars=cars,
-                depot_assignment=depot_assignment,
-                remote_prefix_leases=remote_prefix_leases or {},
-            )
-        )
         if "存4线" in request.put_lines and request.family not in {
             ContractFamily.REMOTE_SESSION,
             ContractFamily.REPAIR_INBOUND,
@@ -139,36 +125,6 @@ class StationResourceGraph:
             released_lines=released,
             violations=tuple(violations),
         )
-
-    def _remote_prefix_lease_violations(
-        self,
-        request: ResourceRequest,
-        *,
-        candidate: Any,
-        validation: Any,
-        cars: list[dict[str, Any]],
-        depot_assignment: Any,
-        remote_prefix_leases: dict[str, Any],
-    ) -> list[str]:
-        if not remote_prefix_leases:
-            return []
-        prospective = [dict(car) for car in cars]
-        physical.apply_candidate(candidate, prospective, validation)
-        violations: list[str] = []
-        for source_line, lease in sorted(remote_prefix_leases.items()):
-            if source_line not in request.put_lines:
-                continue
-            if request.intent == IntentKind.REMOTE_PREFIX_LEASE:
-                continue
-            if not remote_prefix.remaining_debt_nos(lease, cars=prospective, depot_assignment=depot_assignment):
-                continue
-            refilled = remote_prefix.blockers_on_source(lease, prospective)
-            if refilled:
-                violations.append(
-                    "remote_prefix_lease_refill_before_debt_clear:"
-                    f"{source_line}:{','.join(refilled)}:{','.join(lease.debt_nos[:8])}"
-                )
-        return violations
 
     def _serial_blocker_storage_violations(
         self,

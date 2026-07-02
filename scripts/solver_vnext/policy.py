@@ -151,8 +151,6 @@ class BaselinePolicy:
             return 6
         if self.digests_depot_inbound_batch(candidate, context):
             return 7
-        if self.opens_remote_prefix_lease(candidate, context):
-            return 8
         if self.continues_remote_work(candidate, context):
             return 9
         if self.resolves_spotting_closeout(candidate, context):
@@ -188,15 +186,6 @@ class BaselinePolicy:
             ContractFamily.DEPOT_SLOT,
             ContractFamily.DEPOT_OUTBOUND,
         }
-
-    def opens_remote_prefix_lease(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
-        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
-            return False
-        return (
-            candidate.envelope.intent == IntentKind.REMOTE_PREFIX_LEASE
-            and "remote_prefix_lease_opened" in candidate.contract_delta.fulfilled
-            and candidate.contract_delta.support_gain > 0
-        )
 
     def front_access_shaping(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase not in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT}:

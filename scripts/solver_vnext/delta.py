@@ -4,7 +4,6 @@ from typing import Any
 
 from . import physical
 from . import release
-from . import remote_prefix
 from . import serial
 from .contracts import contract_debt
 from .domain import CandidateEnvelope, ContractDelta, IntentKind
@@ -43,16 +42,9 @@ def build_contract_delta(
         depot_assignment=depot_assignment,
     )
     opens_serial_gate_lease = envelope.intent == IntentKind.SERIAL_GATE_CLEAR and bool(serial_releases)
-    remote_prefix_debt = remote_prefix.open_debt_nos(
-        envelope.contract,
-        cars=cars,
-        depot_assignment=depot_assignment,
-        moving_nos=set(envelope.resource_request.move_nos),
-    )
-    opens_remote_prefix_lease = envelope.intent == IntentKind.REMOTE_PREFIX_LEASE and bool(remote_prefix_debt)
-    if after_contract_debt > before_contract_debt and not (opens_serial_gate_lease or opens_remote_prefix_lease):
+    if after_contract_debt > before_contract_debt and not opens_serial_gate_lease:
         broken.append("contract_debt_increased")
-    if after_unsatisfied > before_unsatisfied and not (opens_serial_gate_lease or opens_remote_prefix_lease):
+    if after_unsatisfied > before_unsatisfied and not opens_serial_gate_lease:
         broken.append("global_unsatisfied_increased")
     if serial_releases:
         support_gain = max(support_gain, len(serial_releases))
@@ -60,9 +52,6 @@ def build_contract_delta(
     if opens_serial_gate_lease:
         fulfilled.append("serial_gate_lease_opened")
         support_gain = max(support_gain, len(serial_releases) + max(0, after_unsatisfied - before_unsatisfied))
-    if opens_remote_prefix_lease:
-        fulfilled.append("remote_prefix_lease_opened")
-        support_gain = max(support_gain, len(remote_prefix_debt) + max(0, after_unsatisfied - before_unsatisfied))
     if envelope.resource_request.same_plan_source_return_nos:
         fulfilled.append("same_plan_prefix_returned_to_source")
     if envelope.intent == IntentKind.CUN4_RELEASE_GROUP:

@@ -234,13 +234,6 @@ class HumanPhaseGate:
             and contract_delta.support_gain > 0
         ):
             return PhasePermission(True, "support", target_phase, "serial_gate_clear_support")
-        if (
-            phase == "H4"
-            and resource_delta.request.intent == IntentKind.REMOTE_PREFIX_LEASE
-            and "remote_prefix_lease_opened" in contract_delta.fulfilled
-            and contract_delta.support_gain > 0
-        ):
-            return PhasePermission(True, "support", target_phase, "remote_prefix_lease_support")
         if resource_delta.request.intent == IntentKind.CUN4_RELEASE_ACCEPT and phase in {"H2", "H3", "H4"}:
             return PhasePermission(True, "primary", "H3", "cun4_release_accept_boundary")
         if resource_delta.request.intent == IntentKind.CUN4_OUTBOUND_HOLD and phase in {"H2", "H3", "H4"}:
@@ -266,8 +259,6 @@ class HumanPhaseGate:
             return "H4"
         if request.intent == IntentKind.CUN4_RELEASE_ACCEPT:
             return "H3"
-        if request.intent == IntentKind.REMOTE_PREFIX_LEASE:
-            return "H4"
         if plan_facts.is_remote_outbound_session_release(envelope, request):
             return "H3"
         if family == ContractFamily.CUN4_PORT_STAGING:

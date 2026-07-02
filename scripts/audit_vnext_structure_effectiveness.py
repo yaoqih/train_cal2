@@ -332,8 +332,6 @@ def _structure_summary_rows(
         "remote_session_prefix_batch_digest_restore",
         "depot_inbound_prefix_multidrop_session",
         "remote_depot_direct_accessible_prefix",
-        "remote_prefix_lease_open",
-        "remote_prefix_lease_service",
         "depot_locked_tail_slot_fill",
     ):
         row = template_by_name.get(template_name)
