@@ -36,6 +36,7 @@ def car(
     *,
     line: str = "存1线",
     position: int = 1,
+    length: float = 14.3,
     target_lines: list[str] | None = None,
     closed: bool = False,
     heavy: bool = False,
@@ -48,7 +49,7 @@ def car(
             "Position": position,
             "RepairProcess": "段修",
             "Type": "棚车",
-            "Length": 14.3,
+            "Length": length,
             "TargetLines": target_lines or ["存2线"],
             "IsClosedDoor": closed,
             "IsHeavy": heavy,
@@ -191,6 +192,134 @@ def test_planlet_weigh_requires_empty_weigh_line() -> None:
     )
     assert not validation.accepted
     assert f"weigh_line_not_empty:{physical.WEIGH_LINE}:B1" in validation.reasons
+
+
+def test_final_target_put_still_rejects_line_length_overflow() -> None:
+    cars = [
+        car(f"E{index}", line="预修线", position=index, target_lines=["预修线"])
+        for index in range(1, 15)
+    ]
+    cars.append(car("M1", line="存5线北", position=1, target_lines=["预修线"]))
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=4,
+        source_line="存5线北",
+        target_line="预修线",
+        batch=[cars[-1]],
+        planned_positions={"M1": 15},
+        generation_reason="test",
+        candidate_kind="target_move",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存5线北"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert not validation.accepted
+    assert any(
+        reason.startswith("target_line_length_violation:预修线:")
+        for reason in validation.reasons
+    )
+
+
+def test_depot_line_length_capacity_is_hard_limit() -> None:
+    cars = [
+        car(f"D{index}", line="修1库内", position=index, target_lines=["修1库内"])
+        for index in range(1, 12)
+    ]
+    mover = car("M1", line="存1线", position=1, target_lines=["修1库内"])
+    batch = [mover]
+    cars.append(mover)
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=5,
+        source_line="存1线",
+        target_line="修1库内",
+        batch=batch,
+        planned_positions={"M1": 12},
+        generation_reason="test",
+        candidate_kind="target_move",
+    )
+    projected = physical.projected_after_physical_put(
+        cars,
+        "修1库内",
+        ["M1"],
+        {"M1": 12},
+    )
+    assert not physical.line_has_length_capacity(
+        "修1库内",
+        cars,
+        batch,
+        {"M1"},
+        grouped=physical.cars_by_line(cars),
+    )
+    reasons = physical.validate_target_positions(
+        candidate,
+        projected,
+        batch,
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert any(
+        reason.startswith("target_line_length_violation:修1库内:")
+        for reason in reasons
+    )
+
+
+def test_all_track_specs_enforce_length_capacity() -> None:
+    for target_line, spec in physical.TRACK_SPECS.items():
+        source_line = "存1线" if target_line != "存1线" else "存2线"
+        existing = car(
+            "E1",
+            line=target_line,
+            position=1,
+            length=spec.length_m - 0.1,
+            target_lines=[target_line],
+        )
+        mover = car(
+            "M1",
+            line=source_line,
+            position=1,
+            length=1.0,
+            target_lines=[target_line],
+        )
+        cars = [existing, mover]
+        batch = [mover]
+        candidate = physical.hook_candidate(
+            case_id="T",
+            hook_index=6,
+            source_line=source_line,
+            target_line=target_line,
+            batch=batch,
+            planned_positions={"M1": 2},
+            generation_reason="test",
+            candidate_kind="target_move",
+        )
+        projected = physical.projected_after_physical_put(
+            cars,
+            target_line,
+            ["M1"],
+            {"M1": 2},
+        )
+
+        assert not physical.line_has_length_capacity(
+            target_line,
+            cars,
+            batch,
+            {"M1"},
+            grouped=physical.cars_by_line(cars),
+        ), target_line
+        reasons = physical.validate_target_positions(
+            candidate,
+            projected,
+            batch,
+            physical.DepotAssignment(slots={}, failures={}),
+        )
+        assert any(
+            reason.startswith(f"target_line_length_violation:{target_line}:")
+            for reason in reasons
+        ), (target_line, reasons)
 
 
 def test_reversal_triplet_rule_uses_loco_plus_train_length() -> None:

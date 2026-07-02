@@ -1829,8 +1829,6 @@ def line_has_length_capacity(
     length_load_lookup: dict[str, float] | None = None,
     grouped: dict[str, list[dict[str, Any]]] | None = None,
 ) -> bool:
-    if target_line in DEPOT_LINES:
-        return True
     spec = TRACK_SPECS.get(target_line)
     if not spec:
         return False
@@ -2942,6 +2940,18 @@ def validate_target_positions(
         if position in occupied_positions:
             reasons.append(f"target_position_occupied:{candidate.target_line}:{position}:{no}")
 
+    spec = TRACK_SPECS.get(candidate.target_line)
+    if spec:
+        existing_length = sum(
+            car_length(car)
+            for car in projected_cars
+            if car["Line"] == candidate.target_line
+            if car_no(car) not in batch_nos
+        )
+        after_length = existing_length + candidate.train_length_m
+        if after_length > spec.length_m + LINE_LENGTH_TOLERANCE_M:
+            reasons.append(f"target_line_length_violation:{candidate.target_line}:{after_length:.1f}>{spec.length_m:.1f}")
+
     if is_spotting_line(candidate.target_line):
         forced_groups = {
             force_positions(car)
@@ -2981,36 +2991,11 @@ def validate_target_positions(
                 reasons.append(f"depot_slot_rule_violation:{car_no(car)}:{candidate.target_line}:{position}")
         reasons.extend(depot_slot_hard_reasons(candidate, projected_cars, batch, depot_assignment, actual_positions))
     else:
-        spec = TRACK_SPECS.get(candidate.target_line)
         if spec:
-            existing_length = sum(
-                car_length(car)
-                for car in projected_cars
-                if car["Line"] == candidate.target_line
-                if car_no(car) not in batch_nos
-            )
-            after_length = existing_length + candidate.train_length_m
-            if after_length > spec.length_m + LINE_LENGTH_TOLERANCE_M:
-                reason = f"target_line_length_violation:{candidate.target_line}:{after_length:.1f}>{spec.length_m:.1f}"
-                if not _is_final_target_put(candidate.target_line, batch, projected_cars, depot_assignment):
-                    reasons.append(reason)
             if spec.track_type == "temporary" and candidate.candidate_kind not in STAGING_CANDIDATE_KINDS:
                 reasons.append(f"temporary_line_final_target_violation:{candidate.target_line}")
     return reasons
 
-
-def _is_final_target_put(
-    target_line: str,
-    batch: list[dict[str, Any]],
-    cars: list[dict[str, Any]],
-    depot_assignment: DepotAssignment,
-) -> bool:
-    loads = line_loads(cars)
-    for car in batch:
-        planned_line, _position, _reason = planned_target_for_car(car, cars, depot_assignment, loads)
-        if planned_line != target_line:
-            return False
-    return bool(batch)
 
 def validate_closed_door(
     candidate: HookCandidate,

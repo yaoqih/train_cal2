@@ -589,6 +589,8 @@ class VNextSolver:
         closed_door_reasons = physical.closed_door_replay_violation_reasons(operations, state.cars)
         if closed_door_reasons and not blocked_reason:
             blocked_reason = "|".join(closed_door_reasons)
+        if final_length_warnings and not blocked_reason:
+            blocked_reason = "final_line_length_violation:" + "|".join(final_length_warnings)
         status = "completed" if final_unsatisfied == 0 and not blocked_reason else "blocked"
         if state.hook_index > self.max_hooks and final_unsatisfied:
             blocked_reason = "max_hook_limit_reached"

@@ -905,6 +905,7 @@ class DepotOutboundSessionEpisode(Episode):
             return
         carry: list[dict[str, Any]] = []
         steps = []
+        best_candidate = None
         for source_line in self.source_order:
             if source_line not in contract.source_lines:
                 continue
@@ -925,11 +926,47 @@ class DepotOutboundSessionEpisode(Episode):
                     break
                 batch.append(car)
             if batch:
-                carry.extend(batch)
-                steps.append(physical.plan_step("Get", source_line, tuple(physical.car_no(car) for car in batch)))
-        if len(carry) < 3 or len(steps) < 2:
+                candidate_carry = [*carry, *batch]
+                candidate_steps = [
+                    *steps,
+                    physical.plan_step("Get", source_line, tuple(physical.car_no(car) for car in batch)),
+                ]
+                candidate = self._validated_session_candidate(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    graph=graph,
+                    loco_location=loco_location,
+                    serial_gate_leases=serial_gate_leases or {},
+                    target_line=target_line,
+                    carry=candidate_carry,
+                    steps=candidate_steps,
+                )
+                if candidate is None:
+                    continue
+                carry = candidate_carry
+                steps = candidate_steps
+                if len(carry) >= 3 and len(steps) >= 2:
+                    best_candidate = candidate
+        if best_candidate is None:
             return
+        yield self._envelope(best_candidate, contract)
 
+    def _validated_session_candidate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any],
+        target_line: str,
+        carry: list[dict[str, Any]],
+        steps: list[Any],
+    ) -> Any | None:
         batch_nos = {physical.car_no(car) for car in carry}
         positions = planned_positions_for_batch(
             batch=carry,
@@ -939,7 +976,7 @@ class DepotOutboundSessionEpisode(Episode):
             batch_nos=batch_nos,
         )
         if len(positions) != len(carry):
-            return
+            return None
         probe = physical.build_direct_candidate(
             case_id=case_id,
             hook_index=hook_index,
@@ -953,19 +990,21 @@ class DepotOutboundSessionEpisode(Episode):
             planned_positions=positions,
         )
         if probe is None:
-            return
-        steps.append(physical.plan_step("Put", target_line, tuple(physical.car_no(car) for car in carry), positions))
-        plan_steps = tuple(steps)
+            return None
+        plan_steps = (
+            *steps,
+            physical.plan_step("Put", target_line, tuple(physical.car_no(car) for car in carry), positions),
+        )
         if not self.frontier.plan_steps_are_reachable(
             steps=plan_steps,
             cars=cars,
             depot_assignment=depot_assignment,
             graph=graph,
             loco_location=loco_location,
-            serial_gate_leases=serial_gate_leases or {},
+            serial_gate_leases=serial_gate_leases,
         ):
-            return
-        candidate = physical.build_planlet_candidate(
+            return None
+        return physical.build_planlet_candidate(
             case_id=case_id,
             hook_index=hook_index,
             source_line=steps[0].line,
@@ -978,7 +1017,6 @@ class DepotOutboundSessionEpisode(Episode):
             ),
             candidate_kind="vnext_depot_outbound_session",
         )
-        yield self._envelope(candidate, contract)
 
     def _primary_outbound_target(
         self,
