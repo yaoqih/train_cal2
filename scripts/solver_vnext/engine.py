@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +24,43 @@ from .frontier import AccessFrontier, AccessFrontierRecord
 from .gate import AcceptRejectGate
 from .phase import HumanPhaseGate, PhaseGateRecord
 from .policy import BaselinePolicy, EvaluatedCandidate, PolicyContext
-from .resource_structures import ResourceStructureRecord, hook_resource_records, next_serial_gate_leases, selected_resource_records
+from .resource_structures import (
+    ResourceStructureRecord,
+    hook_resource_records,
+    next_remote_prefix_leases,
+    next_serial_gate_leases,
+    selected_resource_records,
+)
 from .resources import StationResourceGraph
 from .staging import StagingIntentBuilder, StagingIntentRecord
+
+
+def _generate_episode_candidates(
+    *,
+    episode: Any,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    graph: Any,
+    loco_location: Any,
+    serial_gate_leases: dict[str, Any],
+    remote_prefix_leases: dict[str, Any],
+    contract: Any,
+) -> Any:
+    kwargs = {
+        "case_id": case_id,
+        "hook_index": hook_index,
+        "cars": cars,
+        "depot_assignment": depot_assignment,
+        "graph": graph,
+        "loco_location": loco_location,
+        "serial_gate_leases": serial_gate_leases,
+        "contract": contract,
+    }
+    if "remote_prefix_leases" in signature(episode.generate).parameters:
+        kwargs["remote_prefix_leases"] = remote_prefix_leases
+    return episode.generate(**kwargs)
 
 
 def _remote_unsatisfied_count(cars: list[dict[str, Any]], depot_assignment: Any) -> int:
@@ -49,6 +84,8 @@ def _trace_row(
     physical_reasons: tuple[str, ...],
     contract_delta: Any | None,
     resource_delta: Any | None,
+    phase_name: str = "",
+    phase_reason: str = "",
 ) -> StepTrace:
     candidate = envelope.candidate
     request = resource_delta.request if resource_delta else envelope.resource_request
@@ -56,8 +93,8 @@ def _trace_row(
     return StepTrace(
         case_id=state.case_id,
         hook_index=state.hook_index,
-        phase=phase_state.phase.value,
-        phase_reason=phase_state.reason,
+        phase=phase_name or phase_state.phase.value,
+        phase_reason=phase_reason or phase_state.reason,
         phase_front_debt=phase_state.front_debt,
         phase_cun4_port_debt=phase_state.cun4_port_debt,
         phase_remote_debt=phase_state.remote_debt,
@@ -192,6 +229,7 @@ class VNextSolver:
                     cars=state.cars,
                     depot_assignment=state.depot_assignment,
                     serial_gate_leases=state.serial_gate_leases,
+                    remote_prefix_leases=state.remote_prefix_leases,
                 )
             )
             if self.trace_frontier:
@@ -226,7 +264,8 @@ class VNextSolver:
                     for episode in episodes:
                         if not episode.applies(contract):
                             continue
-                        for envelope in episode.generate(
+                        for envelope in _generate_episode_candidates(
+                            episode=episode,
                             case_id=state.case_id,
                             hook_index=state.hook_index,
                             cars=state.cars,
@@ -234,6 +273,7 @@ class VNextSolver:
                             graph=self.graph,
                             loco_location=state.loco_location,
                             serial_gate_leases=state.serial_gate_leases,
+                            remote_prefix_leases=state.remote_prefix_leases,
                             contract=contract,
                         ):
                             generated_count += 1
@@ -287,6 +327,7 @@ class VNextSolver:
                                 cars=state.cars,
                                 depot_assignment=state.depot_assignment,
                                 serial_gate_leases=state.serial_gate_leases,
+                                remote_prefix_leases=state.remote_prefix_leases,
                             )
                             cached_prospective = prospective_cache.get(envelope.candidate.candidate_id)
                             if cached_prospective is None:
@@ -407,6 +448,22 @@ class VNextSolver:
                         )
                         selected_trace_written = True
                         break
+            if validation.reasons:
+                hard_physical_accepted += 1
+            phase_permission = self.phase_gate.permission(
+                phase_state=active_phase_state,
+                envelope=envelope,
+                contract_delta=selected.contract_delta,
+                resource_delta=selected.resource_delta,
+                remote_session_open=policy_context.remote_session_open,
+            )
+            if not phase_permission.allowed:
+                accepted_without_phase_permission += 1
+            execution_phase = self.phase_gate.execution_phase(
+                current_phase=current_phase,
+                permission=phase_permission,
+            )
+            hook_count_by_phase[execution_phase] = hook_count_by_phase.get(execution_phase, 0) + 1
             if not selected_trace_written:
                 traces.append(
                     _trace_row(
@@ -419,30 +476,32 @@ class VNextSolver:
                         physical_reasons=(),
                         contract_delta=selected.contract_delta,
                         resource_delta=selected.resource_delta,
+                        phase_name=self.phase_gate.phase_kind(execution_phase).value,
+                        phase_reason=f"{active_phase_state.reason};execution_target={phase_permission.target_phase}",
                     )
                 )
-            if validation.reasons:
-                hard_physical_accepted += 1
-            hook_count_by_phase[current_phase] = hook_count_by_phase.get(current_phase, 0) + 1
-            phase_permission = self.phase_gate.permission(
-                phase_state=active_phase_state,
-                envelope=envelope,
-                contract_delta=selected.contract_delta,
-                resource_delta=selected.resource_delta,
-                remote_session_open=policy_context.remote_session_open,
-            )
-            if not phase_permission.allowed:
-                accepted_without_phase_permission += 1
+            elif self.trace_all_candidates:
+                for index in range(len(traces) - 1, -1, -1):
+                    if traces[index].candidate_id == envelope.candidate.candidate_id and traces[index].hook_index == state.hook_index:
+                        trace = traces[index]
+                        traces[index] = StepTrace(
+                            **{
+                                **asdict(trace),
+                                "phase": self.phase_gate.phase_kind(execution_phase).value,
+                                "phase_reason": f"{active_phase_state.reason};execution_target={phase_permission.target_phase}",
+                            }
+                        )
+                        break
             phase_record = self.phase_gate.record(
                 case_id=state.case_id,
                 step_index=state.hook_index,
                 previous_phase=previous_phase,
-                current_phase=current_phase,
+                current_phase=execution_phase,
                 phase_state=active_phase_state,
                 envelope=envelope,
                 contract_delta=selected.contract_delta,
                 permission=phase_permission,
-                hook_count_in_phase=hook_count_by_phase[current_phase],
+                hook_count_in_phase=hook_count_by_phase[execution_phase],
             )
             if phase_record.transition_type == "fail":
                 phase_gate_bypass += 1
@@ -468,6 +527,7 @@ class VNextSolver:
                     resource_delta=selected.resource_delta,
                     contract_delta=selected.contract_delta,
                     serial_gate_leases=state.serial_gate_leases,
+                    remote_prefix_leases=state.remote_prefix_leases,
                 )
             )
             structure_node_records.append(
@@ -484,13 +544,13 @@ class VNextSolver:
                 self.staging.records_for_selected(
                     case_id=state.case_id,
                     hook_index=state.hook_index,
-                    phase=current_phase,
+                    phase=execution_phase,
                     envelope=envelope,
                     resource_delta=selected.resource_delta,
                     phase_permission=phase_permission,
                 )
             )
-            previous_phase = current_phase
+            previous_phase = execution_phase
             start_operation_index = len(operations) + 1
             operations.extend(physical.operation_rows(envelope.candidate, validation, start_operation_index))
             state.serial_gate_leases = next_serial_gate_leases(
@@ -502,6 +562,16 @@ class VNextSolver:
                 envelope=envelope,
                 contract_delta=selected.contract_delta,
                 serial_gate_leases=state.serial_gate_leases,
+            )
+            state.remote_prefix_leases = next_remote_prefix_leases(
+                case_id=state.case_id,
+                hook_index=state.hook_index,
+                cars=state.cars,
+                prospective_cars=prospective,
+                depot_assignment=state.depot_assignment,
+                envelope=envelope,
+                contract_delta=selected.contract_delta,
+                remote_prefix_leases=state.remote_prefix_leases,
             )
             state.cars = prospective
             state.loco_location = next_loco_location
@@ -533,6 +603,7 @@ class VNextSolver:
             state.hook_index += 1
 
         final_unsatisfied = len(physical.unsatisfied_cars(state.cars, state.depot_assignment))
+        final_length_warnings = physical.final_line_length_warnings(state.cars)
         closed_door_reasons = physical.closed_door_replay_violation_reasons(operations, state.cars)
         if closed_door_reasons and not blocked_reason:
             blocked_reason = "|".join(closed_door_reasons)
@@ -586,6 +657,7 @@ class VNextSolver:
             remote_business_transition_count=physical.operation_remote_business_transition_count(operations),
             initial_unsatisfied=initial_unsatisfied,
             final_unsatisfied=final_unsatisfied,
+            final_length_warning_count=len(final_length_warnings),
             blocked_reason=blocked_reason,
             step_count=len(accepted_traces),
             accepted_without_phase_permission_count=accepted_without_phase_permission,
@@ -653,6 +725,7 @@ def write_artifacts(
         "accepted_without_phase_permission_count": sum(row.accepted_without_phase_permission_count for row in results),
         "phase_gate_bypass_count": sum(row.phase_gate_bypass_count for row in results),
         "hard_physical_violation_accepted_count": sum(row.hard_physical_violation_accepted_count for row in results),
+        "final_length_warning_count": sum(row.final_length_warning_count for row in results),
         "hook_count": sum(row.hook_count for row in results),
         "remote_business_transition_count": sum(row.remote_business_transition_count for row in results),
         "phase_gate_record_count": len(phase_records),

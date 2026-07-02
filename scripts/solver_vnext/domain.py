@@ -25,6 +25,9 @@ class IntentKind(str, Enum):
     REMOTE_SESSION = "REMOTE_SESSION"
     FRONT_PREP = "FRONT_PREP"
     PREFIX_DIGEST = "PREFIX_DIGEST"
+    REMOTE_PREFIX_LEASE = "REMOTE_PREFIX_LEASE"
+    CUN4_RELEASE_GROUP = "CUN4_RELEASE_GROUP"
+    CUN4_OUTBOUND_HOLD = "CUN4_OUTBOUND_HOLD"
     CUN4_RELEASE_ACCEPT = "CUN4_RELEASE_ACCEPT"
     REMOTE_DEPOT = "REMOTE_DEPOT"
     TAIL_CLOSEOUT = "TAIL_CLOSEOUT"
@@ -46,6 +49,7 @@ class ResourceKind(str, Enum):
     GLOBAL_GATE = "GLOBAL_GATE"
     WEIGH_STAND = "WEIGH_STAND"
     SERIAL_LINE_GATE = "SERIAL_LINE_GATE"
+    REMOTE_PREFIX_GATE = "REMOTE_PREFIX_GATE"
 
 
 @dataclass(frozen=True)
@@ -112,6 +116,9 @@ class PhaseState:
     closeout_debt: int
     reason: str
     cun4_release_ready: bool = False
+    cun4_port_mode: str = ""
+    cun4_release_count: int = 0
+    cun4_prefix_hold_count: int = 0
     active_variant: str = ""
 
 
@@ -178,6 +185,18 @@ class SerialGateLease:
 
 
 @dataclass
+class RemotePrefixLease:
+    lease_id: str
+    owner_contract_id: str
+    source_line: str
+    staging_line: str
+    opened_hook: int
+    blocker_nos: tuple[str, ...]
+    debt_nos: tuple[str, ...]
+    restore_positions: tuple[tuple[str, int], ...]
+
+
+@dataclass
 class SolverState:
     case_id: str
     cars: list[dict[str, Any]]
@@ -189,6 +208,7 @@ class SolverState:
     remote_session_open: bool = False
     last_business_remote: bool | None = None
     serial_gate_leases: dict[str, SerialGateLease] = field(default_factory=dict)
+    remote_prefix_leases: dict[str, RemotePrefixLease] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -239,6 +259,7 @@ class CaseResult:
     remote_business_transition_count: int
     initial_unsatisfied: int
     final_unsatisfied: int
+    final_length_warning_count: int
     blocked_reason: str
     step_count: int
     accepted_without_phase_permission_count: int

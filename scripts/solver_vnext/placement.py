@@ -60,6 +60,7 @@ def _spotting_positions_for_batch(
         positions = _free_spotting_positions(
             target_line=target_line,
             forced=forced,
+            group=group,
             cars=cars,
             depot_assignment=depot_assignment,
             batch_nos=batch_nos,
@@ -86,6 +87,7 @@ def _free_spotting_positions(
     *,
     target_line: str,
     forced: tuple[int, ...],
+    group: list[dict[str, Any]],
     cars: list[dict[str, Any]],
     depot_assignment: Any,
     batch_nos: set[str],
@@ -103,18 +105,25 @@ def _free_spotting_positions(
     capacity = physical.spotting_capacity(target_line, forced)
     if not capacity or len(existing_positions) + needed > capacity:
         return []
-    window_sets = physical.spotting_physical_window_sets(target_line, forced)
-    if not window_sets:
+    projected = [dict(car) for car in cars]
+    projected_by_no = {physical.car_no(car): car for car in projected}
+    for car in group:
+        no = physical.car_no(car)
+        projected_car = projected_by_no.get(no)
+        if projected_car is None:
+            projected_car = dict(car)
+            projected.append(projected_car)
+            projected_by_no[no] = projected_car
+        projected_car["Line"] = target_line
+        projected_car["Position"] = 0
+    allowed = physical.spotting_allowed_positions(projected, target_line, forced, depot_assignment)
+    if not allowed:
         return []
     existing_set = set(existing_positions)
-    for window in window_sets:
-        if not existing_set <= window:
-            continue
-        free_positions = [
-            position
-            for position in sorted(window, reverse=True)
-            if position not in existing_set and position not in used
-        ]
-        if len(free_positions) >= needed:
-            return free_positions
-    return []
+    if not existing_set <= allowed:
+        return []
+    return [
+        position
+        for position in sorted(allowed, reverse=True)
+        if position not in existing_set and position not in used
+    ][:needed]

@@ -300,6 +300,7 @@ class AccessFrontier:
         loco_location: Any,
         depot_assignment: Any | None = None,
         serial_gate_leases: dict[str, Any] | None = None,
+        candidate_kind: str = "frontier_planlet_probe",
     ) -> bool:
         """Return whether a planlet's Get/Put sequence is physically reachable."""
         return self.plan_steps_reachability(
@@ -309,6 +310,7 @@ class AccessFrontier:
             loco_location=loco_location,
             depot_assignment=depot_assignment,
             serial_gate_leases=serial_gate_leases,
+            candidate_kind=candidate_kind,
         ).accepted
 
     def target_put_violation_reasons(
@@ -342,13 +344,11 @@ class AccessFrontier:
             generation_reason="vnext:depot_put_frontier_probe",
             candidate_kind="blocker_relocation",
         )
-        target_line_cars = [car for car in projected_cars if car["Line"] == target_line]
         return tuple(
             physical.validate_target_positions(
                 probe,
                 projected_cars,
                 batch,
-                target_line_cars,
                 depot_assignment,
             )
         )

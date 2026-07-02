@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import physical
+from . import release
 from .contracts import build_car_refs
 from .domain import ContractFamily
 
@@ -45,6 +46,9 @@ class FlowFacts:
     front_debt: int
     closeout_debt: int
     cun4_release_ready: bool
+    cun4_port_mode: str
+    cun4_release_count: int
+    cun4_prefix_hold_count: int
 
 
 FRONT_FAMILIES = {
@@ -94,14 +98,7 @@ def classify_flow_facts(cars: list[dict[str, Any]], depot_assignment: Any) -> Fl
         }
         for ref in refs
     )
-    cun4_release_ready = any(
-        ref.line == "存4线"
-        and (
-            ref.contract_family in {ContractFamily.REPAIR_INBOUND, ContractFamily.DEPOT_SLOT}
-            or ref.target_line in physical.DEPOT_TARGET_LINES
-        )
-        for ref in refs
-    )
+    cun4_state = release.cun4_port_state(cars=cars, depot_assignment=depot_assignment)
     return FlowFacts(
         active_variant=_repair_variant(
             refs=refs,
@@ -117,7 +114,10 @@ def classify_flow_facts(cars: list[dict[str, Any]], depot_assignment: Any) -> Fl
         remote_debt=remote_debt,
         front_debt=front_debt,
         closeout_debt=closeout_debt,
-        cun4_release_ready=cun4_release_ready,
+        cun4_release_ready=cun4_state.standard_ready,
+        cun4_port_mode=cun4_state.mode,
+        cun4_release_count=cun4_state.release_count,
+        cun4_prefix_hold_count=len(cun4_state.prefix_hold_nos),
     )
 
 

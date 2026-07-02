@@ -48,6 +48,9 @@ class BaselinePolicy:
             closeout_debt=flow_facts.closeout_debt,
             remote_session_open=state.remote_session_open,
             cun4_release_ready=flow_facts.cun4_release_ready,
+            cun4_port_mode=flow_facts.cun4_port_mode,
+            cun4_release_count=flow_facts.cun4_release_count,
+            cun4_prefix_hold_count=flow_facts.cun4_prefix_hold_count,
             active_variant=flow_facts.active_variant,
         )
         remote_open = phase_state.phase == PhaseKind.H4_REMOTE_DEPOT
@@ -102,8 +105,16 @@ class BaselinePolicy:
         )
 
     def _special_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
-        if self.fills_cun4_port(candidate, context):
+        if self.resolves_spotting_closeout(candidate, context):
             return 0
+        if candidate.envelope.intent == IntentKind.CUN4_RELEASE_ACCEPT:
+            return 0
+        if candidate.envelope.intent == IntentKind.CUN4_RELEASE_GROUP:
+            return 0
+        if candidate.envelope.intent == IntentKind.CUN4_OUTBOUND_HOLD:
+            return 1
+        if self.fills_cun4_port(candidate, context):
+            return 2
         if self.opens_remote_session(candidate):
             return 1
         if candidate.envelope.contract.family == ContractFamily.REMOTE_SESSION:
@@ -111,23 +122,112 @@ class BaselinePolicy:
         return 3
 
     def _candidate_lane(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
-        if self.fills_cun4_port(candidate, context):
+        if candidate.envelope.intent == IntentKind.CUN4_RELEASE_ACCEPT:
             return 0
-        if self.opens_remote_session(candidate):
+        if context.phase_state.phase in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT} and self.front_access_shaping(candidate, context):
             return 0
-        if self.releases_depot_slot(candidate, context):
+        if candidate.envelope.intent == IntentKind.CUN4_RELEASE_GROUP:
+            return 0
+        if candidate.envelope.intent == IntentKind.CUN4_OUTBOUND_HOLD:
             return 1
-        if self.swaps_depot_slot(candidate, context):
+        if self.fills_cun4_port(candidate, context):
             return 2
-        if self.digests_remote_session_batch(candidate, context):
+        if self.opens_remote_session(candidate):
             return 3
-        if self.digests_depot_inbound_batch(candidate, context):
+        if self.releases_depot_outbound(candidate, context):
+            return 3
+        if self.releases_depot_slot(candidate, context):
             return 4
+        if self.swaps_depot_slot(candidate, context):
+            return 5
+        if self.digests_remote_prefix_batch(candidate, context):
+            return 5
+        if self.digests_remote_session_batch(candidate, context):
+            return 6
+        if self.digests_depot_inbound_batch(candidate, context):
+            return 7
+        if self.opens_remote_prefix_lease(candidate, context):
+            return 8
+        if self.continues_remote_work(candidate, context):
+            return 9
+        if self.resolves_spotting_closeout(candidate, context):
+            if context.phase_state.phase == PhaseKind.H4_REMOTE_DEPOT:
+                return 20
+            return 0
         if self.fragments_depot_inbound(candidate, context):
             return 30
         if candidate.envelope.intent == IntentKind.BLOCKER_STAGING:
             return 40
         return 10
+
+    def resolves_spotting_closeout(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase not in {PhaseKind.H4_REMOTE_DEPOT, PhaseKind.H5_CLOSEOUT}:
+            return False
+        if candidate.contract_delta.contract_reduction <= 0:
+            return False
+        request = candidate.resource_delta.request
+        hook = candidate.envelope.candidate
+        if not physical.is_spotting_line(request.target_line):
+            return False
+        return (
+            physical.honors_spotting_planned_positions(hook.candidate_kind)
+            or candidate.envelope.template_name in {"spotting_repack", "spotting_target_repack"}
+        )
+
+    def continues_remote_work(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        if candidate.contract_delta.contract_reduction <= 0:
+            return False
+        if not plan_facts.touches_remote(candidate.resource_delta.request):
+            return False
+        return candidate.envelope.contract.family in {
+            ContractFamily.REMOTE_SESSION,
+            ContractFamily.REPAIR_INBOUND,
+            ContractFamily.DEPOT_SLOT,
+            ContractFamily.DEPOT_OUTBOUND,
+        }
+
+    def opens_remote_prefix_lease(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        return (
+            candidate.envelope.intent == IntentKind.REMOTE_PREFIX_LEASE
+            and "remote_prefix_lease_opened" in candidate.contract_delta.fulfilled
+            and candidate.contract_delta.support_gain > 0
+        )
+
+    def front_access_shaping(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase not in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT}:
+            return False
+        if candidate.contract_delta.contract_reduction <= 0:
+            return False
+        family = candidate.envelope.contract.family
+        request = candidate.resource_delta.request
+        if plan_facts.touches_remote(request):
+            return False
+        if request.target_line == "存4线":
+            return False
+        if request.source_line in {"存5线北", "存5线南"}:
+            if family == ContractFamily.DISPATCH_SHED_QUEUE and request.target_line == "调梁棚":
+                return candidate.contract_delta.contract_reduction >= 3
+            return (
+                family in {
+                    ContractFamily.FUNCTION_LINE_SERVICE,
+                    ContractFamily.DISPATCH_SHED_QUEUE,
+                    ContractFamily.PRE_REPAIR_STAGING,
+                }
+                and request.target_line in {"调梁棚", "调梁线北", "抛丸线", "预修线"}
+            )
+        if request.source_line == "调梁棚":
+            return (
+                family in {
+                    ContractFamily.FUNCTION_LINE_SERVICE,
+                    ContractFamily.LOCO_AREA_STAGING,
+                }
+                and request.target_line in {"洗罐站", "抛丸线", "机走棚"}
+            )
+        return False
 
     def fills_cun4_port(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase not in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT}:
@@ -161,6 +261,19 @@ class BaselinePolicy:
             and delta.contract_reduction > 0
         )
 
+    def releases_depot_outbound(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        envelope = candidate.envelope
+        hook = envelope.candidate
+        request = candidate.resource_delta.request
+        return (
+            envelope.contract.family == ContractFamily.DEPOT_OUTBOUND
+            and hook.source_line in physical.DEPOT_LINES
+            and request.target_line not in physical.DEPOT_TARGET_LINES
+            and candidate.contract_delta.contract_reduction > 0
+        )
+
     def swaps_depot_slot(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
             return False
@@ -180,6 +293,14 @@ class BaselinePolicy:
             and envelope.intent == IntentKind.REMOTE_SESSION
             and any(line in physical.DEPOT_LINES for line in request.put_lines)
             and delta.contract_reduction >= 3
+        )
+
+    def digests_remote_prefix_batch(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        return (
+            candidate.envelope.template_name == "remote_session_prefix_batch_digest_restore"
+            and candidate.contract_delta.contract_reduction >= 2
         )
 
     def digests_depot_inbound_batch(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
@@ -241,9 +362,9 @@ class BaselinePolicy:
                 ContractFamily.PRE_REPAIR_STAGING: 2,
                 ContractFamily.LOCO_AREA_STAGING: 3,
                 ContractFamily.YARD_REBALANCE: 4,
+                ContractFamily.REPAIR_INBOUND: 5,
                 ContractFamily.CUN4_PORT_STAGING: 5,
                 ContractFamily.DEPOT_OUTBOUND: 6,
-                ContractFamily.REPAIR_INBOUND: 7,
                 ContractFamily.DEPOT_SLOT: 8,
                 ContractFamily.REMOTE_SESSION: 9,
             }

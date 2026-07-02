@@ -67,6 +67,9 @@ class StructureNodeMetricRecord:
     remote_debt: int
     closeout_debt: int
     cun4_release_ready: bool
+    cun4_port_mode: str
+    cun4_release_count: int
+    cun4_prefix_hold_count: int
     remote_session_open: bool
     flow_edge_count: int
     flow_edge_families: str
@@ -115,6 +118,7 @@ class GenerationGapRecord:
     target_route_blocked: str
     source_prefixes: str
     serial_blocker_sources: str
+    spotting_detail: str
     reason: str
 
 
@@ -144,6 +148,9 @@ def build_structure_node_record(
         remote_debt=phase_state.remote_debt,
         closeout_debt=phase_state.closeout_debt,
         cun4_release_ready=phase_state.cun4_release_ready,
+        cun4_port_mode=phase_state.cun4_port_mode,
+        cun4_release_count=phase_state.cun4_release_count,
+        cun4_prefix_hold_count=phase_state.cun4_prefix_hold_count,
         remote_session_open=policy_context.remote_session_open,
         flow_edge_count=len(flow_edges),
         flow_edge_families=_counter_text(edge_families),
@@ -206,6 +213,13 @@ def build_generation_gap_records(
             if prefixes.get(line)
         )
         serial_sources = tuple(line for line in sources if line in serial_blockers)
+        spotting_detail = _spotting_detail(
+            contract=contract,
+            targets=targets,
+            prefixes=prefixes,
+            cars=state.cars,
+            depot_assignment=state.depot_assignment,
+        )
         rows.append(
             GenerationGapRecord(
                 case_id=state.case_id,
@@ -225,6 +239,7 @@ def build_generation_gap_records(
                 target_route_blocked="|".join(target_blocked),
                 source_prefixes="|".join(source_prefixes),
                 serial_blocker_sources="|".join(serial_sources),
+                spotting_detail=spotting_detail,
                 reason=_generation_gap_reason(
                     contract=contract,
                     applicable=applicable,
@@ -274,6 +289,51 @@ def _generation_gap_reason(
     if any(physical.is_spotting_line(line) for line in targets):
         return "spotting_target_repack_required"
     return "episode_generated_zero_after_prefilter"
+
+
+def _spotting_detail(
+    *,
+    contract: Any,
+    targets: tuple[str, ...],
+    prefixes: dict[str, tuple[str, ...]],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+) -> str:
+    target_line = next((line for line in targets if physical.is_spotting_line(line)), "")
+    if not target_line:
+        return ""
+    by_no = {physical.car_no(car): car for car in cars}
+    subject_nos = set(getattr(contract, "subject_nos", ()) or ())
+    source_prefix_nos = [
+        no
+        for line in getattr(contract, "source_lines", ()) or ()
+        for no in prefixes.get(line, ())
+    ]
+    prefix_subject = [no for no in source_prefix_nos if no in subject_nos]
+    forced_counter: Counter[str] = Counter()
+    for no in prefix_subject:
+        forced = physical.force_positions(by_no.get(no, {}))
+        if forced:
+            forced_counter[",".join(str(item) for item in forced)] += 1
+    existing_counter: Counter[str] = Counter()
+    for car in cars:
+        if car["Line"] != target_line:
+            continue
+        forced = physical.force_positions(car)
+        if forced and target_line in (car.get("_TargetLineSet") or set(physical.target_lines(car))):
+            existing_counter[",".join(str(item) for item in forced)] += 1
+    pieces = [
+        f"line={target_line}",
+        f"prefix_subject={len(prefix_subject)}",
+        f"forced_prefix={_counter_text(forced_counter)}",
+        f"forced_existing={_counter_text(existing_counter)}",
+    ]
+    for forced_text, count in forced_counter.items():
+        forced = tuple(int(item) for item in forced_text.split(",") if item)
+        pieces.append(f"capacity[{forced_text}]={physical.spotting_capacity(target_line, forced)}")
+        pieces.append(f"existing[{forced_text}]={len(physical.spotting_same_forced_positions(cars, target_line, forced, depot_assignment))}")
+        pieces.append(f"incoming[{forced_text}]={count}")
+    return ";".join(pieces)
 
 
 def _subject_is_blocked_inside_prefix(contract: Any, source_prefixes: tuple[str, ...]) -> bool:

@@ -88,6 +88,7 @@ WEIGH_LINE = "机库线"
 STAGING_CANDIDATE_KINDS = {
     "blocker_relocation",
     "capacity_release_to_staging",
+    "vnext_remote_prefix_lease_open",
     "same_line_stage_out",
     "spot_release_to_staging",
 }
@@ -434,6 +435,16 @@ def plan_step(
     planned_positions: dict[str, int] | None = None,
 ) -> PlanStep:
     return PlanStep(action, line, move_nos, planned_positions or {})
+
+
+SPOTTING_POSITIONED_CANDIDATE_KINDS = {
+    "vnext_spotting_repack",
+    "vnext_spotting_target_repack",
+}
+
+
+def honors_spotting_planned_positions(candidate_kind: str) -> bool:
+    return candidate_kind in SPOTTING_POSITIONED_CANDIDATE_KINDS
 
 
 @dataclass(frozen=True)
@@ -1168,16 +1179,12 @@ def spotting_capacity(line: str, forced: tuple[int, ...]) -> int:
 def spotting_window_bounds(line: str, forced: tuple[int, ...]) -> list[tuple[int, int]]:
     total = SPOTTING_LINE_TOTAL_POSITIONS.get(line, 0)
     mask_positions = spotting_mask_positions(line, forced)
-    capacity = len(mask_positions)
-    if not total or not capacity or not spotting_mask_is_contiguous(line, forced):
+    if not total or not mask_positions or not spotting_mask_is_contiguous(line, forced):
         return []
     first_position = mask_positions[0]
-    max_shift = total - mask_positions[-1]
-    if max_shift < 0:
-        return []
     return [
-        (first_position + shift, first_position + shift + capacity - 1)
-        for shift in range(max_shift + 1)
+        (first_position, end_position)
+        for end_position in range(first_position, total + 1)
     ]
 
 
@@ -1185,7 +1192,7 @@ def spotting_physical_position_for_mask(line: str, mask_position: int) -> int:
     total = SPOTTING_LINE_TOTAL_POSITIONS.get(line, 0)
     if not total or not 1 <= mask_position <= total:
         return 0
-    return total - mask_position + 1
+    return mask_position
 
 
 
@@ -1225,6 +1232,44 @@ def spotting_same_forced_positions(
     return positions
 
 
+def spotting_allowed_positions(
+    cars: list[dict[str, Any]],
+    target_line: str,
+    forced: tuple[int, ...],
+    depot_assignment: DepotAssignment,
+) -> set[int]:
+    total = SPOTTING_LINE_TOTAL_POSITIONS.get(target_line, 0)
+    mask_positions = spotting_mask_positions(target_line, forced)
+    if not total or not mask_positions or not spotting_mask_is_contiguous(target_line, forced):
+        return set()
+    same_members = [
+        car
+        for car in cars
+        if car_no(car) not in depot_assignment.failures
+        and car["Line"] == target_line
+        and target_line in (car.get("_TargetLineSet") or set(target_lines(car)))
+        and force_positions(car) == forced
+    ]
+    if not same_members:
+        return set()
+    southmost_same_position = max(int(car.get("Position") or 0) for car in same_members)
+    southern_nonforced_suffix = sum(
+        1
+        for car in cars
+        if car["Line"] == target_line
+        and int(car.get("Position") or 0) > southmost_same_position
+        and not (
+            target_line in (car.get("_TargetLineSet") or set(target_lines(car)))
+            and force_positions(car) == forced
+        )
+    )
+    max_position = total - southern_nonforced_suffix
+    min_position = mask_positions[0]
+    if max_position < min_position:
+        return set()
+    return set(range(min_position, max_position + 1))
+
+
 def spotting_group_positions_for_batch(
     *,
     group: list[dict[str, Any]],
@@ -1248,23 +1293,31 @@ def spotting_group_positions_for_batch(
         excluded_nos=batch_nos,
     )
     capacity = spotting_capacity(target_line, forced)
-    window_sets = spotting_physical_window_sets(target_line, forced)
-    if not window_sets or not capacity:
+    if not capacity:
         return {}
     existing_set = set(existing_positions)
     if len(existing_set) + len(group) > capacity:
         return {}
-    for window in window_sets:
-        if not existing_set <= window:
+    projected = [dict(car) for car in cars]
+    projected_nos = {car_no(car) for car in projected}
+    for car in group:
+        if car_no(car) in projected_nos:
             continue
-        free_positions = [
-            position
-            for position in sorted(window, reverse=True)
-            if position not in existing_set and position not in used
-        ]
-        if len(free_positions) >= len(group):
-            return {car_no(car): free_positions[index] for index, car in enumerate(group)}
-    return {}
+        item = dict(car)
+        item["Line"] = target_line
+        item["Position"] = 0
+        projected.append(item)
+    allowed = spotting_allowed_positions(projected, target_line, forced, depot_assignment)
+    if not existing_set <= allowed:
+        return {}
+    free_positions = [
+        position
+        for position in sorted(allowed)
+        if position not in existing_set and position not in used
+    ]
+    if len(free_positions) < len(group):
+        return {}
+    return {car_no(car): free_positions[index] for index, car in enumerate(group)}
 
 
 def spotting_group_is_acceptable(
@@ -1285,7 +1338,7 @@ def spotting_group_is_acceptable(
     if not capacity or len(positions) > capacity:
         return False
     occupied = set(positions)
-    return any(occupied <= window for window in window_sets)
+    return occupied <= spotting_allowed_positions(cars, target_line, forced, depot_assignment)
 
 
 def spotting_position_is_acceptable(
@@ -1474,8 +1527,10 @@ def planned_positions_for_batch(
     for car in batch:
         no = car_no(car)
         slot = depot_assignment.slots.get(no)
-        if slot and slot.line == target_line and slot.locked:
+        if slot and slot.line == target_line:
             position = slot.position
+            if position in occupied:
+                return {}
             planned[no] = position
             occupied.add(position)
             continue
@@ -1573,6 +1628,18 @@ def line_length_loads(cars: list[dict[str, Any]]) -> Counter[str]:
     return loads
 
 
+def final_line_length_warnings(cars: list[dict[str, Any]]) -> tuple[str, ...]:
+    loads = line_length_loads(cars)
+    warnings: list[str] = []
+    for line, load in sorted(loads.items()):
+        spec = TRACK_SPECS.get(line)
+        if not spec:
+            continue
+        if load > spec.length_m + LINE_LENGTH_TOLERANCE_M:
+            warnings.append(f"{line}:{load:.1f}>{spec.length_m:.1f}")
+    return tuple(warnings)
+
+
 def occupied_lines_for_route(cars: list[dict[str, Any]], moving_nos: set[str]) -> set[str]:
     return {
         car["Line"]
@@ -1613,9 +1680,10 @@ def physical_positions_after_put(
     put_order: list[str],
     access_node: str,
     planned_positions: dict[str, int] | None = None,
+    honor_spotting_planned_positions: bool = False,
 ) -> dict[str, int]:
     put_order = [no for no in put_order if no]
-    if line in DEPOT_LINES and planned_positions:
+    if planned_positions and (line in DEPOT_LINES or is_spotting_line(line)):
         return {
             no: int(planned_positions[no])
             for no in put_order
@@ -1637,8 +1705,16 @@ def apply_physical_put_order(
     put_order: list[str],
     access_node: str,
     planned_positions: dict[str, int] | None = None,
+    honor_spotting_planned_positions: bool = False,
 ) -> None:
-    positions = physical_positions_after_put(cars, line, put_order, access_node, planned_positions)
+    positions = physical_positions_after_put(
+        cars,
+        line,
+        put_order,
+        access_node,
+        planned_positions,
+        honor_spotting_planned_positions,
+    )
     for car in cars:
         no = car_no(car)
         if no not in positions:
@@ -1653,9 +1729,17 @@ def projected_after_physical_put(
     put_order: list[str],
     access_node: str,
     planned_positions: dict[str, int] | None = None,
+    honor_spotting_planned_positions: bool = False,
 ) -> list[dict[str, Any]]:
     projected = [dict(car) for car in cars]
-    apply_physical_put_order(projected, line, put_order, access_node, planned_positions)
+    apply_physical_put_order(
+        projected,
+        line,
+        put_order,
+        access_node,
+        planned_positions,
+        honor_spotting_planned_positions,
+    )
     return projected
 
 
@@ -1799,7 +1883,7 @@ def line_cars_in_access_order(
 def classify_action_family(source_line: str, target_line: str, is_weigh: bool) -> ContractFamily:
     if is_weigh:
         return ContractFamily.SPECIAL_REPAIR_PROCESS
-    if source_line in DEPOT_LINES and target_line not in DEPOT_TARGET_LINES:
+    if source_line in REMOTE_INTERACTION_LINES and target_line not in DEPOT_TARGET_LINES:
         return ContractFamily.DEPOT_OUTBOUND
     if target_line == "存4线":
         return ContractFamily.CUN4_PORT_STAGING
@@ -2695,12 +2779,12 @@ def validate_candidate(
         put_order,
         put_location.node,
         candidate.planned_positions,
+        honors_spotting_planned_positions(candidate.candidate_kind),
     )
     position_reasons = validate_target_positions(
         candidate,
         projected_after_put,
         batch,
-        target_line_cars,
         active_depot_assignment,
     )
     reasons.extend(position_reasons)
@@ -2864,11 +2948,6 @@ def validate_planlet(
                 has_weigh=any(bool(car.get("IsWeigh")) for car in batch),
                 plan_steps=(),
             )
-            existing_target_cars = [
-                car
-                for car in working_cars
-                if car["Line"] == step.line and car_no(car) not in carried
-            ]
             active_depot_assignment = current_depot_assignment(depot_assignment, working_cars)
             put_location = operation_stand_location(path, step.line)
             put_order = carried_order[-len(step_nos):] if step_nos else []
@@ -2878,15 +2957,23 @@ def validate_planlet(
                 put_order,
                 put_location.node,
                 step.planned_positions,
+                honors_spotting_planned_positions(candidate.candidate_kind),
             )
-            reasons.extend(validate_target_positions(step_candidate, projected_after_put, batch, existing_target_cars, active_depot_assignment))
+            reasons.extend(validate_target_positions(step_candidate, projected_after_put, batch, active_depot_assignment))
             train_consist = [by_no[no] for no in carried_order if no in by_no]
             reasons.extend(validate_closed_door(step_candidate, projected_after_put, batch, train_consist))
             if reasons:
                 break
             operation_paths.append(path)
             put_path = path
-            apply_physical_put_order(working_cars, step.line, put_order, put_location.node, step.planned_positions)
+            apply_physical_put_order(
+                working_cars,
+                step.line,
+                put_order,
+                put_location.node,
+                step.planned_positions,
+                honors_spotting_planned_positions(candidate.candidate_kind),
+            )
             for source_line, moved_nos in source_lines_by_step:
                 disposed_nos = moved_nos & step_nos
                 if disposed_nos and source_line != step.line and source_line not in DEPOT_LINES:
@@ -2960,7 +3047,6 @@ def validate_target_positions(
     candidate: HookCandidate,
     projected_cars: list[dict[str, Any]],
     batch: list[dict[str, Any]],
-    target_line_cars: list[dict[str, Any]],
     depot_assignment: DepotAssignment,
 ) -> list[str]:
     reasons: list[str] = []
@@ -3029,17 +3115,32 @@ def validate_target_positions(
         if spec:
             existing_length = sum(
                 car_length(car)
-                for car in target_line_cars
+                for car in projected_cars
+                if car["Line"] == candidate.target_line
                 if car_no(car) not in batch_nos
             )
             after_length = existing_length + candidate.train_length_m
             if after_length > spec.length_m + LINE_LENGTH_TOLERANCE_M:
-                reasons.append(
-                    f"target_line_length_violation:{candidate.target_line}:{after_length:.1f}>{spec.length_m:.1f}"
-                )
+                reason = f"target_line_length_violation:{candidate.target_line}:{after_length:.1f}>{spec.length_m:.1f}"
+                if not _is_final_target_put(candidate.target_line, batch, projected_cars, depot_assignment):
+                    reasons.append(reason)
             if spec.track_type == "temporary" and candidate.candidate_kind not in STAGING_CANDIDATE_KINDS:
                 reasons.append(f"temporary_line_final_target_violation:{candidate.target_line}")
     return reasons
+
+
+def _is_final_target_put(
+    target_line: str,
+    batch: list[dict[str, Any]],
+    cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment,
+) -> bool:
+    loads = line_loads(cars)
+    for car in batch:
+        planned_line, _position, _reason = planned_target_for_car(car, cars, depot_assignment, loads)
+        if planned_line != target_line:
+            return False
+    return bool(batch)
 
 def validate_closed_door(
     candidate: HookCandidate,
@@ -3199,7 +3300,14 @@ def apply_candidate(
             path = paths.pop(0) if paths else ()
             access_node = operation_stand_location(path, step.line).node if path else line_end_node(step.line, "North")
             put_order = carried_order[-len(step_nos):] if step_nos else []
-            apply_physical_put_order(cars, step.line, put_order, access_node, step.planned_positions)
+            apply_physical_put_order(
+                cars,
+                step.line,
+                put_order,
+                access_node,
+                step.planned_positions,
+                honors_spotting_planned_positions(candidate.candidate_kind),
+            )
             for source_line, moved_nos in source_lines_by_step:
                 disposed_nos = moved_nos & step_nos
                 if disposed_nos and source_line != step.line and source_line not in DEPOT_LINES:
@@ -3236,13 +3344,22 @@ def apply_candidate(
         no = car_no(car)
         if no == weighed_no:
             car["_Weighed"] = True
-    apply_physical_put_order(cars, candidate.target_line, put_order, put_location.node, candidate.planned_positions)
+    apply_physical_put_order(
+        cars,
+        candidate.target_line,
+        put_order,
+        put_location.node,
+        candidate.planned_positions,
+        honors_spotting_planned_positions(candidate.candidate_kind),
+    )
     if candidate.source_line != candidate.target_line:
         if candidate.source_line not in DEPOT_LINES:
             compact_source_positions(cars, candidate.source_line, move_nos)
 
 
 def compact_source_positions(cars: list[dict[str, Any]], source_line: str, moved_nos: set[str]) -> None:
+    if is_spotting_line(source_line):
+        return
     remaining = [car for car in cars if car["Line"] == source_line and car_no(car) not in moved_nos]
     remaining.sort(key=lambda item: (int(item.get("Position") or 0), car_no(item)))
     for position, car in enumerate(remaining, start=1):

@@ -10,6 +10,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from solver_vnext import physical
+from solver_vnext.placement import planned_positions_for_batch
 from solver_vnext.contracts import classify_family
 from solver_vnext.domain import ContractFamily
 
@@ -150,6 +151,58 @@ def test_reversal_triplet_rule_does_not_fire_on_unlisted_path() -> None:
         train_length_m=300.0,
     )
     assert reasons == []
+
+
+def test_spotting_placement_uses_relaxed_business_window_with_fixed_capacity() -> None:
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    batch = [
+        car(f"F{index}", line="存5线北", position=index, target_lines=["调梁棚"])
+        for index in range(1, 5)
+    ]
+    for item in batch:
+        item["_ForcePositions"] = (6, 7, 8, 9)
+        item["ForceTargetPosition"] = [6, 7, 8, 9]
+    placed = planned_positions_for_batch(
+        batch=batch,
+        target_line="调梁棚",
+        cars=batch,
+        depot_assignment=depot_assignment,
+        batch_nos={physical.car_no(item) for item in batch},
+    )
+    assert set(placed.values()) <= {6, 7, 8, 9, 10, 11}
+    assert len(set(placed.values())) == 4
+
+    overflow = [
+        car(f"O{index}", line="存5线北", position=index, target_lines=["调梁棚"])
+        for index in range(1, 6)
+    ]
+    for item in overflow:
+        item["_ForcePositions"] = (6, 7, 8, 9)
+        item["ForceTargetPosition"] = [6, 7, 8, 9]
+    assert planned_positions_for_batch(
+        batch=overflow,
+        target_line="调梁棚",
+        cars=overflow,
+        depot_assignment=depot_assignment,
+        batch_nos={physical.car_no(item) for item in overflow},
+    ) == {}
+
+
+def test_spotting_line_source_positions_are_not_compacted_after_remove() -> None:
+    cars = [
+        car("N1", line="抛丸线", position=1, target_lines=["存1线"]),
+        car("F1", line="抛丸线", position=2, target_lines=["抛丸线"]),
+        car("F2", line="抛丸线", position=3, target_lines=["抛丸线"]),
+    ]
+    for item in cars[1:]:
+        item["_ForcePositions"] = (2, 3)
+        item["ForceTargetPosition"] = [2, 3]
+    physical.compact_source_positions(cars, "抛丸线", {"N1"})
+    assert {physical.car_no(item): item["Position"] for item in cars} == {
+        "N1": 1,
+        "F1": 2,
+        "F2": 3,
+    }
 
 
 if __name__ == "__main__":
