@@ -235,7 +235,7 @@ def test_spotting_placement_uses_relaxed_business_window_with_fixed_capacity() -
     ) == {}
 
 
-def test_spotting_line_source_positions_are_not_compacted_after_remove() -> None:
+def test_spotting_line_source_positions_compact_after_north_end_remove() -> None:
     cars = [
         car("N1", line="抛丸线", position=1, target_lines=["存1线"]),
         car("F1", line="抛丸线", position=2, target_lines=["抛丸线"]),
@@ -244,11 +244,206 @@ def test_spotting_line_source_positions_are_not_compacted_after_remove() -> None
     for item in cars[1:]:
         item["_ForcePositions"] = (2, 3)
         item["ForceTargetPosition"] = [2, 3]
+    cars[0]["Line"] = "存1线"
     physical.compact_source_positions(cars, "抛丸线", {"N1"})
-    assert {physical.car_no(item): item["Position"] for item in cars} == {
-        "N1": 1,
-        "F1": 2,
-        "F2": 3,
+    assert {
+        physical.car_no(item): item["Position"]
+        for item in cars
+        if item["Line"] == "抛丸线"
+    } == {
+        "F1": 1,
+        "F2": 2,
+    }
+
+
+def test_get_order_allows_only_north_end_prefix() -> None:
+    cars = [
+        car("A", line="存1线", position=1),
+        car("B", line="存1线", position=2),
+        car("C", line="存1线", position=3),
+    ]
+    assert physical.inaccessible_get_reason(
+        cars=cars,
+        line="存1线",
+        move_nos=("A", "B"),
+        carried_nos=set(),
+        step_index=1,
+    ) == ""
+    reason = physical.inaccessible_get_reason(
+        cars=cars,
+        line="存1线",
+        move_nos=("B",),
+        carried_nos=set(),
+        step_index=1,
+    )
+    assert reason.startswith("line_end_get_order_violation")
+    reason = physical.inaccessible_get_reason(
+        cars=cars,
+        line="存1线",
+        move_nos=("A", "C"),
+        carried_nos=set(),
+        step_index=1,
+    )
+    assert "reachable=A,B" in reason
+
+
+def test_put_order_allows_only_train_tail_suffix() -> None:
+    carried_order = ["A", "B", "C"]
+    assert physical.inaccessible_put_reason(carried_order, ("C",), 2) == ""
+    assert physical.inaccessible_put_reason(carried_order, ("B", "C"), 2) == ""
+    assert physical.inaccessible_put_reason(carried_order, ("A",), 2).startswith(
+        "train_tail_put_order_violation"
+    )
+    assert physical.inaccessible_put_reason(carried_order, ("C", "B"), 2).startswith(
+        "train_tail_put_order_violation"
+    )
+
+
+def test_put_inserts_from_north_end_and_shifts_existing_on_all_lines() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
+        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
+        car("E1", line="修1库内", position=4, target_lines=["修1库内"]),
+        car("E2", line="修1库内", position=8, target_lines=["修1库内"]),
+    ]
+    physical.apply_physical_put_order(cars, "修1库内", ["M1", "M2"])
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "M1": ("修1库内", 1),
+        "M2": ("修1库内", 2),
+        "E1": ("修1库内", 3),
+        "E2": ("修1库内", 4),
+    }
+
+
+def test_planlet_rejects_non_tail_put_and_accepts_tail_put_order() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["存3线"]),
+        car("B", line="存1线", position=2, target_lines=["存2线"]),
+        car("C", line="存1线", position=3, target_lines=["存2线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    graph = physical.TrackGraph()
+    invalid = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存1线",
+        target_line="存2线",
+        batch=cars,
+        steps=(
+            physical.plan_step("Get", "存1线", ("A", "B", "C")),
+            physical.plan_step("Put", "存2线", ("A",)),
+        ),
+        reason="test",
+        candidate_kind="test_planlet",
+    )
+    invalid_validation = physical.validate_candidate(
+        graph,
+        invalid,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert any(
+        reason.startswith("train_tail_put_order_violation")
+        for reason in invalid_validation.reasons
+    )
+
+    valid = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=2,
+        source_line="存1线",
+        target_line="存3线",
+        batch=cars,
+        steps=(
+            physical.plan_step("Get", "存1线", ("A", "B", "C")),
+            physical.plan_step("Put", "存2线", ("B", "C")),
+            physical.plan_step("Put", "存3线", ("A",)),
+        ),
+        reason="test",
+        candidate_kind="test_planlet",
+    )
+    valid_validation = physical.validate_candidate(
+        graph,
+        valid,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert valid_validation.accepted, valid_validation.reasons
+
+
+def test_planlet_source_compaction_excludes_cars_still_on_loco() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["存3线"]),
+        car("B", line="存1线", position=2, target_lines=["存2线"]),
+        car("C", line="存1线", position=3, target_lines=["存2线"]),
+        car("S", line="存1线", position=4, target_lines=["存1线"]),
+    ]
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=3,
+        source_line="存1线",
+        target_line="存3线",
+        batch=cars[:3],
+        steps=(
+            physical.plan_step("Get", "存1线", ("A", "B", "C")),
+            physical.plan_step("Put", "存2线", ("B", "C")),
+            physical.plan_step("Put", "存3线", ("A",)),
+        ),
+        reason="test",
+        candidate_kind="test_planlet",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert validation.accepted, validation.reasons
+    physical.apply_candidate(candidate, cars, validation)
+    assert {physical.car_no(item): item["Position"] for item in cars}["S"] == 1
+
+
+def test_planlet_partial_return_to_source_does_not_count_carried_cars_on_line() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["存3线"]),
+        car("B", line="存1线", position=2, target_lines=["存1线"]),
+        car("S", line="存1线", position=3, target_lines=["存1线"]),
+    ]
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=4,
+        source_line="存1线",
+        target_line="存3线",
+        batch=cars[:2],
+        steps=(
+            physical.plan_step("Get", "存1线", ("A", "B")),
+            physical.plan_step("Put", "存1线", ("B",)),
+            physical.plan_step("Put", "存3线", ("A",)),
+        ),
+        reason="test",
+        candidate_kind="test_planlet",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert validation.accepted, validation.reasons
+    physical.apply_candidate(candidate, cars, validation)
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "A": ("存3线", 1),
+        "B": ("存1线", 1),
+        "S": ("存1线", 2),
     }
 
 

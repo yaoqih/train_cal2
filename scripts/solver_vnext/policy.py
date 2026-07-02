@@ -166,13 +166,9 @@ class BaselinePolicy:
         if candidate.contract_delta.contract_reduction <= 0:
             return False
         request = candidate.resource_delta.request
-        hook = candidate.envelope.candidate
         if not physical.is_spotting_line(request.target_line):
             return False
-        return (
-            physical.honors_spotting_planned_positions(hook.candidate_kind)
-            or candidate.envelope.template_name in {"spotting_repack", "spotting_target_repack"}
-        )
+        return candidate.envelope.template_name in {"spotting_repack", "spotting_target_repack"}
 
     def continues_remote_work(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:

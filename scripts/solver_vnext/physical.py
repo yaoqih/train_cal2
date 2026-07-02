@@ -381,16 +381,6 @@ def plan_step(
     return PlanStep(action, line, move_nos, planned_positions or {})
 
 
-SPOTTING_POSITIONED_CANDIDATE_KINDS = {
-    "vnext_spotting_repack",
-    "vnext_spotting_target_repack",
-}
-
-
-def honors_spotting_planned_positions(candidate_kind: str) -> bool:
-    return candidate_kind in SPOTTING_POSITIONED_CANDIDATE_KINDS
-
-
 @dataclass(frozen=True)
 class HookCandidate:
     case_id: str
@@ -1547,16 +1537,8 @@ def physical_positions_after_put(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
-    planned_positions: dict[str, int] | None = None,
-    honor_spotting_planned_positions: bool = False,
 ) -> dict[str, int]:
     put_order = [no for no in put_order if no]
-    if planned_positions and (line in DEPOT_LINES or is_spotting_line(line)):
-        return {
-            no: int(planned_positions[no])
-            for no in put_order
-            if no in planned_positions
-        }
     put_nos = set(put_order)
     existing_access_order = [
         no for no in line_access_order(cars, line, put_nos)
@@ -1570,15 +1552,11 @@ def apply_physical_put_order(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
-    planned_positions: dict[str, int] | None = None,
-    honor_spotting_planned_positions: bool = False,
 ) -> None:
     positions = physical_positions_after_put(
         cars,
         line,
         put_order,
-        planned_positions,
-        honor_spotting_planned_positions,
     )
     for car in cars:
         no = car_no(car)
@@ -1588,20 +1566,30 @@ def apply_physical_put_order(
         car["Position"] = positions[no]
 
 
+def apply_physical_get_order(
+    cars: list[dict[str, Any]],
+    line: str,
+    get_order: list[str] | tuple[str, ...],
+) -> None:
+    get_nos = {no for no in get_order if no}
+    for car in cars:
+        if car_no(car) not in get_nos:
+            continue
+        car["Line"] = ""
+        car["Position"] = 0
+    compact_source_positions(cars, line, get_nos)
+
+
 def projected_after_physical_put(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
-    planned_positions: dict[str, int] | None = None,
-    honor_spotting_planned_positions: bool = False,
 ) -> list[dict[str, Any]]:
     projected = [dict(car) for car in cars]
     apply_physical_put_order(
         projected,
         line,
         put_order,
-        planned_positions,
-        honor_spotting_planned_positions,
     )
     return projected
 
@@ -2463,7 +2451,6 @@ def validate_candidate(
     reasons: list[str] = []
     by_no = {car_no(car): car for car in cars}
     batch = [by_no[no] for no in candidate.move_car_nos if no in by_no]
-    target_line_cars = [car for car in cars if car["Line"] == candidate.target_line]
     occupied_lines = occupied_lines_for_get_route(cars, set(candidate.move_car_nos), candidate.source_line)
     move_nos = set(candidate.move_car_nos)
     get_path = graph.route_avoiding_occupied(
@@ -2567,9 +2554,6 @@ def validate_candidate(
     reasons.extend(single_hook_weigh_reasons(candidate, batch))
 
     active_depot_assignment = current_depot_assignment(depot_assignment, cars)
-    put_location = operation_stand_location(put_path, candidate.target_line) if put_path else LocoLocation(
-        line=candidate.target_line,
-    )
     put_order = carried_order_after_get(
         cars=cars,
         line=candidate.source_line,
@@ -2582,8 +2566,6 @@ def validate_candidate(
         cars,
         candidate.target_line,
         put_order,
-        candidate.planned_positions,
-        honors_spotting_planned_positions(candidate.candidate_kind),
     )
     position_reasons = validate_target_positions(
         candidate,
@@ -2618,7 +2600,6 @@ def validate_planlet(
     operation_paths: list[tuple[str, ...]] = []
     get_path: tuple[str, ...] = ()
     put_path: tuple[str, ...] = ()
-    source_lines_by_step: list[tuple[str, set[str]]] = []
 
     for index, step in enumerate(candidate_plan_steps(candidate), start=1):
         step_nos = set(step.move_car_nos)
@@ -2639,7 +2620,6 @@ def validate_planlet(
                 reasons.append("pull_limit_violation")
                 break
             occupied_lines = occupied_lines_for_get_route(working_cars, step_nos | carried, step.line)
-            moving = step_nos | carried
             raw_path = graph.route_avoiding_occupied(
                 current_loco.line,
                 step.line,
@@ -2694,7 +2674,7 @@ def validate_planlet(
             ):
                 if no not in carried_order:
                     carried_order.append(no)
-            source_lines_by_step.append((step.line, set(step_nos)))
+            apply_physical_get_order(working_cars, step.line, step.move_car_nos)
             current_loco = source_location
             continue
 
@@ -2751,14 +2731,11 @@ def validate_planlet(
                 plan_steps=(),
             )
             active_depot_assignment = current_depot_assignment(depot_assignment, working_cars)
-            put_location = operation_stand_location(path, step.line)
             put_order = carried_order[-len(step_nos):] if step_nos else []
             projected_after_put = projected_after_physical_put(
                 working_cars,
                 step.line,
                 put_order,
-                step.planned_positions,
-                honors_spotting_planned_positions(candidate.candidate_kind),
             )
             reasons.extend(validate_target_positions(step_candidate, projected_after_put, batch, active_depot_assignment))
             train_consist = [by_no[no] for no in carried_order if no in by_no]
@@ -2771,18 +2748,7 @@ def validate_planlet(
                 working_cars,
                 step.line,
                 put_order,
-                step.planned_positions,
-                honors_spotting_planned_positions(candidate.candidate_kind),
             )
-            for source_line, moved_nos in source_lines_by_step:
-                disposed_nos = moved_nos & step_nos
-                if disposed_nos and source_line != step.line and source_line not in DEPOT_LINES:
-                    compact_source_positions(working_cars, source_line, disposed_nos)
-            source_lines_by_step = [
-                (source_line, moved_nos - step_nos)
-                for source_line, moved_nos in source_lines_by_step
-                if moved_nos - step_nos
-            ]
             carried.difference_update(step_nos)
             carried_order = [no for no in carried_order if no not in step_nos]
             current_loco = operation_stand_location(path, step.line)
@@ -3068,14 +3034,11 @@ def apply_candidate(
     validation: PhysicalValidation | None = None,
 ) -> None:
     if candidate.plan_steps:
-        source_lines_by_step: list[tuple[str, set[str]]] = []
         carried_order: list[str] = []
         paths = list(validation.operation_paths) if validation else []
         for step in candidate_plan_steps(candidate):
-            step_index = len(source_lines_by_step) + 1
             step_nos = set(step.move_car_nos)
             if step.action == "Get":
-                source_lines_by_step.append((step.line, step_nos))
                 if paths:
                     paths.pop(0)
                 for no in carried_order_after_get(
@@ -3086,6 +3049,7 @@ def apply_candidate(
                 ):
                     if no not in carried_order:
                         carried_order.append(no)
+                apply_physical_get_order(cars, step.line, step.move_car_nos)
                 continue
             if step.action == "Weigh":
                 if paths:
@@ -3103,18 +3067,7 @@ def apply_candidate(
                 cars,
                 step.line,
                 put_order,
-                step.planned_positions,
-                honors_spotting_planned_positions(candidate.candidate_kind),
             )
-            for source_line, moved_nos in source_lines_by_step:
-                disposed_nos = moved_nos & step_nos
-                if disposed_nos and source_line != step.line and source_line not in DEPOT_LINES:
-                    compact_source_positions(cars, source_line, disposed_nos)
-            source_lines_by_step = [
-                (source_line, moved_nos - step_nos)
-                for source_line, moved_nos in source_lines_by_step
-                if moved_nos - step_nos
-            ]
             carried_order = [no for no in carried_order if no not in step_nos]
         return
     move_nos = set(candidate.move_car_nos)
@@ -3135,17 +3088,12 @@ def apply_candidate(
         cars,
         candidate.target_line,
         put_order,
-        candidate.planned_positions,
-        honors_spotting_planned_positions(candidate.candidate_kind),
     )
     if candidate.source_line != candidate.target_line:
-        if candidate.source_line not in DEPOT_LINES:
-            compact_source_positions(cars, candidate.source_line, move_nos)
+        compact_source_positions(cars, candidate.source_line, move_nos)
 
 
 def compact_source_positions(cars: list[dict[str, Any]], source_line: str, moved_nos: set[str]) -> None:
-    if is_spotting_line(source_line):
-        return
     remaining = [car for car in cars if car["Line"] == source_line and car_no(car) not in moved_nos]
     remaining.sort(key=lambda item: (int(item.get("Position") or 0), car_no(item)))
     for position, car in enumerate(remaining, start=1):
