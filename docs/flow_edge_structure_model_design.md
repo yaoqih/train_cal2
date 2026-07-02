@@ -5750,7 +5750,7 @@ artifacts/current_truth2_eval/
 当前验证入口：
 
 ```bash
-rtk python3 scripts/generate_physical_runtime_trace.py --root . --output-dir artifacts/current_truth2_eval --max-hooks 300 --check
+rtk python3 scripts/generate_vnext_runtime_trace.py --root . --output-dir artifacts/current_truth2_eval --max-hooks 300 --check
 ```
 
 用于判断方案是否真正接近人工的核心指标：

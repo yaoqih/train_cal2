@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 from . import serial
 from .contracts import contract_debt
 from .domain import CandidateEnvelope, ContractDelta, IntentKind
@@ -10,7 +10,7 @@ from .domain import CandidateEnvelope, ContractDelta, IntentKind
 
 def simulate_candidate(candidate: Any, cars: list[dict[str, Any]], validation: Any) -> list[dict[str, Any]]:
     prospective = [dict(car) for car in cars]
-    legacy.legacy.apply_candidate(candidate, prospective, validation)
+    physical.apply_candidate(candidate, prospective, validation)
     return prospective
 
 
@@ -21,8 +21,8 @@ def build_contract_delta(
     prospective_cars: list[dict[str, Any]],
     depot_assignment: Any,
 ) -> ContractDelta:
-    before_unsatisfied = len(legacy.unsatisfied_cars(cars, depot_assignment))
-    after_unsatisfied = len(legacy.unsatisfied_cars(prospective_cars, depot_assignment))
+    before_unsatisfied = len(physical.unsatisfied_cars(cars, depot_assignment))
+    after_unsatisfied = len(physical.unsatisfied_cars(prospective_cars, depot_assignment))
     before_contract_debt = contract_debt(envelope.contract, cars, depot_assignment)
     after_contract_debt = contract_debt(envelope.contract, prospective_cars, depot_assignment)
     fulfilled: list[str] = []
@@ -40,17 +40,21 @@ def build_contract_delta(
         prospective_cars=prospective_cars,
         depot_assignment=depot_assignment,
     )
-    if after_contract_debt > before_contract_debt:
+    opens_serial_gate_lease = envelope.intent == IntentKind.SERIAL_GATE_CLEAR and bool(serial_releases)
+    if after_contract_debt > before_contract_debt and not opens_serial_gate_lease:
         broken.append("contract_debt_increased")
-    if after_unsatisfied > before_unsatisfied:
+    if after_unsatisfied > before_unsatisfied and not opens_serial_gate_lease:
         broken.append("global_unsatisfied_increased")
     if serial_releases:
         support_gain = max(support_gain, len(serial_releases))
         reduced.append("serial_line_gate_released")
+    if opens_serial_gate_lease:
+        fulfilled.append("serial_gate_lease_opened")
+        support_gain = max(support_gain, len(serial_releases) + max(0, after_unsatisfied - before_unsatisfied))
     if envelope.resource_request.same_plan_source_return_nos:
         fulfilled.append("same_plan_prefix_returned_to_source")
-    if envelope.intent == IntentKind.DEPOT_REPACK:
-        reduced.append("depot_repack_ordered")
+    if envelope.intent in {IntentKind.DEPOT_REPACK, IntentKind.DEPOT_SLOT_SWAP}:
+        reduced.append("depot_repack_ordered" if envelope.intent == IntentKind.DEPOT_REPACK else "depot_slot_swap_ordered")
         if after_contract_debt < before_contract_debt:
             reduced.append("depot_contract_debt_reduced")
     return ContractDelta(
@@ -79,14 +83,14 @@ def _serial_blocker_releases(
     releases: list[str] = []
     for blocker_line in serial.serial_blocker_lines():
         before_nos = {
-            legacy.car_no(car)
+            physical.car_no(car)
             for car in cars
             if car["Line"] == blocker_line
         }
         if not before_nos or not before_nos <= move_nos:
             continue
         after_nos = {
-            legacy.car_no(car)
+            physical.car_no(car)
             for car in prospective_cars
             if car["Line"] == blocker_line
         }

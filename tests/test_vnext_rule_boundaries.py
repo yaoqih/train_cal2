@@ -1,0 +1,158 @@
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from solver_vnext import physical
+from solver_vnext.contracts import classify_family
+from solver_vnext.domain import ContractFamily
+
+
+def car(
+    no: str,
+    *,
+    line: str = "存1线",
+    position: int = 1,
+    target_lines: list[str] | None = None,
+    closed: bool = False,
+    heavy: bool = False,
+    weigh: bool = False,
+) -> dict:
+    return physical.normalized_car(
+        {
+            "No": no,
+            "Line": line,
+            "Position": position,
+            "RepairProcess": "段修",
+            "Type": "棚车",
+            "Length": 14.3,
+            "TargetLines": target_lines or ["存2线"],
+            "IsClosedDoor": closed,
+            "IsHeavy": heavy,
+            "IsWeigh": weigh,
+        }
+    )
+
+
+def test_family_classification_is_single_source() -> None:
+    assert classify_family("存1线", "机库线", False) == ContractFamily.LOCO_AREA_STAGING
+    assert physical.action_family("存1线", "机库线", False) == ContractFamily.LOCO_AREA_STAGING.value
+    assert physical.action_family("存1线", "洗罐站", False) == ContractFamily.FUNCTION_LINE_SERVICE.value
+    assert physical.action_family("修1库内", "存4线", False) == ContractFamily.DEPOT_OUTBOUND.value
+
+
+def test_closed_door_non_cun4_heavy_first_rejected() -> None:
+    consist = [
+        car("C1", closed=True, heavy=False),
+        car("C2", heavy=True),
+    ]
+    reasons = physical.closed_door_put_reasons(
+        target_line="存2线",
+        projected_cars=consist,
+        moved_nos={physical.car_no(item) for item in consist},
+        train_consist=consist,
+    )
+    assert any(reason.startswith("closed_door_full_consist_first_car_violation") for reason in reasons)
+
+
+def test_closed_door_non_cun4_over_ten_first_rejected() -> None:
+    consist = [car("C01", closed=True)] + [car(f"C{index:02d}") for index in range(2, 12)]
+    reasons = physical.closed_door_put_reasons(
+        target_line="存2线",
+        projected_cars=consist,
+        moved_nos={physical.car_no(item) for item in consist},
+        train_consist=consist,
+    )
+    assert any(reason.startswith("closed_door_full_consist_first_car_violation") for reason in reasons)
+
+
+def test_closed_door_cun4_put_position_rejected_for_moved_car() -> None:
+    projected = [
+        car("C1", line="存4线", position=1, target_lines=["存4线"], closed=True),
+        car("C2", line="存4线", position=4, target_lines=["存4线"]),
+    ]
+    reasons = physical.closed_door_put_reasons(
+        target_line="存4线",
+        projected_cars=projected,
+        moved_nos={"C1"},
+        train_consist=projected,
+    )
+    assert "closed_door_cun4_put_position_violation:C1:1" in reasons
+
+
+def test_closed_door_cun4_put_position_ignores_unmoved_car_for_step_check() -> None:
+    projected = [
+        car("C1", line="存4线", position=1, target_lines=["存4线"], closed=True),
+        car("C2", line="存4线", position=4, target_lines=["存4线"]),
+    ]
+    assert physical.closed_door_put_reasons(
+        target_line="存4线",
+        projected_cars=projected,
+        moved_nos={"C2"},
+        train_consist=projected,
+    ) == []
+
+
+def test_pull_equivalent_counts_heavy_as_four() -> None:
+    assert physical.pull_equivalent([car("C1", heavy=True), car("C2")]) == 5
+
+
+def test_weigh_requires_pending_tail_car() -> None:
+    batch = [car("C1", weigh=True), car("C2")]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存1线",
+        target_line="存2线",
+        batch=batch,
+        planned_positions={"C1": 1, "C2": 2},
+        generation_reason="test",
+        candidate_kind="target_move",
+        has_weigh_override=True,
+    )
+    reasons = physical.single_hook_weigh_reasons(candidate, batch)
+    assert reasons and reasons[0].startswith("weigh_requires_pending_tail_car")
+
+
+def test_reversal_triplet_rule_uses_loco_plus_train_length() -> None:
+    static_cars = [car("B1", line="机北2", position=1)]
+    reasons = physical.pre_repair_reversal_reasons(
+        ["调梁线北", "渡4", "机库线"],
+        static_cars,
+        moving_nos=set(),
+        train_length_m=30.0,
+    )
+    assert any(reason.startswith("route_reversal_length_violation") for reason in reasons)
+
+
+def test_reversal_triplet_rule_does_not_fire_without_blocker() -> None:
+    reasons = physical.pre_repair_reversal_reasons(
+        ["调梁线北", "渡4", "机库线"],
+        [],
+        moving_nos=set(),
+        train_length_m=300.0,
+    )
+    assert reasons == []
+
+
+def test_reversal_triplet_rule_does_not_fire_on_unlisted_path() -> None:
+    static_cars = [car("B1", line="机北2", position=1)]
+    reasons = physical.pre_repair_reversal_reasons(
+        ["存1线", "存2线", "存3线"],
+        static_cars,
+        moving_nos=set(),
+        train_length_m=300.0,
+    )
+    assert reasons == []
+
+
+if __name__ == "__main__":
+    for name, value in sorted(globals().items()):
+        if name.startswith("test_") and callable(value):
+            value()

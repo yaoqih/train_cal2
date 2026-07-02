@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 from . import serial
 from .domain import ContractFamily
 from .domain import CandidateEnvelope, ResourceDelta, ResourceKind, ResourceRequest
@@ -11,28 +11,29 @@ from .domain import CandidateEnvelope, ResourceDelta, ResourceKind, ResourceRequ
 class StationResourceGraph:
     """Hard resource arbiter for vNext candidates.
 
-    The first implementation is deliberately small: it does not score business
-    value, it only accepts/rejects resource requests and records why.
+    Physical reachability is decided before this layer.  Serial gate checks here
+    are strategy/resource constraints: they protect downstream work from being
+    re-blocked after an entrance has been opened.
     """
 
     def request_for(self, envelope: CandidateEnvelope) -> ResourceRequest:
         candidate = envelope.candidate
-        steps = legacy.candidate_plan_steps(candidate)
+        steps = physical.candidate_plan_steps(candidate)
         touched_lines = tuple(dict.fromkeys(step.line for step in steps if step.action in {"Get", "Put", "Weigh"}))
         put_lines = tuple(dict.fromkeys(step.line for step in steps if step.action == "Put"))
         resources = [ResourceKind.LOCO_POSITION, ResourceKind.LOCO_CARRY, ResourceKind.ROUTE_GET, ResourceKind.ROUTE_PUT]
-        if any(line in legacy.DEPOT_LINES for line in put_lines):
+        if any(line in physical.DEPOT_LINES for line in put_lines):
             resources.append(ResourceKind.DEPOT_SLOT)
-        if any(line in legacy.legacy.DEPOT_OUTSIDE_LINES for line in put_lines):
+        if any(line in physical.DEPOT_OUTSIDE_LINES for line in put_lines):
             resources.append(ResourceKind.DEPOT_SLOT)
         if "存4线" in touched_lines:
             resources.append(ResourceKind.CUN4_NORTH_BUFFER)
-        if any(line in legacy.REMOTE_INTERACTION_LINES for line in touched_lines):
+        if any(line in physical.REMOTE_INTERACTION_LINES for line in touched_lines):
             resources.append(ResourceKind.REMOTE_SESSION)
             resources.append(ResourceKind.GLOBAL_GATE)
         if candidate.has_weigh:
             resources.append(ResourceKind.WEIGH_STAND)
-        if any(line not in legacy.DEPOT_LINES for line in put_lines):
+        if any(line not in physical.DEPOT_LINES for line in put_lines):
             resources.append(ResourceKind.LINE_CAPACITY)
         if any(
             line in serial.serial_related_lines()
@@ -61,16 +62,36 @@ class StationResourceGraph:
         validation: Any,
         cars: list[dict[str, Any]],
         depot_assignment: Any,
+        serial_gate_leases: dict[str, Any] | None = None,
     ) -> ResourceDelta:
         violations: list[str] = []
         if validation.reasons:
             violations.extend(f"physical:{reason}" for reason in validation.reasons)
-        if any(line in legacy.RUNNING_LINES for line in request.touched_lines):
+        if any(line in physical.RUNNING_LINES for line in request.touched_lines):
             violations.append("running_line_storage")
         violations.extend(
             self._serial_blocker_storage_violations(
                 request,
                 candidate=candidate,
+                cars=cars,
+                depot_assignment=depot_assignment,
+            )
+        )
+        violations.extend(
+            self._serial_gate_lease_violations(
+                request,
+                candidate=candidate,
+                validation=validation,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                serial_gate_leases=serial_gate_leases or {},
+            )
+        )
+        violations.extend(
+            self._depot_slot_violations(
+                request,
+                candidate=candidate,
+                validation=validation,
                 cars=cars,
                 depot_assignment=depot_assignment,
             )
@@ -83,9 +104,10 @@ class StationResourceGraph:
             ContractFamily.CUN4_PORT_STAGING,
             ContractFamily.PRE_REPAIR_STAGING,
             ContractFamily.LOCO_AREA_STAGING,
+            ContractFamily.SPECIAL_REPAIR_PROCESS,
         }:
             violations.append("cun4_buffer_requires_owner")
-        if any(line in legacy.legacy.DEPOT_OUTSIDE_LINES for line in request.put_lines) and request.family not in {
+        if any(line in physical.DEPOT_OUTSIDE_LINES for line in request.put_lines) and request.family not in {
             ContractFamily.REMOTE_SESSION,
             ContractFamily.DEPOT_SLOT,
             ContractFamily.DEPOT_OUTBOUND,
@@ -139,3 +161,56 @@ class StationResourceGraph:
                     f"{put_line}:{','.join(sorted(blocked))}:{','.join(sorted(downstream_debt)[:8])}"
                 )
         return violations
+
+    def _serial_gate_lease_violations(
+        self,
+        request: ResourceRequest,
+        *,
+        candidate: Any,
+        validation: Any,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        serial_gate_leases: dict[str, Any],
+    ) -> list[str]:
+        leased_put_lines = [line for line in request.put_lines if line in serial_gate_leases]
+        if not leased_put_lines:
+            return []
+        prospective = [dict(car) for car in cars]
+        physical.apply_candidate(candidate, prospective, validation)
+        violations: list[str] = []
+        for blocker_line in leased_put_lines:
+            after_debt = serial.downstream_debt_nos(
+                blocker_line=blocker_line,
+                cars=prospective,
+                depot_assignment=depot_assignment,
+                moving_nos=set(),
+            )
+            after_blockers = [
+                physical.car_no(car)
+                for car in prospective
+                if car["Line"] == blocker_line
+            ]
+            if after_debt and after_blockers:
+                violations.append(
+                    "serial_gate_lease_refill_before_downstream_clear:"
+                    f"{blocker_line}:{','.join(sorted(after_blockers)[:8])}:"
+                    f"{','.join(sorted(after_debt)[:8])}"
+                )
+        return violations
+
+    def _depot_slot_violations(
+        self,
+        request: ResourceRequest,
+        *,
+        candidate: Any,
+        validation: Any,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+    ) -> list[str]:
+        return physical.depot_resource_violations(
+            request,
+            candidate=candidate,
+            validation=validation,
+            cars=cars,
+            depot_assignment=depot_assignment,
+        )

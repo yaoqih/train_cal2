@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 from .domain import CandidateEnvelope, ResourceDelta
 from .phase import PhasePermission
 
@@ -32,6 +32,16 @@ class StagingIntentRecord:
 
 class StagingIntentBuilder:
     """Extract explicit temporary-assembly facts from selected planlets."""
+
+    PEEL_STAGING_LINES = {
+        "存2线",
+        "存1线",
+        "存3线",
+        "存5线北",
+        "存5线南",
+        "预修线",
+        "调梁棚",
+    }
 
     def records_for_selected(
         self,
@@ -62,6 +72,16 @@ class StagingIntentBuilder:
                     reason="same_planlet_temporary_source_return",
                 )
             )
+        if envelope.template_name == "tail_blocker_peel_digest":
+            records.extend(
+                self._tail_blocker_peel_records(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    phase=phase,
+                    target_phase=target_phase,
+                    envelope=envelope,
+                )
+            )
         records.extend(
             self._same_plan_temporary_puts(
                 case_id=case_id,
@@ -73,6 +93,41 @@ class StagingIntentBuilder:
         )
         return records
 
+    def _tail_blocker_peel_records(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        phase: str,
+        target_phase: str,
+        envelope: CandidateEnvelope,
+    ) -> list[StagingIntentRecord]:
+        steps = physical.candidate_plan_steps(envelope.candidate)
+        if len(steps) < 2 or steps[0].action != "Get" or steps[1].action != "Put":
+            return []
+        records: list[StagingIntentRecord] = []
+        for step in steps[1:]:
+            if step.action == "Put" and step.line == envelope.candidate.source_line:
+                continue
+            if step.action != "Put" or step.line not in self.PEEL_STAGING_LINES:
+                break
+            records.append(
+                self._record(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    event_type="active",
+                    phase=phase,
+                    target_phase=target_phase,
+                    envelope=envelope,
+                    staging_line=step.line,
+                    vehicle_order=self._step_nos(step),
+                    expiry_condition="serial_downstream_debt_clear_or_target_slot_available",
+                    release_condition="later_move_to_final_target",
+                    reason="tail_blocker_temporary_peel_staging",
+                )
+            )
+        return records
+
     def _same_plan_temporary_puts(
         self,
         *,
@@ -82,7 +137,7 @@ class StagingIntentBuilder:
         target_phase: str,
         envelope: CandidateEnvelope,
     ) -> list[StagingIntentRecord]:
-        steps = legacy.candidate_plan_steps(envelope.candidate)
+        steps = physical.candidate_plan_steps(envelope.candidate)
         later_gets: dict[tuple[str, str], int] = {}
         for index, step in enumerate(steps):
             if step.action != "Get":
@@ -180,8 +235,8 @@ class StagingIntentBuilder:
         flags: list[str] = []
         if staging_line == "存4线":
             flags.append("do_not_pollute_cun4_release_port")
-        if staging_line in legacy.REMOTE_INTERACTION_LINES:
+        if staging_line in physical.REMOTE_INTERACTION_LINES:
             flags.append("do_not_block_remote_session_corridor")
-        if staging_line in legacy.RUNNING_LINES:
+        if staging_line in physical.RUNNING_LINES:
             flags.append("running_line_storage_forbidden")
         return "|".join(flags)

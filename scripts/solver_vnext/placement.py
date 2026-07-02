@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 
 
 def planned_positions_for_batch(
@@ -14,7 +14,7 @@ def planned_positions_for_batch(
     depot_assignment: Any,
     batch_nos: set[str],
 ) -> dict[str, int]:
-    if legacy.legacy.is_spotting_line(target_line) and any(legacy.force_positions(car) for car in batch):
+    if physical.is_spotting_line(target_line) and any(physical.force_positions(car) for car in batch):
         return _spotting_positions_for_batch(
             batch=batch,
             target_line=target_line,
@@ -22,13 +22,13 @@ def planned_positions_for_batch(
             depot_assignment=depot_assignment,
             batch_nos=batch_nos,
         )
-    return legacy.legacy.planned_positions_for_batch(
+    return physical.planned_positions_for_batch(
         batch=batch,
         target_line=target_line,
         cars=cars,
         depot_assignment=depot_assignment,
         batch_nos=batch_nos,
-        grouped=legacy.cars_by_line(cars),
+        grouped=physical.cars_by_line(cars),
     )
 
 
@@ -43,14 +43,14 @@ def _spotting_positions_for_batch(
     occupied = {
         int(car.get("Position") or 0)
         for car in cars
-        if car["Line"] == target_line and legacy.car_no(car) not in batch_nos
+        if car["Line"] == target_line and physical.car_no(car) not in batch_nos
     }
     planned: dict[str, int] = {}
     used: set[int] = set()
     forced_groups: dict[tuple[int, ...], list[dict[str, Any]]] = defaultdict(list)
     free_batch = []
     for car in batch:
-        forced = legacy.force_positions(car)
+        forced = physical.force_positions(car)
         if forced:
             forced_groups[forced].append(car)
         else:
@@ -70,14 +70,14 @@ def _spotting_positions_for_batch(
         if len(positions) < len(group):
             return {}
         for car, position in zip(group, positions):
-            planned[legacy.car_no(car)] = position
+            planned[physical.car_no(car)] = position
             used.add(position)
 
     position = 1
     for car in free_batch:
         while position in occupied or position in used:
             position += 1
-        planned[legacy.car_no(car)] = position
+        planned[physical.car_no(car)] = position
         used.add(position)
     return planned
 
@@ -93,22 +93,28 @@ def _free_spotting_positions(
     used: set[int],
     needed: int,
 ) -> list[int]:
-    existing_count = len(
-        legacy.legacy.spotting_same_forced_positions(
-            cars,
-            target_line,
-            forced,
-            depot_assignment,
-            excluded_nos=batch_nos,
-        )
+    existing_positions = physical.spotting_same_forced_positions(
+        cars,
+        target_line,
+        forced,
+        depot_assignment,
+        excluded_nos=batch_nos,
     )
-    capacity = legacy.legacy.spotting_capacity(target_line, forced)
-    if capacity and existing_count + needed > capacity:
+    capacity = physical.spotting_capacity(target_line, forced)
+    if not capacity or len(existing_positions) + needed > capacity:
         return []
-    buffer_count = legacy.legacy.spotting_south_buffer_count(cars, target_line, forced, depot_assignment)
-    valid_positions = legacy.legacy.spotting_effective_window(target_line, forced, buffer_count)
-    return [
-        position
-        for position in sorted(valid_positions, reverse=True)
-        if position not in occupied and position not in used
-    ]
+    window_sets = physical.spotting_physical_window_sets(target_line, forced)
+    if not window_sets:
+        return []
+    existing_set = set(existing_positions)
+    for window in window_sets:
+        if not existing_set <= window:
+            continue
+        free_positions = [
+            position
+            for position in sorted(window, reverse=True)
+            if position not in existing_set and position not in used
+        ]
+        if len(free_positions) >= needed:
+            return free_positions
+    return []

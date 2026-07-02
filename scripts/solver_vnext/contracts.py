@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 from .domain import CarRef, ContractFamily, FlowContract
 
 
@@ -25,39 +25,19 @@ FAMILY_PRIORITY = {
 
 
 def classify_family(source_line: str, target_line: str, is_weigh: bool) -> ContractFamily:
-    if is_weigh:
-        return ContractFamily.SPECIAL_REPAIR_PROCESS
-    if source_line in legacy.DEPOT_LINES and target_line not in legacy.DEPOT_TARGET_LINES:
-        return ContractFamily.DEPOT_OUTBOUND
-    if target_line == "存4线":
-        return ContractFamily.CUN4_PORT_STAGING
-    if target_line in legacy.DEPOT_LINES:
-        return ContractFamily.REPAIR_INBOUND
-    if target_line in legacy.legacy.DEPOT_OUTSIDE_LINES:
-        return ContractFamily.DEPOT_SLOT
-    if target_line == "预修线":
-        return ContractFamily.PRE_REPAIR_STAGING
-    if target_line in {"调梁棚", "调梁线北"}:
-        return ContractFamily.DISPATCH_SHED_QUEUE
-    if target_line in {"洗罐站", "洗罐线北", "油漆线", "抛丸线", "卸轮线"}:
-        return ContractFamily.FUNCTION_LINE_SERVICE
-    if target_line in {"机走棚", "机库线", "机走北"}:
-        return ContractFamily.LOCO_AREA_STAGING
-    if target_line:
-        return ContractFamily.YARD_REBALANCE
-    return ContractFamily.RESIDUAL
+    return physical.classify_action_family(source_line, target_line, is_weigh)
 
 
 def build_car_refs(cars: list[dict[str, Any]], depot_assignment: Any) -> list[CarRef]:
-    loads = legacy.line_loads(cars)
+    loads = physical.line_loads(cars)
     refs: list[CarRef] = []
     for car in cars:
-        target_line, target_position, reason = legacy.planned_target_for_car(car, cars, depot_assignment, loads)
-        satisfied = legacy.car_is_satisfied(car, depot_assignment, cars)
+        target_line, target_position, reason = physical.planned_target_for_car(car, cars, depot_assignment, loads)
+        satisfied = physical.car_is_satisfied(car, depot_assignment, cars)
         family = classify_family(car["Line"], target_line, bool(car.get("IsWeigh")))
         refs.append(
             CarRef(
-                no=legacy.car_no(car),
+                no=physical.car_no(car),
                 line=car["Line"],
                 position=int(car.get("Position") or 0),
                 target_line=target_line,
@@ -65,12 +45,12 @@ def build_car_refs(cars: list[dict[str, Any]], depot_assignment: Any) -> list[Ca
                 target_reason=reason,
                 contract_family=family,
                 satisfied=satisfied,
-                is_remote_source=car["Line"] in legacy.REMOTE_INTERACTION_LINES,
-                is_remote_target=target_line in legacy.REMOTE_INTERACTION_LINES,
+                is_remote_source=car["Line"] in physical.REMOTE_INTERACTION_LINES,
+                is_remote_target=target_line in physical.REMOTE_INTERACTION_LINES,
                 is_weigh=bool(car.get("IsWeigh")),
                 is_closed_door=bool(car.get("IsClosedDoor")),
-                length_m=legacy.car_length(car),
-                force_positions=legacy.force_positions(car),
+                length_m=physical.car_length(car),
+                force_positions=physical.force_positions(car),
             )
         )
     return refs
@@ -148,9 +128,9 @@ def build_contracts(cars: list[dict[str, Any]], depot_assignment: Any) -> list[F
 
 
 def contract_debt(contract: FlowContract, cars: list[dict[str, Any]], depot_assignment: Any) -> int:
-    by_no = {legacy.car_no(car): car for car in cars}
+    by_no = {physical.car_no(car): car for car in cars}
     return sum(
         1
         for no in contract.subject_nos
-        if no in by_no and not legacy.car_is_satisfied(by_no[no], depot_assignment, cars)
+        if no in by_no and not physical.car_is_satisfied(by_no[no], depot_assignment, cars)
     )

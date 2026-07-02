@@ -4,25 +4,36 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
+from .connection import ConnectionMetricRecord
+from .connection import records_for_selected as connection_records_for_selected
 from .contracts import build_contracts
+from .diagnostics import (
+    CandidateRoundStats,
+    GenerationGapRecord,
+    StructureNodeMetricRecord,
+    build_generation_gap_records,
+    build_structure_node_record,
+)
 from .delta import build_contract_delta, simulate_candidate
 from .domain import CaseResult, CandidateEnvelope, ResourceDelta, SolverState, StepTrace
 from .episodes import EPISODES
+from .flow import FlowEdgeRecord, build_flow_edge_records
 from .frontier import AccessFrontier, AccessFrontierRecord
 from .gate import AcceptRejectGate
 from .phase import HumanPhaseGate, PhaseGateRecord
 from .policy import BaselinePolicy, EvaluatedCandidate, PolicyContext
+from .resource_structures import ResourceStructureRecord, hook_resource_records, next_serial_gate_leases, selected_resource_records
 from .resources import StationResourceGraph
 from .staging import StagingIntentBuilder, StagingIntentRecord
 
 
 def _remote_unsatisfied_count(cars: list[dict[str, Any]], depot_assignment: Any) -> int:
-    loads = legacy.line_loads(cars)
+    loads = physical.line_loads(cars)
     count = 0
-    for car in legacy.unsatisfied_cars(cars, depot_assignment):
-        target_line, _position, _reason = legacy.planned_target_for_car(car, cars, depot_assignment, loads)
-        if car["Line"] in legacy.REMOTE_INTERACTION_LINES or target_line in legacy.REMOTE_INTERACTION_LINES:
+    for car in physical.unsatisfied_cars(cars, depot_assignment):
+        target_line, _position, _reason = physical.planned_target_for_car(car, cars, depot_assignment, loads)
+        if car["Line"] in physical.REMOTE_INTERACTION_LINES or target_line in physical.REMOTE_INTERACTION_LINES:
             count += 1
     return count
 
@@ -99,7 +110,7 @@ class VNextSolver:
         self.max_hooks = max_hooks
         self.trace_all_candidates = trace_all_candidates
         self.trace_frontier = trace_frontier
-        self.physical = legacy.PhysicalAdapter()
+        self.graph = physical.TrackGraph()
         self.resources = StationResourceGraph()
         self.gate = AcceptRejectGate()
         self.frontier = AccessFrontier()
@@ -118,15 +129,25 @@ class VNextSolver:
         list[PhaseGateRecord],
         list[AccessFrontierRecord],
         list[StagingIntentRecord],
+        list[FlowEdgeRecord],
+        list[ConnectionMetricRecord],
+        list[StructureNodeMetricRecord],
+        list[ResourceStructureRecord],
+        list[GenerationGapRecord],
     ]:
-        case_id, _payload, cars, depot_assignment, loco_location = legacy.read_case(truth_path)
+        case_id, _payload, cars, depot_assignment, loco_location = physical.read_case(truth_path)
         state = SolverState(case_id=case_id, cars=cars, depot_assignment=depot_assignment, loco_location=loco_location)
-        state.visited_signatures.add(legacy.state_signature(state.cars, state.loco_location))
-        initial_unsatisfied = len(legacy.unsatisfied_cars(state.cars, state.depot_assignment))
+        state.visited_signatures.add(physical.state_signature(state.cars, state.loco_location))
+        initial_unsatisfied = len(physical.unsatisfied_cars(state.cars, state.depot_assignment))
         traces: list[StepTrace] = []
         phase_records: list[PhaseGateRecord] = []
         frontier_records: list[AccessFrontierRecord] = []
         staging_records: list[StagingIntentRecord] = []
+        flow_edge_records: list[FlowEdgeRecord] = []
+        connection_records: list[ConnectionMetricRecord] = []
+        structure_node_records: list[StructureNodeMetricRecord] = []
+        resource_structure_records: list[ResourceStructureRecord] = []
+        generation_gap_records: list[GenerationGapRecord] = []
         operations: list[Any] = []
         blocked_reason = ""
         hard_physical_accepted = 0
@@ -137,12 +158,42 @@ class VNextSolver:
         last_policy_context: PolicyContext | None = None
 
         while state.hook_index <= self.max_hooks:
-            if not legacy.unsatisfied_cars(state.cars, state.depot_assignment):
+            if not physical.unsatisfied_cars(state.cars, state.depot_assignment):
                 break
-            legacy.clear_access_order_cache()
+            physical.clear_access_order_cache()
             selected: EvaluatedCandidate | None = None
-            policy_context = self.policy.context(state)
+            raw_policy_context = self.policy.context(state)
+            current_phase = self.phase_gate.active_phase(
+                previous_phase=previous_phase,
+                proposed=raw_policy_context.phase_state,
+            )
+            active_phase_state = replace(
+                raw_policy_context.phase_state,
+                phase=self.phase_gate.phase_kind(current_phase),
+            )
+            policy_context = PolicyContext(
+                phase_state=active_phase_state,
+                remote_open=current_phase == "H4",
+                remote_session_open=raw_policy_context.remote_session_open,
+                last_business_remote=raw_policy_context.last_business_remote,
+            )
             last_policy_context = policy_context
+            hook_flow_edges = build_flow_edge_records(
+                case_id=state.case_id,
+                hook_index=state.hook_index,
+                cars=state.cars,
+                depot_assignment=state.depot_assignment,
+            )
+            flow_edge_records.extend(hook_flow_edges)
+            resource_structure_records.extend(
+                hook_resource_records(
+                    case_id=state.case_id,
+                    hook_index=state.hook_index,
+                    cars=state.cars,
+                    depot_assignment=state.depot_assignment,
+                    serial_gate_leases=state.serial_gate_leases,
+                )
+            )
             if self.trace_frontier:
                 frontier_records.append(
                     self.frontier.snapshot(
@@ -150,7 +201,7 @@ class VNextSolver:
                         hook_index=state.hook_index,
                         cars=state.cars,
                         depot_assignment=state.depot_assignment,
-                        graph=self.physical.graph,
+                        graph=self.graph,
                         loco_location=state.loco_location,
                     )
                 )
@@ -164,10 +215,11 @@ class VNextSolver:
             rejected_this_round = 0
             generated_this_round = 0
 
-            def evaluate_episodes(episodes: tuple[Any, ...]) -> tuple[EvaluatedCandidate | None, int, int]:
+            def evaluate_episodes(episodes: tuple[Any, ...]) -> tuple[EvaluatedCandidate | None, int, int, CandidateRoundStats]:
                 selected_candidate: EvaluatedCandidate | None = None
                 rejected_count = 0
                 generated_count = 0
+                stats = CandidateRoundStats()
                 validation_cache: dict[str, Any] = {}
                 prospective_cache: dict[str, tuple[list[dict[str, Any]], Any, tuple[str, str, tuple[tuple[str, str, int], ...]]]] = {}
                 for contract in contracts:
@@ -179,11 +231,13 @@ class VNextSolver:
                             hook_index=state.hook_index,
                             cars=state.cars,
                             depot_assignment=state.depot_assignment,
-                            graph=self.physical.graph,
+                            graph=self.graph,
                             loco_location=state.loco_location,
+                            serial_gate_leases=state.serial_gate_leases,
                             contract=contract,
                         ):
                             generated_count += 1
+                            stats.generated()
                             resource_request = self.resources.request_for(envelope)
                             envelope = CandidateEnvelope(
                                 candidate=envelope.candidate,
@@ -194,7 +248,8 @@ class VNextSolver:
                             )
                             validation = validation_cache.get(envelope.candidate.candidate_id)
                             if validation is None:
-                                validation = self.physical.validate(
+                                validation = physical.validate_candidate(
+                                    self.graph,
                                     envelope.candidate,
                                     state.cars,
                                     state.loco_location,
@@ -223,6 +278,7 @@ class VNextSolver:
                                         )
                                     )
                                 rejected_count += 1
+                                stats.rejected("physical_reject")
                                 continue
                             resource_delta = self.resources.acquire(
                                 resource_request,
@@ -230,12 +286,13 @@ class VNextSolver:
                                 validation=validation,
                                 cars=state.cars,
                                 depot_assignment=state.depot_assignment,
+                                serial_gate_leases=state.serial_gate_leases,
                             )
                             cached_prospective = prospective_cache.get(envelope.candidate.candidate_id)
                             if cached_prospective is None:
                                 prospective = simulate_candidate(envelope.candidate, state.cars, validation)
-                                next_loco_location = self.physical.next_loco_location(envelope.candidate, validation)
-                                prospective_signature = legacy.state_signature(prospective, next_loco_location)
+                                next_loco_location = physical.next_loco_location(envelope.candidate, validation)
+                                prospective_signature = physical.state_signature(prospective, next_loco_location)
                                 cached_prospective = (prospective, next_loco_location, prospective_signature)
                                 prospective_cache[envelope.candidate.candidate_id] = cached_prospective
                             prospective, next_loco_location, prospective_signature = cached_prospective
@@ -248,23 +305,38 @@ class VNextSolver:
                             decision = self.gate.decide(contract_delta, resource_delta)
                             if decision.accepted and prospective_signature in state.visited_signatures:
                                 decision = self.gate.loop_reject(contract_delta, resource_delta)
+                            gate_accepted = decision.accepted
+                            gate_reason = decision.reason
+                            if gate_accepted:
+                                phase_permission = self.phase_gate.permission(
+                                    phase_state=active_phase_state,
+                                    envelope=envelope,
+                                    contract_delta=contract_delta,
+                                    resource_delta=resource_delta,
+                                    remote_session_open=policy_context.remote_session_open,
+                                )
+                                if not phase_permission.allowed:
+                                    gate_accepted = False
+                                    gate_reason = f"phase_veto:{phase_permission.reason}"
                             if self.trace_all_candidates:
                                 traces.append(
                                     _trace_row(
                                         state=state,
                                         policy_context=policy_context,
                                         envelope=envelope,
-                                        gate_accepted=decision.accepted,
+                                        gate_accepted=gate_accepted,
                                         selected=False,
-                                        gate_reason=decision.reason,
+                                        gate_reason=gate_reason,
                                         physical_reasons=(),
                                         contract_delta=contract_delta,
                                         resource_delta=resource_delta,
                                     )
                                 )
-                            if not decision.accepted:
+                            if not gate_accepted:
                                 rejected_count += 1
+                                stats.rejected(gate_reason)
                                 continue
+                            stats.accepted()
                             evaluated = EvaluatedCandidate(
                                 envelope=envelope,
                                 validation=validation,
@@ -276,14 +348,47 @@ class VNextSolver:
                             )
                             if self.policy.better(evaluated, selected_candidate, policy_context):
                                 selected_candidate = evaluated
-                return selected_candidate, generated_count, rejected_count
+                return selected_candidate, generated_count, rejected_count, stats
 
-            selected, generated_this_round, rejected_this_round = evaluate_episodes(EPISODES)
+            selected, generated_this_round, rejected_this_round, round_stats = evaluate_episodes(EPISODES)
             if selected is None:
                 blocked_reason = (
                     "no_episode_candidate_generated"
                     if generated_this_round == 0
                     else f"all_episode_candidates_rejected:{rejected_this_round}"
+                )
+                if generated_this_round == 0:
+                    frontier_record = None
+                    if frontier_records and frontier_records[-1].case_id == state.case_id and frontier_records[-1].hook_index == state.hook_index:
+                        frontier_record = frontier_records[-1]
+                    else:
+                        frontier_record = self.frontier.snapshot(
+                            case_id=state.case_id,
+                            hook_index=state.hook_index,
+                            cars=state.cars,
+                            depot_assignment=state.depot_assignment,
+                            graph=self.graph,
+                            loco_location=state.loco_location,
+                        )
+                    generation_gap_records.extend(
+                        build_generation_gap_records(
+                            state=state,
+                            policy_context=policy_context,
+                            contracts=contracts,
+                            episodes=EPISODES,
+                            frontier_record=frontier_record,
+                        )
+                    )
+                structure_node_records.append(
+                    build_structure_node_record(
+                        state=state,
+                        policy_context=policy_context,
+                        flow_edges=hook_flow_edges,
+                        contracts=contracts,
+                        stats=round_stats,
+                        selected=None,
+                        blocked_reason=blocked_reason,
+                    )
                 )
                 break
 
@@ -318,14 +423,6 @@ class VNextSolver:
                 )
             if validation.reasons:
                 hard_physical_accepted += 1
-            current_phase = self.phase_gate.active_phase(
-                previous_phase=previous_phase,
-                proposed=policy_context.phase_state,
-            )
-            active_phase_state = replace(
-                policy_context.phase_state,
-                phase=self.phase_gate.phase_kind(current_phase),
-            )
             hook_count_by_phase[current_phase] = hook_count_by_phase.get(current_phase, 0) + 1
             phase_permission = self.phase_gate.permission(
                 phase_state=active_phase_state,
@@ -350,6 +447,39 @@ class VNextSolver:
             if phase_record.transition_type == "fail":
                 phase_gate_bypass += 1
             phase_records.append(phase_record)
+            connection_records.extend(
+                connection_records_for_selected(
+                    case_id=state.case_id,
+                    hook_index=state.hook_index,
+                    envelope=envelope,
+                    contract_delta=selected.contract_delta,
+                    resource_delta=selected.resource_delta,
+                    phase_permission=phase_permission,
+                )
+            )
+            resource_structure_records.extend(
+                selected_resource_records(
+                    case_id=state.case_id,
+                    hook_index=state.hook_index,
+                    cars=state.cars,
+                    prospective_cars=prospective,
+                    depot_assignment=state.depot_assignment,
+                    envelope=envelope,
+                    resource_delta=selected.resource_delta,
+                    contract_delta=selected.contract_delta,
+                    serial_gate_leases=state.serial_gate_leases,
+                )
+            )
+            structure_node_records.append(
+                build_structure_node_record(
+                    state=state,
+                    policy_context=policy_context,
+                    flow_edges=hook_flow_edges,
+                    contracts=contracts,
+                    stats=round_stats,
+                    selected=selected,
+                )
+            )
             staging_records.extend(
                 self.staging.records_for_selected(
                     case_id=state.case_id,
@@ -362,12 +492,22 @@ class VNextSolver:
             )
             previous_phase = current_phase
             start_operation_index = len(operations) + 1
-            operations.extend(self.physical.operation_rows(envelope.candidate, validation, start_operation_index))
+            operations.extend(physical.operation_rows(envelope.candidate, validation, start_operation_index))
+            state.serial_gate_leases = next_serial_gate_leases(
+                case_id=state.case_id,
+                hook_index=state.hook_index,
+                cars=state.cars,
+                prospective_cars=prospective,
+                depot_assignment=state.depot_assignment,
+                envelope=envelope,
+                contract_delta=selected.contract_delta,
+                serial_gate_leases=state.serial_gate_leases,
+            )
             state.cars = prospective
             state.loco_location = next_loco_location
             state.visited_signatures.add(prospective_signature)
             touched_remote = any(
-                line in legacy.REMOTE_INTERACTION_LINES
+                line in physical.REMOTE_INTERACTION_LINES
                 for line in envelope.resource_request.touched_lines
             )
             state.remote_session_open = bool(
@@ -375,21 +515,25 @@ class VNextSolver:
                 and touched_remote
                 and (
                     state.remote_session_open
+                    or (
+                        phase_permission.allowed
+                        and phase_permission.target_phase in {"H3", "H4"}
+                    )
                     or self.policy.opens_remote_session(selected)
                 )
             )
             business_lines = [
                 step.line
-                for step in legacy.candidate_plan_steps(envelope.candidate)
+                for step in physical.candidate_plan_steps(envelope.candidate)
                 if step.action in {"Get", "Put"}
             ]
             if business_lines:
-                state.last_business_remote = business_lines[-1] in legacy.REMOTE_INTERACTION_LINES
+                state.last_business_remote = business_lines[-1] in physical.REMOTE_INTERACTION_LINES
             state.accepted_candidate_ids.add(envelope.candidate.candidate_id)
             state.hook_index += 1
 
-        final_unsatisfied = len(legacy.unsatisfied_cars(state.cars, state.depot_assignment))
-        closed_door_reasons = legacy.closed_door_replay_violation_reasons(operations, state.cars)
+        final_unsatisfied = len(physical.unsatisfied_cars(state.cars, state.depot_assignment))
+        closed_door_reasons = physical.closed_door_replay_violation_reasons(operations, state.cars)
         if closed_door_reasons and not blocked_reason:
             blocked_reason = "|".join(closed_door_reasons)
         status = "completed" if final_unsatisfied == 0 and not blocked_reason else "blocked"
@@ -413,21 +557,21 @@ class VNextSolver:
         output_dir.mkdir(parents=True, exist_ok=True)
         if operations:
             response_path = output_dir / "responses" / f"{case_id}.json"
-            self.physical.write_json(
+            physical.write_json(
                 response_path,
                 {
                     "Success": status == "completed",
                     "Message": "" if status == "completed" else blocked_reason,
                     "StatusCode": 200 if status == "completed" else 409,
                     "Data": {
-                        "Operations": [self.physical.response_operation(row) for row in operations],
+                        "Operations": [physical.response_operation(row) for row in operations],
                         "GeneratedEndStatus": [
                             {
-                                "No": legacy.car_no(car),
+                                "No": physical.car_no(car),
                                 "Line": car["Line"],
                                 "Position": int(car.get("Position") or 0),
                             }
-                            for car in sorted(state.cars, key=legacy.car_no)
+                            for car in sorted(state.cars, key=physical.car_no)
                         ],
                     },
                 },
@@ -439,7 +583,7 @@ class VNextSolver:
             status=status,
             hook_count=sum(1 for row in operations if row.action in {"Get", "Put"}),
             operation_count=len(operations),
-            remote_business_transition_count=legacy.operation_remote_business_transition_count(operations),
+            remote_business_transition_count=physical.operation_remote_business_transition_count(operations),
             initial_unsatisfied=initial_unsatisfied,
             final_unsatisfied=final_unsatisfied,
             blocked_reason=blocked_reason,
@@ -448,7 +592,19 @@ class VNextSolver:
             phase_gate_bypass_count=phase_gate_bypass,
             hard_physical_violation_accepted_count=hard_physical_accepted,
         )
-        return result, traces, operations, phase_records, frontier_records, staging_records
+        return (
+            result,
+            traces,
+            operations,
+            phase_records,
+            frontier_records,
+            staging_records,
+            flow_edge_records,
+            connection_records,
+            structure_node_records,
+            resource_structure_records,
+            generation_gap_records,
+        )
 
 
 def write_artifacts(
@@ -458,13 +614,36 @@ def write_artifacts(
     phase_records: list[PhaseGateRecord],
     frontier_records: list[AccessFrontierRecord],
     staging_records: list[StagingIntentRecord],
+    flow_edge_records: list[FlowEdgeRecord],
+    connection_records: list[ConnectionMetricRecord],
+    structure_node_records: list[StructureNodeMetricRecord],
+    resource_structure_records: list[ResourceStructureRecord],
+    generation_gap_records: list[GenerationGapRecord],
 ) -> None:
-    adapter = legacy.PhysicalAdapter()
-    adapter.write_csv(output_dir / "case_summary.csv", [asdict(row) for row in results])
-    adapter.write_csv(output_dir / "step_trace.csv", [asdict(row) for row in traces])
-    adapter.write_csv(output_dir / "phase_gate_records.csv", [asdict(row) for row in phase_records])
-    adapter.write_csv(output_dir / "access_frontier_records.csv", [asdict(row) for row in frontier_records])
-    adapter.write_csv(output_dir / "staging_intent_records.csv", [asdict(row) for row in staging_records])
+    physical.write_csv(output_dir / "case_summary.csv", [asdict(row) for row in results])
+    physical.write_csv(output_dir / "step_trace.csv", [asdict(row) for row in traces])
+    physical.write_csv(output_dir / "phase_gate_records.csv", [asdict(row) for row in phase_records])
+    physical.write_csv(output_dir / "access_frontier_records.csv", [asdict(row) for row in frontier_records])
+    physical.write_csv(output_dir / "staging_intent_records.csv", [asdict(row) for row in staging_records])
+    physical.write_csv(output_dir / "flow_edge_records.csv", [asdict(row) for row in flow_edge_records])
+    physical.write_csv(output_dir / "connection_metrics.csv", [asdict(row) for row in connection_records])
+    physical.write_csv(output_dir / "structure_node_metrics.csv", [asdict(row) for row in structure_node_records])
+    physical.write_csv(output_dir / "resource_structure_records.csv", [asdict(row) for row in resource_structure_records])
+    physical.write_csv(output_dir / "generation_gap_records.csv", [asdict(row) for row in generation_gap_records])
+    physical.write_csv(
+        output_dir / "structure_acceptance.csv",
+        _structure_acceptance_rows(
+            results=results,
+            traces=traces,
+            phase_records=phase_records,
+            frontier_records=frontier_records,
+            staging_records=staging_records,
+            flow_edge_records=flow_edge_records,
+            connection_records=connection_records,
+            structure_node_records=structure_node_records,
+            resource_structure_records=resource_structure_records,
+        ),
+    )
     route_blocked_counts = [row.route_blocked_line_count for row in frontier_records]
     serial_blocker_counts = [row.serial_blocker_line_count for row in frontier_records]
     summary = {
@@ -479,7 +658,296 @@ def write_artifacts(
         "phase_gate_record_count": len(phase_records),
         "access_frontier_record_count": len(frontier_records),
         "staging_intent_record_count": len(staging_records),
+        "flow_edge_record_count": len(flow_edge_records),
+        "connection_metric_record_count": len(connection_records),
+        "connection_metric_failure_count": sum(1 for row in connection_records if row.status != "pass"),
+        "structure_node_metric_record_count": len(structure_node_records),
+        "resource_structure_record_count": len(resource_structure_records),
+        "resource_structure_failure_count": sum(1 for row in resource_structure_records if row.status == "fail"),
+        "resource_structure_warning_count": sum(1 for row in resource_structure_records if row.status == "warn"),
+        "generation_gap_record_count": len(generation_gap_records),
         "max_route_blocked_line_count": max(route_blocked_counts, default=0),
         "max_serial_blocker_line_count": max(serial_blocker_counts, default=0),
     }
-    adapter.write_json(output_dir / "vnext_summary.json", summary)
+    physical.write_json(output_dir / "vnext_summary.json", summary)
+
+
+def _structure_acceptance_rows(
+    *,
+    results: list[CaseResult],
+    traces: list[StepTrace],
+    phase_records: list[PhaseGateRecord],
+    frontier_records: list[AccessFrontierRecord],
+    staging_records: list[StagingIntentRecord],
+    flow_edge_records: list[FlowEdgeRecord],
+    connection_records: list[ConnectionMetricRecord],
+    structure_node_records: list[StructureNodeMetricRecord],
+    resource_structure_records: list[ResourceStructureRecord],
+) -> list[dict[str, Any]]:
+    accepted_without_phase = sum(row.accepted_without_phase_permission_count for row in results)
+    phase_bypass = sum(row.phase_gate_bypass_count for row in results)
+    hard_physical = sum(row.hard_physical_violation_accepted_count for row in results)
+    connection_fail = sum(1 for row in connection_records if row.status != "pass")
+    resource_fail_by_structure = _resource_status_counts(resource_structure_records, "fail")
+    resource_warn_by_structure = _resource_status_counts(resource_structure_records, "warn")
+    variants = sorted({row.variant for row in flow_edge_records if row.variant})
+    rows = [
+        _acceptance_row(
+            "FlowFacts/FlowEdge",
+            "pass" if flow_edge_records and variants else "fail",
+            len(flow_edge_records),
+            0 if flow_edge_records and variants else 1,
+            0,
+            "flow_edge_records.csv",
+            "variants=" + ",".join(variants),
+        ),
+        _acceptance_row(
+            "HumanPhaseGate",
+            "pass" if accepted_without_phase == 0 and phase_bypass == 0 else "fail",
+            len(phase_records),
+            accepted_without_phase + phase_bypass,
+            0,
+            "phase_gate_records.csv",
+            f"accepted_without_phase={accepted_without_phase};phase_bypass={phase_bypass}",
+        ),
+        _acceptance_row(
+            "ConnectionChain",
+            "pass" if connection_fail == 0 else "fail",
+            len(connection_records),
+            connection_fail,
+            0,
+            "connection_metrics.csv",
+            "selected steps have contract/resource/delta/phase connection",
+        ),
+        _acceptance_row(
+            "StructureNodeDiagnostics",
+            "pass" if structure_node_records else "fail",
+            len(structure_node_records),
+            0 if structure_node_records else 1,
+            0,
+            "structure_node_metrics.csv",
+            "per-hook candidate and reject bucket coverage",
+        ),
+        _acceptance_row(
+            "AcceptedPhysicalGate",
+            "pass" if hard_physical == 0 else "fail",
+            len(results),
+            hard_physical,
+            0,
+            "case_summary.csv",
+            "physical validator accepted violations",
+        ),
+    ]
+    rows.extend(
+        _candidate_structure_acceptance_rows(
+            traces=traces,
+            frontier_records=frontier_records,
+            staging_records=staging_records,
+            phase_records=phase_records,
+        )
+    )
+    for structure in (
+        "CUN4_NORTH_BUFFER",
+        "CUN4_NORTH_BUFFER_DELTA",
+        "DEPOT_SLOT_GRAPH",
+        "DEPOT_SLOT_DELTA",
+        "DEPOT_SWAP_DELTA",
+        "SERIAL_GATE_LEASE",
+        "SERIAL_GATE_LEASE_DELTA",
+        "SERIAL_GATE_LEASE_LIFECYCLE",
+        "LOCO_CARRY_STATE",
+    ):
+        fail_count = resource_fail_by_structure.get(structure, 0)
+        warn_count = resource_warn_by_structure.get(structure, 0)
+        observed_count = sum(1 for row in resource_structure_records if row.structure == structure)
+        status = "pass"
+        if fail_count:
+            status = "fail"
+        elif warn_count:
+            status = "warn"
+        elif observed_count == 0:
+            status = "unknown"
+        rows.append(
+            _acceptance_row(
+                structure,
+                status,
+                observed_count,
+                fail_count,
+                warn_count,
+                "resource_structure_records.csv",
+                "resource structure coverage and hard-failure count",
+            )
+        )
+    return rows
+
+
+def _candidate_structure_acceptance_rows(
+    *,
+    traces: list[StepTrace],
+    frontier_records: list[AccessFrontierRecord],
+    staging_records: list[StagingIntentRecord],
+    phase_records: list[PhaseGateRecord],
+) -> list[dict[str, Any]]:
+    expected_templates = {
+        "depot_multi_drop_accessible_prefix",
+        "depot_outbound_session",
+        "depot_repack_with_inbound_tail",
+        "depot_slot_swap",
+        "depot_locked_tail_slot_fill",
+        "direct_accessible_prefix",
+        "direct_prefix_access_lease",
+        "owned_prefix_tail_digest_restore",
+        "remote_depot_direct_accessible_prefix",
+        "remote_depot_prefix_access_lease",
+        "remote_session_directional_digest",
+        "serial_gate_clear_support",
+        "tail_blocker_peel_digest",
+        "tail_closeout_direct_accessible_prefix",
+    }
+    observed_templates = {row.template_name for row in traces if row.template_name}
+    selected_templates = {row.template_name for row in traces if row.selected and row.template_name}
+    unobserved = sorted(expected_templates - observed_templates)
+    unselected = sorted((expected_templates & observed_templates) - selected_templates)
+    trace_all_candidates = any(not row.selected for row in traces)
+
+    rows = [
+        _acceptance_row(
+            "EpisodeTemplateCoverage",
+            "pass" if observed_templates else "fail",
+            len(observed_templates),
+            0 if observed_templates else 1,
+            len(unselected),
+            "step_trace.csv",
+            (
+                f"observed={','.join(sorted(observed_templates))};"
+                f"selected={','.join(sorted(selected_templates))};"
+                f"unobserved={','.join(unobserved)};"
+                f"unselected={','.join(unselected)}"
+            ),
+        ),
+        _acceptance_row(
+            "AccessFrontierTraceCoverage",
+            "pass" if frontier_records else "unknown",
+            len(frontier_records),
+            0,
+            0 if frontier_records else 1,
+            "access_frontier_records.csv",
+            "enable --trace-frontier to audit per-hook frontier facts"
+            if not frontier_records
+            else "frontier snapshots recorded",
+        ),
+    ]
+
+    selected_source_returns = [
+        row for row in traces if row.selected and row.same_plan_source_return_nos
+    ]
+    source_return_records = [
+        row for row in staging_records if row.reason == "same_planlet_temporary_source_return"
+    ]
+    missing_staging = max(0, len(selected_source_returns) - len(source_return_records))
+    rows.append(
+        _acceptance_row(
+            "TemporaryStagingIntent",
+            "pass" if missing_staging == 0 else "fail",
+            len(staging_records),
+            missing_staging,
+            0,
+            "staging_intent_records.csv",
+            (
+                f"selected_source_return_steps={len(selected_source_returns)};"
+                f"source_return_records={len(source_return_records)};"
+                f"same_plan_temporary_records={len(staging_records)}"
+            ),
+        )
+    )
+
+    blank_manual = sum(1 for row in phase_records if not row.manual_phase_hook_count)
+    rows.append(
+        _acceptance_row(
+            "ManualPhaseHookBenchmark",
+            "unknown" if blank_manual else "pass",
+            len(phase_records),
+            0,
+            blank_manual,
+            "phase_gate_records.csv",
+            "manual H1-H5 hook/session benchmark not yet populated"
+            if blank_manual
+            else "manual phase benchmark populated",
+        )
+    )
+
+    if not trace_all_candidates:
+        rows.append(
+            _acceptance_row(
+                "CandidateRejectProfile",
+                "unknown",
+                len(traces),
+                0,
+                1,
+                "step_trace.csv",
+                "run with --trace-all-candidates to audit rejected candidate structures",
+            )
+        )
+        return rows
+
+    reject_groups = {
+        "RouteReachabilityGate": ("route_blocked_by_occupied_line", "route_missing"),
+        "DepotSlotCandidateGate": ("depot_slot_rule_violation", "depot_section_after_factory_violation"),
+        "SpottingCandidateGate": ("spotting_group_window_violation",),
+        "RouteReversalGate": ("route_reversal_length_violation", "route_reversal_with_blocker_length_violation"),
+    }
+    physical_reasons = [
+        reason
+        for row in traces
+        if row.physical_reasons
+        for reason in row.physical_reasons.split("|")
+        if reason
+    ]
+    for structure, prefixes in reject_groups.items():
+        count = sum(
+            1
+            for reason in physical_reasons
+            if any(reason == prefix or reason.startswith(f"{prefix}:") or prefix in reason for prefix in prefixes)
+        )
+        rows.append(
+            _acceptance_row(
+                structure,
+                "pass" if count == 0 else "warn",
+                count,
+                0,
+                count,
+                "step_trace.csv",
+                "remaining candidate rejects; generation gate not fully structural yet"
+                if count
+                else "no remaining rejects in traced candidates",
+            )
+        )
+    return rows
+
+
+def _resource_status_counts(records: list[ResourceStructureRecord], status: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in records:
+        if row.status == status:
+            counts[row.structure] = counts.get(row.structure, 0) + 1
+    return counts
+
+
+def _acceptance_row(
+    structure: str,
+    status: str,
+    observed_count: int,
+    failure_count: int,
+    warning_count: int,
+    evidence: str,
+    notes: str,
+) -> dict[str, Any]:
+    return {
+        "structure": structure,
+        "status": status,
+        "observed_count": observed_count,
+        "failure_count": failure_count,
+        "warning_count": warning_count,
+        "evidence": evidence,
+        "notes": notes,
+    }

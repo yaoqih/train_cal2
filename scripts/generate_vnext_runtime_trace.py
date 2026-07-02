@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 
 from solver_vnext.engine import VNextSolver, write_artifacts
-from solver_vnext.legacy_adapter import legacy
+from solver_vnext import physical
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,7 +36,7 @@ def run(args: argparse.Namespace) -> int:
     truth_paths = sorted(path for path in truth_dir.glob("*.json") if path.name != "conversion_summary.json")
     if args.case_id:
         wanted = {item.upper() for item in args.case_id}
-        truth_paths = [path for path in truth_paths if legacy.case_id_from_path(path) in wanted]
+        truth_paths = [path for path in truth_paths if physical.case_id_from_path(path) in wanted]
 
     solver = VNextSolver(
         max_hooks=args.max_hooks,
@@ -48,15 +48,49 @@ def run(args: argparse.Namespace) -> int:
     phase_records = []
     frontier_records = []
     staging_records = []
+    flow_edge_records = []
+    connection_records = []
+    structure_node_records = []
+    resource_structure_records = []
+    generation_gap_records = []
     for truth_path in truth_paths:
-        result, case_traces, _operations, case_phase_records, case_frontier_records, case_staging_records = solver.solve_case(truth_path, output_dir)
+        (
+            result,
+            case_traces,
+            _operations,
+            case_phase_records,
+            case_frontier_records,
+            case_staging_records,
+            case_flow_edge_records,
+            case_connection_records,
+            case_structure_node_records,
+            case_resource_structure_records,
+            case_generation_gap_records,
+        ) = solver.solve_case(truth_path, output_dir)
         results.append(result)
         traces.extend(case_traces)
         phase_records.extend(case_phase_records)
         frontier_records.extend(case_frontier_records)
         staging_records.extend(case_staging_records)
+        flow_edge_records.extend(case_flow_edge_records)
+        connection_records.extend(case_connection_records)
+        structure_node_records.extend(case_structure_node_records)
+        resource_structure_records.extend(case_resource_structure_records)
+        generation_gap_records.extend(case_generation_gap_records)
 
-    write_artifacts(output_dir, results, traces, phase_records, frontier_records, staging_records)
+    write_artifacts(
+        output_dir,
+        results,
+        traces,
+        phase_records,
+        frontier_records,
+        staging_records,
+        flow_edge_records,
+        connection_records,
+        structure_node_records,
+        resource_structure_records,
+        generation_gap_records,
+    )
     completed = sum(1 for row in results if row.status == "completed")
     blocked = sum(1 for row in results if row.status == "blocked")
     print(

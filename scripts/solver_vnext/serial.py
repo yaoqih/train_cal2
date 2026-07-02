@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 
 
 def reverse_serial_blockers() -> dict[str, set[str]]:
     reverse: dict[str, set[str]] = {}
-    for blocked_line, blocker_lines in legacy.legacy.SERIAL_LINE_BLOCKERS.items():
+    for blocked_line, blocker_lines in physical.SERIAL_LINE_BLOCKERS.items():
         for blocker_line in blocker_lines:
             reverse.setdefault(blocker_line, set()).add(blocked_line)
     return reverse
@@ -18,7 +18,7 @@ def serial_blocker_lines() -> set[str]:
 
 
 def serial_related_lines() -> set[str]:
-    return set(legacy.legacy.SERIAL_LINE_BLOCKERS) | serial_blocker_lines()
+    return set(physical.SERIAL_LINE_BLOCKERS) | serial_blocker_lines()
 
 
 def downstream_lines(blocker_line: str) -> set[str]:
@@ -44,13 +44,13 @@ def downstream_debt_nos(
     blocked = downstream_lines(blocker_line)
     if not blocked:
         return []
-    loads = legacy.line_loads(cars)
+    loads = physical.line_loads(cars)
     debt: list[str] = []
-    for car in legacy.unsatisfied_cars(cars, depot_assignment):
-        no = legacy.car_no(car)
+    for car in physical.unsatisfied_cars(cars, depot_assignment):
+        no = physical.car_no(car)
         if no in moving_nos:
             continue
-        target_line, _position, _reason = legacy.planned_target_for_car(car, cars, depot_assignment, loads)
+        target_line, _position, _reason = physical.planned_target_for_car(car, cars, depot_assignment, loads)
         if car["Line"] in blocked or target_line in blocked:
             debt.append(no)
     return debt

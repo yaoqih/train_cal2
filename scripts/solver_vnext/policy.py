@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 from . import plan_facts
 from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, IntentKind, PhaseKind, PhaseState, ResourceDelta, SolverState
+from .flow import classify_flow_facts
 from .phase import HumanPhaseGate
 
 
@@ -39,45 +40,15 @@ class BaselinePolicy:
         self.phase_gate = HumanPhaseGate()
 
     def context(self, state: SolverState) -> PolicyContext:
-        unsatisfied = legacy.unsatisfied_cars(state.cars, state.depot_assignment)
-        loads = legacy.line_loads(state.cars)
-        remote_count = 0
-        front_count = 0
-        cun4_count = 0
-        closeout_count = 0
-        for car in unsatisfied:
-            target_line, _position, _reason = legacy.planned_target_for_car(
-                car,
-                state.cars,
-                state.depot_assignment,
-                loads,
-            )
-            if car["Line"] in legacy.REMOTE_INTERACTION_LINES or target_line in legacy.REMOTE_INTERACTION_LINES:
-                remote_count += 1
-            elif target_line == "存4线":
-                cun4_count += 1
-            elif target_line in {
-                "调梁棚",
-                "调梁线北",
-                "预修线",
-                "洗罐站",
-                "洗罐线北",
-                "油漆线",
-                "抛丸线",
-                "卸轮线",
-                "机走棚",
-                "机库线",
-                "机走北",
-            }:
-                front_count += 1
-            else:
-                closeout_count += 1
+        flow_facts = classify_flow_facts(state.cars, state.depot_assignment)
         phase_state = self.phase_gate.classify_state(
-            front_debt=front_count,
-            cun4_port_debt=cun4_count,
-            remote_debt=remote_count,
-            closeout_debt=closeout_count,
+            front_debt=flow_facts.front_debt,
+            cun4_port_debt=flow_facts.cun4_port_debt,
+            remote_debt=flow_facts.remote_debt,
+            closeout_debt=flow_facts.closeout_debt,
             remote_session_open=state.remote_session_open,
+            cun4_release_ready=flow_facts.cun4_release_ready,
+            active_variant=flow_facts.active_variant,
         )
         remote_open = phase_state.phase == PhaseKind.H4_REMOTE_DEPOT
         return PolicyContext(
@@ -111,49 +82,57 @@ class BaselinePolicy:
         remote_transition_cost = plan_facts.remote_transition_cost(hook, context.last_business_remote)
         hook_count = max(1, plan_facts.hook_count(hook))
         lane = self._candidate_lane(candidate, context)
-        if envelope.contract.family == ContractFamily.REMOTE_SESSION:
-            return (
-                lane,
-                self._contract_phase_key(envelope.contract, context),
-                self._remote_penalty(touched_remote, context),
-                remote_transition_cost,
-                round(-delta.contract_reduction / hook_count, 4),
-                round(-delta.effective_gain / hook_count, 4),
-                -delta.contract_reduction,
-                hook_count,
-                -len(hook.move_car_nos),
-                self._contract_key(envelope.contract, context),
-                hook.candidate_id,
-            )
         return (
             lane,
+            self._special_candidate_rank(candidate, context),
             self._contract_phase_key(envelope.contract, context),
+            self._remote_penalty(touched_remote, context),
+            remote_transition_cost,
             round(-delta.contract_reduction / hook_count, 4),
             round(-delta.effective_gain / hook_count, 4),
             round(-delta.total_reduction / hook_count, 4),
             -delta.contract_reduction,
             -delta.effective_gain,
             -delta.total_reduction,
-            self._remote_penalty(touched_remote, context),
-            remote_transition_cost,
-            -len(hook.move_car_nos),
             plan_facts.put_count(hook),
+            hook_count,
+            -len(hook.move_car_nos),
             self._contract_key(envelope.contract, context),
             hook.candidate_id,
         )
 
+    def _special_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        if self.fills_cun4_port(candidate, context):
+            return 0
+        if self.opens_remote_session(candidate):
+            return 1
+        if candidate.envelope.contract.family == ContractFamily.REMOTE_SESSION:
+            return 2
+        return 3
+
     def _candidate_lane(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        if self.fills_cun4_port(candidate, context):
+            return 0
         if self.opens_remote_session(candidate):
             return 0
         if self.releases_depot_slot(candidate, context):
             return 1
-        if self.digests_remote_session_batch(candidate, context):
+        if self.swaps_depot_slot(candidate, context):
             return 2
-        if self.digests_depot_inbound_batch(candidate, context):
+        if self.digests_remote_session_batch(candidate, context):
             return 3
+        if self.digests_depot_inbound_batch(candidate, context):
+            return 4
         if self.fragments_depot_inbound(candidate, context):
             return 30
+        if candidate.envelope.intent == IntentKind.BLOCKER_STAGING:
+            return 40
         return 10
+
+    def fills_cun4_port(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase not in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT}:
+            return False
+        return "存4线" in candidate.resource_delta.request.put_lines and candidate.contract_delta.total_reduction > 0
 
     def opens_remote_session(self, candidate: EvaluatedCandidate) -> bool:
         envelope = candidate.envelope
@@ -177,9 +156,17 @@ class BaselinePolicy:
             return False
         return (
             envelope.contract.family in {ContractFamily.DEPOT_SLOT, ContractFamily.DEPOT_OUTBOUND}
-            and hook.source_line in legacy.DEPOT_LINES
-            and request.target_line in legacy.legacy.DEPOT_OUTSIDE_LINES
+            and hook.source_line in physical.DEPOT_LINES
+            and request.target_line in physical.DEPOT_OUTSIDE_LINES
             and delta.contract_reduction > 0
+        )
+
+    def swaps_depot_slot(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        return (
+            candidate.envelope.intent == IntentKind.DEPOT_SLOT_SWAP
+            and candidate.contract_delta.contract_reduction > 0
         )
 
     def digests_remote_session_batch(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
@@ -191,7 +178,7 @@ class BaselinePolicy:
         return (
             envelope.contract.family == ContractFamily.REMOTE_SESSION
             and envelope.intent == IntentKind.REMOTE_SESSION
-            and any(line in legacy.DEPOT_LINES for line in request.put_lines)
+            and any(line in physical.DEPOT_LINES for line in request.put_lines)
             and delta.contract_reduction >= 3
         )
 
@@ -204,7 +191,7 @@ class BaselinePolicy:
         return (
             envelope.contract.family == ContractFamily.REPAIR_INBOUND
             and envelope.intent == IntentKind.REMOTE_DEPOT
-            and any(line in legacy.DEPOT_LINES for line in request.put_lines)
+            and any(line in physical.DEPOT_LINES for line in request.put_lines)
             and not request.same_plan_source_return_nos
             and plan_facts.depot_put_line_count(request) >= 2
             and (
@@ -222,7 +209,7 @@ class BaselinePolicy:
         return (
             envelope.contract.family == ContractFamily.REPAIR_INBOUND
             and envelope.intent == IntentKind.REMOTE_DEPOT
-            and any(line in legacy.DEPOT_LINES for line in request.put_lines)
+            and any(line in physical.DEPOT_LINES for line in request.put_lines)
             and plan_facts.depot_put_line_count(request) == 1
             and plan_facts.put_count(envelope.candidate) == 1
             and delta.contract_reduction <= 1

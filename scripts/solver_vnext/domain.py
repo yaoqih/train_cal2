@@ -29,6 +29,9 @@ class IntentKind(str, Enum):
     REMOTE_DEPOT = "REMOTE_DEPOT"
     TAIL_CLOSEOUT = "TAIL_CLOSEOUT"
     DEPOT_REPACK = "DEPOT_REPACK"
+    DEPOT_SLOT_SWAP = "DEPOT_SLOT_SWAP"
+    SERIAL_GATE_CLEAR = "SERIAL_GATE_CLEAR"
+    BLOCKER_STAGING = "BLOCKER_STAGING"
 
 
 class ResourceKind(str, Enum):
@@ -108,6 +111,8 @@ class PhaseState:
     remote_debt: int
     closeout_debt: int
     reason: str
+    cun4_release_ready: bool = False
+    active_variant: str = ""
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,16 @@ class GateDecision:
 
 
 @dataclass
+class SerialGateLease:
+    lease_id: str
+    owner_contract_id: str
+    blocker_line: str
+    opened_hook: int
+    blocker_nos: tuple[str, ...]
+    debt_nos: tuple[str, ...]
+
+
+@dataclass
 class SolverState:
     case_id: str
     cars: list[dict[str, Any]]
@@ -173,6 +188,7 @@ class SolverState:
     visited_signatures: set[tuple[str, str, tuple[tuple[str, str, int], ...]]] = field(default_factory=set)
     remote_session_open: bool = False
     last_business_remote: bool | None = None
+    serial_gate_leases: dict[str, SerialGateLease] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

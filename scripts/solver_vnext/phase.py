@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from . import legacy_adapter as legacy
+from . import physical
 from . import plan_facts
 from .domain import ContractDelta, ContractFamily, IntentKind, PhaseKind, PhaseState, ResourceDelta
 
@@ -49,9 +49,9 @@ class PhaseGateRecord:
 class HumanPhaseGate:
     """Human-derived phase gate.
 
-    This module is deliberately passive: it classifies phase state, records
-    transitions, and reports whether an accepted action is primary/support/veto
-    for the current phase.  Candidate generation and ranking stay outside it.
+    This module classifies phase state and decides whether a candidate is
+    primary/support/veto for that phase. It does not rank candidates or generate
+    moves; the engine treats veto as a hard gate before policy tie-breaking.
     """
 
     PRIMARY_FAMILIES = {
@@ -91,9 +91,14 @@ class HumanPhaseGate:
             ContractFamily.REMOTE_SESSION,
             ContractFamily.REPAIR_INBOUND,
             ContractFamily.DEPOT_OUTBOUND,
+            ContractFamily.SPECIAL_REPAIR_PROCESS,
         },
         "H3": {ContractFamily.CUN4_PORT_STAGING, ContractFamily.DEPOT_SLOT},
-        "H4": {ContractFamily.CUN4_PORT_STAGING, ContractFamily.LOCO_AREA_STAGING},
+        "H4": {
+            ContractFamily.CUN4_PORT_STAGING,
+            ContractFamily.FUNCTION_LINE_SERVICE,
+            ContractFamily.LOCO_AREA_STAGING,
+        },
         "H5": {ContractFamily.SPECIAL_REPAIR_PROCESS},
     }
 
@@ -105,10 +110,15 @@ class HumanPhaseGate:
         remote_debt: int,
         closeout_debt: int,
         remote_session_open: bool,
+        cun4_release_ready: bool = False,
+        active_variant: str = "",
     ) -> PhaseState:
         if remote_session_open and remote_debt:
             phase = PhaseKind.H4_REMOTE_DEPOT
             reason = "remote_session_continuation"
+        elif cun4_release_ready and remote_debt:
+            phase = PhaseKind.H3_RELEASE_ACCEPT
+            reason = "cun4_release_ready"
         elif front_debt > 6 and front_debt > int(remote_debt * 0.6):
             phase = PhaseKind.H1_FRONT_SERVICE
             reason = "front_service_debt_open"
@@ -128,6 +138,8 @@ class HumanPhaseGate:
             remote_debt=remote_debt,
             closeout_debt=closeout_debt,
             reason=reason,
+            cun4_release_ready=cun4_release_ready,
+            active_variant=active_variant,
         )
 
     def phase_code(self, phase: PhaseKind | str) -> str:
@@ -153,9 +165,11 @@ class HumanPhaseGate:
         proposed_rank = PHASE_RANK.get(proposed_code, 0)
         if previous_phase == "H4" and proposed.remote_debt > 0:
             return "H4"
+        if previous_phase == "H3" and proposed.remote_debt > 0 and proposed_code != "H4":
+            return "H3"
         if previous_phase in {"H3", "H4"} and proposed.remote_debt == 0 and proposed_rank < PHASE_RANK["H5"]:
             return "H5"
-        if previous_phase == "H2" and proposed.cun4_port_debt > 0 and proposed.remote_debt > 0:
+        if previous_phase == "H2" and proposed_code != "H3" and proposed.cun4_port_debt > 0 and proposed.remote_debt > 0:
             return "H2"
         if proposed_rank and proposed_rank < previous_rank:
             return previous_phase
@@ -177,8 +191,23 @@ class HumanPhaseGate:
             remote_session_open=remote_session_open,
         )
         family = envelope.contract.family
+        hard_veto = self._hard_boundary_veto(
+            phase=phase,
+            phase_state=phase_state,
+            target_phase=target_phase,
+            resource_delta=resource_delta,
+            remote_session_open=remote_session_open,
+        )
+        if hard_veto:
+            return PhasePermission(False, "veto_candidate", target_phase, hard_veto)
         if family in self.PRIMARY_FAMILIES.get(phase, set()):
             return PhasePermission(True, "primary", target_phase, "primary_family_allowed")
+        if (
+            resource_delta.request.intent == IntentKind.SERIAL_GATE_CLEAR
+            and "serial_gate_lease_opened" in contract_delta.fulfilled
+            and contract_delta.support_gain > 0
+        ):
+            return PhasePermission(True, "support", target_phase, "serial_gate_clear_support")
         if self._is_structural_support(
             phase=phase,
             target_phase=target_phase,
@@ -187,8 +216,14 @@ class HumanPhaseGate:
             resource_delta=resource_delta,
         ):
             return PhasePermission(True, "support", target_phase, "support_contract_allowed")
-        if resource_delta.request.intent == IntentKind.DEPOT_REPACK and contract_delta.effective_gain > 0:
+        if resource_delta.request.intent in {IntentKind.DEPOT_REPACK, IntentKind.DEPOT_SLOT_SWAP} and contract_delta.effective_gain > 0:
             return PhasePermission(True, "support", target_phase, "positive_support_delta")
+        if self._is_opportunistic_support(
+            phase_state=phase_state,
+            target_phase=target_phase,
+            contract_delta=contract_delta,
+        ):
+            return PhasePermission(True, "support", target_phase, "positive_opportunistic_support")
         return PhasePermission(False, "veto_candidate", target_phase, "phase_family_not_allowed")
 
     def target_phase(self, *, envelope: Any, resource_delta: ResourceDelta, remote_session_open: bool) -> str:
@@ -315,8 +350,55 @@ class HumanPhaseGate:
             return False
         if contract_delta.effective_gain <= 0 and contract_delta.total_reduction <= 0:
             return False
-        touched_remote = any(line in legacy.REMOTE_INTERACTION_LINES for line in resource_delta.request.touched_lines)
+        if phase == "H4" and envelope.contract.family == ContractFamily.CUN4_PORT_STAGING:
+            return True
+        touched_remote = any(line in physical.REMOTE_INTERACTION_LINES for line in resource_delta.request.touched_lines)
         if phase in {"H3", "H4"} and target_phase in {"H1", "H2"} and not touched_remote:
+            return False
+        return True
+
+    def _hard_boundary_veto(
+        self,
+        *,
+        phase: str,
+        phase_state: PhaseState,
+        target_phase: str,
+        resource_delta: ResourceDelta,
+        remote_session_open: bool,
+    ) -> str:
+        request = resource_delta.request
+        touched_remote = any(line in physical.REMOTE_INTERACTION_LINES for line in request.touched_lines)
+        if phase == "H2" and phase_state.cun4_release_ready:
+            if target_phase == "H3":
+                return ""
+            if target_phase == "H4" and remote_session_open:
+                return ""
+            return "h2_release_ready_requires_h3_release_accept"
+        if phase == "H3":
+            if target_phase == "H3":
+                return ""
+            if target_phase == "H4" and (remote_session_open or touched_remote):
+                return ""
+            return "h3_release_accept_atomic_boundary"
+        if phase == "H4" and phase_state.remote_debt > 0:
+            if target_phase == "H5":
+                return "h4_remote_debt_before_closeout"
+            if target_phase in {"H1", "H2"} and not touched_remote:
+                return "h4_blocks_front_work_until_remote_debt_clear"
+        return ""
+
+    def _is_opportunistic_support(
+        self,
+        *,
+        phase_state: PhaseState,
+        target_phase: str,
+        contract_delta: ContractDelta,
+    ) -> bool:
+        if contract_delta.effective_gain <= 0 and contract_delta.total_reduction <= 0:
+            return False
+        if target_phase == "H5" and (
+            phase_state.front_debt > 0 or phase_state.cun4_port_debt > 0 or phase_state.remote_debt > 0
+        ):
             return False
         return True
 
@@ -332,6 +414,7 @@ class HumanPhaseGate:
             "cun4_port_debt": phase_state.cun4_port_debt,
             "remote_debt": phase_state.remote_debt,
             "closeout_debt": phase_state.closeout_debt,
+            "cun4_release_ready": phase_state.cun4_release_ready,
             "phase_reason": phase_state.reason,
             "transition": transition_type,
         }
@@ -346,6 +429,8 @@ class HumanPhaseGate:
         return ";".join(f"{key}={value}" for key, value in values.items())
 
     def _variant(self, phase_state: PhaseState) -> str:
+        if phase_state.active_variant:
+            return phase_state.active_variant
         if phase_state.remote_debt and phase_state.cun4_port_debt:
             return "FULL_CHAIN_REPAIR"
         if phase_state.remote_debt:
