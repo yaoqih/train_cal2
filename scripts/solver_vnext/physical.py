@@ -99,8 +99,8 @@ SPOTTING_LINE_TOTAL_POSITIONS = {
 }
 _normalize_line_cache: dict[Any, str] = {}
 _access_order_cache: dict[tuple[int, int, str, str, str, frozenset[str], frozenset[str]], list[dict[str, Any]]] = {}
-_unsatisfied_cache: dict[tuple[int, int], tuple[dict[str, Any], ...]] = {}
-_line_loads_cache: dict[int, Counter[str]] = {}
+_unsatisfied_cache: dict[tuple[Any, ...], tuple[dict[str, Any], ...]] = {}
+_line_loads_cache: dict[tuple[tuple[str, str, int], ...], Counter[str]] = {}
 
 
 def clear_access_order_cache() -> None:
@@ -634,8 +634,8 @@ def route_approach_lines_for_put(
     return operation_approach_lines(line)
 
 
-def route_end_location(path: tuple[str, ...] | list[str], fallback_line: str) -> LocoLocation:
-    line = normalize_line(fallback_line)
+def route_end_location(path: tuple[str, ...] | list[str], default_line: str) -> LocoLocation:
+    line = normalize_line(default_line)
     if path:
         line = normalize_line(path[-1])
     return LocoLocation(line=line)
@@ -855,9 +855,9 @@ def depot_line_capacity(
     depot_assignment: DepotAssignment,
     line: str,
     *,
-    fallback_position: int = 0,
+    minimum_position: int = 0,
 ) -> int:
-    """Return the configured depot capacity, falling back only for legacy empty assignments."""
+    """Return the configured depot capacity, using observed positions for incomplete fixtures."""
     configured = getattr(depot_assignment, "capacities", {}).get(line)
     if configured:
         return int(configured)
@@ -865,7 +865,7 @@ def depot_line_capacity(
         [int(slot.position) for slot in depot_assignment.slots.values() if slot.line == line]
         or [0]
     )
-    return max(assigned_max, int(fallback_position or 0), 5)
+    return max(assigned_max, int(minimum_position or 0), 5)
 
 
 def line_number(line: str) -> int:
@@ -1264,7 +1264,7 @@ def target_position_is_acceptable(
                 return False
         if slot.locked:
             return position == slot.position
-        capacity = depot_line_capacity(depot_assignment, target_line, fallback_position=position)
+        capacity = depot_line_capacity(depot_assignment, target_line, minimum_position=position)
         return depot_actual_position_allowed(car, target_line, position, capacity)
     if target_line not in (car.get("_TargetLineSet") or set(target_lines(car))):
         return False
@@ -1483,7 +1483,7 @@ def car_is_satisfied(
             return position == slot.position
         if car["Line"] not in depot_targets(car):
             return False
-        capacity = depot_line_capacity(depot_assignment, car["Line"], fallback_position=position)
+        capacity = depot_line_capacity(depot_assignment, car["Line"], minimum_position=position)
         return depot_actual_position_allowed(car, car["Line"], position, capacity) and (
             cars is None or depot_section_repair_position_allowed(car, car["Line"], position, cars)
         )
@@ -1497,7 +1497,7 @@ def car_is_satisfied(
 
 
 def unsatisfied_cars(cars: list[dict[str, Any]], depot_assignment: DepotAssignment) -> list[dict[str, Any]]:
-    key = (id(cars), id(depot_assignment))
+    key = (cars_cache_key(cars), depot_assignment_cache_key(depot_assignment))
     cached = _unsatisfied_cache.get(key)
     if cached is not None:
         return list(cached)
@@ -1507,12 +1507,32 @@ def unsatisfied_cars(cars: list[dict[str, Any]], depot_assignment: DepotAssignme
 
 
 def line_loads(cars: list[dict[str, Any]]) -> Counter[str]:
-    key = id(cars)
+    key = cars_cache_key(cars)
     cached = _line_loads_cache.get(key)
     if cached is None:
         cached = Counter(car["Line"] for car in cars)
         _line_loads_cache[key] = cached
     return cached.copy()
+
+
+def cars_cache_key(cars: list[dict[str, Any]]) -> tuple[tuple[str, str, int], ...]:
+    return tuple(
+        (car_no(car), car["Line"], int(car.get("Position") or 0))
+        for car in sorted(cars, key=lambda item: car_no(item))
+    )
+
+
+def depot_assignment_cache_key(depot_assignment: DepotAssignment) -> tuple[Any, ...]:
+    return (
+        tuple(
+            sorted(
+                (no, slot.line, slot.position, slot.locked)
+                for no, slot in depot_assignment.slots.items()
+            )
+        ),
+        tuple(sorted(depot_assignment.failures.items())),
+        tuple(sorted(depot_assignment.capacities.items())),
+    )
 
 
 def line_length_loads(cars: list[dict[str, Any]]) -> Counter[str]:
@@ -1522,15 +1542,20 @@ def line_length_loads(cars: list[dict[str, Any]]) -> Counter[str]:
     return loads
 
 
-def final_line_length_warnings(cars: list[dict[str, Any]]) -> tuple[str, ...]:
+def final_line_length_warnings(
+    cars: list[dict[str, Any]],
+    baseline_cars: list[dict[str, Any]] | None = None,
+) -> tuple[str, ...]:
     loads = line_length_loads(cars)
+    baseline_loads = line_length_loads(baseline_cars) if baseline_cars is not None else Counter()
     warnings: list[str] = []
     for line, load in sorted(loads.items()):
         spec = TRACK_SPECS.get(line)
         if not spec:
             continue
-        if load > spec.length_m + LINE_LENGTH_TOLERANCE_M:
-            warnings.append(f"{line}:{load:.1f}>{spec.length_m:.1f}")
+        allowed_load = max(spec.length_m, baseline_loads.get(line, 0.0))
+        if load > allowed_load + LINE_LENGTH_TOLERANCE_M:
+            warnings.append(f"{line}:{load:.1f}>{allowed_load:.1f}")
     return tuple(warnings)
 
 
@@ -2024,7 +2049,7 @@ def depot_locked_tail_positions(cars: list[dict[str, Any]], line: str, depot_ass
     if not locked_positions:
         return set()
     tail_start = max(locked_positions)
-    capacity = depot_line_capacity(depot_assignment, line, fallback_position=tail_start)
+    capacity = depot_line_capacity(depot_assignment, line, minimum_position=tail_start)
     return set(range(tail_start, capacity + 1))
 
 
@@ -2983,7 +3008,7 @@ def validate_target_positions(
         capacity = depot_line_capacity(
             depot_assignment,
             candidate.target_line,
-            fallback_position=max(target_positions or [0]),
+            minimum_position=max(target_positions or [0]),
         )
         for car in batch:
             position = actual_positions.get(car_no(car), 0)

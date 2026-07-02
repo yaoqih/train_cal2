@@ -201,6 +201,23 @@ class HumanPhaseGate:
             return previous_phase
         return proposed_code
 
+    def next_phase_after_exhaustion(self, *, phase_state: PhaseState, current_phase: str) -> str:
+        if current_phase == "H1":
+            if phase_state.cun4_port_debt and phase_state.remote_debt:
+                return "H2"
+            if phase_state.remote_debt:
+                return "H4"
+            if phase_state.closeout_debt:
+                return "H5"
+        if current_phase == "H2":
+            if phase_state.cun4_release_ready and phase_state.remote_debt:
+                return "H3"
+            if phase_state.remote_debt:
+                return "H4"
+        if current_phase == "H3" and phase_state.remote_debt:
+            return "H4"
+        return ""
+
     def permission(
         self,
         *,
@@ -228,12 +245,6 @@ class HumanPhaseGate:
             return PhasePermission(False, "veto_candidate", target_phase, hard_veto)
         if family in self.PRIMARY_FAMILIES.get(phase, set()):
             return PhasePermission(True, "primary", target_phase, "primary_family_allowed")
-        if (
-            resource_delta.request.intent == IntentKind.SERIAL_GATE_CLEAR
-            and "serial_gate_lease_opened" in contract_delta.fulfilled
-            and contract_delta.support_gain > 0
-        ):
-            return PhasePermission(True, "support", target_phase, "serial_gate_clear_support")
         if resource_delta.request.intent == IntentKind.CUN4_RELEASE_ACCEPT and phase in {"H2", "H3", "H4"}:
             return PhasePermission(True, "primary", "H3", "cun4_release_accept_boundary")
         if resource_delta.request.intent == IntentKind.CUN4_OUTBOUND_HOLD and phase in {"H2", "H3", "H4"}:
@@ -246,7 +257,7 @@ class HumanPhaseGate:
             resource_delta=resource_delta,
         ):
             return PhasePermission(True, "support", target_phase, "support_contract_allowed")
-        if resource_delta.request.intent in {IntentKind.DEPOT_REPACK, IntentKind.DEPOT_SLOT_SWAP} and contract_delta.effective_gain > 0:
+        if resource_delta.request.intent == IntentKind.DEPOT_SLOT_SWAP and contract_delta.effective_gain > 0:
             return PhasePermission(True, "support", target_phase, "positive_support_delta")
         return PhasePermission(False, "veto_candidate", target_phase, "phase_family_not_allowed")
 
@@ -284,6 +295,8 @@ class HumanPhaseGate:
             return "enter"
         if previous_phase == current_phase:
             return "stay"
+        if previous_phase == "H4" and current_phase == "H3":
+            return "release"
         previous_rank = PHASE_RANK.get(previous_phase, 0)
         current_rank = PHASE_RANK.get(current_phase, 0)
         if current_rank <= previous_rank:
@@ -296,6 +309,8 @@ class HumanPhaseGate:
         """Phase consumed by the accepted move, not just the pre-move state."""
         if not permission or not permission.allowed:
             return current_phase
+        if permission.target_phase == "H3":
+            return "H3"
         current_rank = PHASE_RANK.get(current_phase, 0)
         target_rank = PHASE_RANK.get(permission.target_phase, 0)
         if permission.relation == "support" and permission.target_phase != "H3":

@@ -203,16 +203,21 @@ class VNextSolver:
                 previous_phase=previous_phase,
                 proposed=raw_policy_context.phase_state,
             )
-            active_phase_state = replace(
-                raw_policy_context.phase_state,
-                phase=self.phase_gate.phase_kind(current_phase),
-            )
-            policy_context = PolicyContext(
-                phase_state=active_phase_state,
-                remote_session=raw_policy_context.remote_session,
-                remote_open=current_phase == "H4",
-                last_business_remote=raw_policy_context.last_business_remote,
-            )
+
+            def context_for_phase(phase_code: str) -> PolicyContext:
+                phase_state = replace(
+                    raw_policy_context.phase_state,
+                    phase=self.phase_gate.phase_kind(phase_code),
+                )
+                return PolicyContext(
+                    phase_state=phase_state,
+                    remote_session=raw_policy_context.remote_session,
+                    remote_open=phase_code == "H4",
+                    last_business_remote=raw_policy_context.last_business_remote,
+                )
+
+            policy_context = context_for_phase(current_phase)
+            active_phase_state = policy_context.phase_state
             last_policy_context = policy_context
             hook_flow_edges = build_flow_edge_records(
                 case_id=state.case_id,
@@ -241,10 +246,8 @@ class VNextSolver:
                         loco_location=state.loco_location,
                     )
                 )
-            contracts = self.policy.order_contracts(
-                build_contracts(state.cars, state.depot_assignment),
-                policy_context,
-            )
+            all_contracts = build_contracts(state.cars, state.depot_assignment)
+            contracts = self.policy.order_contracts(all_contracts, policy_context)
             if not contracts:
                 blocked_reason = "no_active_contract"
                 break
@@ -388,6 +391,49 @@ class VNextSolver:
                 return selected_candidate, generated_count, rejected_count, stats
 
             selected, generated_this_round, rejected_this_round, round_stats = evaluate_episodes(EPISODES)
+            while selected is None and generated_this_round > 0:
+                next_phase = self.phase_gate.next_phase_after_exhaustion(
+                    phase_state=active_phase_state,
+                    current_phase=current_phase,
+                )
+                if not next_phase or next_phase == current_phase:
+                    break
+                structure_node_records.append(
+                    build_structure_node_record(
+                        state=state,
+                        policy_context=policy_context,
+                        flow_edges=hook_flow_edges,
+                        contracts=contracts,
+                        stats=round_stats,
+                        selected=None,
+                        blocked_reason=(
+                            f"phase_exhausted:{current_phase}->{next_phase};"
+                            f"{round_stats.top_reject_reasons()}"
+                        ),
+                    )
+                )
+                phase_records.append(
+                    self.phase_gate.record(
+                        case_id=state.case_id,
+                        step_index=state.hook_index,
+                        previous_phase=current_phase,
+                        current_phase=next_phase,
+                        phase_state=active_phase_state,
+                        envelope=None,
+                        contract_delta=None,
+                        permission=None,
+                        hook_count_in_phase=hook_count_by_phase.get(next_phase, 0),
+                        reject_reason=f"phase_exhausted:{current_phase}->{next_phase}",
+                        transition_override=self.phase_gate.transition_type(current_phase, next_phase),
+                    )
+                )
+                current_phase = next_phase
+                previous_phase = current_phase
+                policy_context = context_for_phase(current_phase)
+                active_phase_state = policy_context.phase_state
+                last_policy_context = policy_context
+                contracts = self.policy.order_contracts(all_contracts, policy_context)
+                selected, generated_this_round, rejected_this_round, round_stats = evaluate_episodes(EPISODES)
             if selected is None:
                 blocked_reason = (
                     "no_episode_candidate_generated"
@@ -585,7 +631,7 @@ class VNextSolver:
             state.hook_index += 1
 
         final_unsatisfied = len(physical.unsatisfied_cars(state.cars, state.depot_assignment))
-        final_length_warnings = physical.final_line_length_warnings(state.cars)
+        final_length_warnings = physical.final_line_length_warnings(state.cars, baseline_cars=cars)
         closed_door_reasons = physical.closed_door_replay_violation_reasons(operations, state.cars)
         if closed_door_reasons and not blocked_reason:
             blocked_reason = "|".join(closed_door_reasons)
@@ -855,7 +901,6 @@ def _structure_acceptance_rows(
         "DEPOT_SLOT_DELTA",
         "DEPOT_SWAP_DELTA",
         "SERIAL_GATE_LEASE",
-        "SERIAL_GATE_LEASE_DELTA",
         "SERIAL_GATE_LEASE_LIFECYCLE",
         "LOCO_CARRY_STATE",
     ):
@@ -891,18 +936,10 @@ def _candidate_structure_acceptance_rows(
     phase_records: list[PhaseGateRecord],
 ) -> list[dict[str, Any]]:
     expected_templates = {
-        "depot_multi_drop_accessible_prefix",
         "depot_outbound_session",
-        "depot_repack_with_inbound_tail",
         "depot_slot_swap",
-        "depot_locked_tail_slot_fill",
         "direct_accessible_prefix",
-        "direct_prefix_access_lease",
-        "owned_prefix_tail_digest_restore",
-        "remote_depot_direct_accessible_prefix",
-        "remote_depot_prefix_access_lease",
         "remote_session_directional_digest",
-        "serial_gate_clear_support",
         "tail_blocker_peel_digest",
         "tail_closeout_direct_accessible_prefix",
     }

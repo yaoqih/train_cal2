@@ -734,7 +734,7 @@ def test_serial_gate_resource_uses_put_step_nos_not_whole_candidate_batch() -> N
         move_nos=("D1", "B1"),
         touched_lines=("洗罐站", "机走棚", "存1线"),
         put_lines=("机走棚", "存1线"),
-        intent=IntentKind.PREFIX_DIGEST,
+        intent=IntentKind.BLOCKER_STAGING,
     )
     assert graph._serial_blocker_storage_violations(
         request,
@@ -753,7 +753,7 @@ def test_serial_gate_resource_uses_put_step_nos_not_whole_candidate_batch() -> N
         move_nos=("D1", "B1"),
         touched_lines=("洗罐站", "机走棚", "存1线"),
         put_lines=("机走棚", "存1线"),
-        intent=IntentKind.PREFIX_DIGEST,
+        intent=IntentKind.BLOCKER_STAGING,
     )
     assert graph._serial_blocker_storage_violations(
         other_owner_request,

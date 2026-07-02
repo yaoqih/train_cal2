@@ -8,7 +8,7 @@ from . import physical
 from . import release
 from . import serial
 from .contracts import build_car_refs
-from .domain import ContractFamily, IntentKind, SerialGateLease
+from .domain import ContractFamily, SerialGateLease
 
 
 @dataclass(frozen=True)
@@ -66,12 +66,6 @@ def selected_resource_records(
             hook_index=hook_index,
             envelope=envelope,
             resource_delta=resource_delta,
-        ),
-        _serial_gate_lease_record(
-            case_id=case_id,
-            hook_index=hook_index,
-            envelope=envelope,
-            contract_delta=contract_delta,
         ),
         _selected_cun4_record(
             case_id=case_id,
@@ -132,23 +126,6 @@ def next_serial_gate_leases(
         if not after_debt:
             del next_leases[blocker_line]
 
-    if envelope.intent == IntentKind.SERIAL_GATE_CLEAR and "serial_gate_lease_opened" in contract_delta.fulfilled:
-        blocker_line = envelope.candidate.source_line
-        debt_nos = serial.downstream_debt_nos(
-            blocker_line=blocker_line,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            moving_nos=set(envelope.candidate.move_car_nos),
-        )
-        if debt_nos:
-            next_leases[blocker_line] = SerialGateLease(
-                lease_id=f"{case_id}:{blocker_line}:{hook_index}",
-                owner_contract_id=envelope.contract.contract_id,
-                blocker_line=blocker_line,
-                opened_hook=hook_index,
-                blocker_nos=tuple(envelope.candidate.move_car_nos),
-                debt_nos=tuple(sorted(debt_nos)),
-            )
     return next_leases
 
 
@@ -321,30 +298,6 @@ def _loco_carry_record(
         subject_nos="|".join(resource_delta.request.move_nos),
         violation=violation,
         detail="|".join(segments),
-    )
-
-
-def _serial_gate_lease_record(
-    *,
-    case_id: str,
-    hook_index: int,
-    envelope: Any,
-    contract_delta: Any,
-) -> ResourceStructureRecord:
-    opened = envelope.intent == IntentKind.SERIAL_GATE_CLEAR
-    status = "pass" if (not opened or "serial_gate_lease_opened" in contract_delta.fulfilled) else "fail"
-    return ResourceStructureRecord(
-        case_id=case_id,
-        hook_index=hook_index,
-        structure="SERIAL_GATE_LEASE_DELTA",
-        status=status,
-        owner_contract_id=envelope.contract.contract_id,
-        candidate_id=envelope.candidate.candidate_id,
-        mode="opened" if opened else "not_applicable",
-        resource_key=envelope.candidate.source_line,
-        subject_nos="|".join(envelope.candidate.move_car_nos),
-        violation="" if status == "pass" else "serial_gate_clear_without_lease_delta",
-        detail="|".join((*contract_delta.fulfilled, *contract_delta.reduced)),
     )
 
 
@@ -551,41 +504,6 @@ def _serial_gate_lifecycle_records(
             )
         )
 
-    if envelope.intent == IntentKind.SERIAL_GATE_CLEAR:
-        blocker_line = envelope.candidate.source_line
-        after_debt = set(
-            serial.downstream_debt_nos(
-                blocker_line=blocker_line,
-                cars=prospective_cars,
-                depot_assignment=depot_assignment,
-                moving_nos=set(),
-            )
-        )
-        after_blockers = sorted(
-            physical.car_no(car)
-            for car in prospective_cars
-            if car["Line"] == blocker_line
-        )
-        opened = "serial_gate_lease_opened" in contract_delta.fulfilled
-        status = "pass" if opened and not (after_blockers and after_debt) else "fail"
-        records.append(
-            ResourceStructureRecord(
-                case_id=case_id,
-                hook_index=hook_index,
-                structure="SERIAL_GATE_LEASE_LIFECYCLE",
-                status=status,
-                owner_contract_id=envelope.contract.contract_id,
-                candidate_id=envelope.candidate.candidate_id,
-                mode="opened",
-                resource_key=blocker_line,
-                subject_nos="|".join(envelope.candidate.move_car_nos),
-                violation="" if status == "pass" else "serial_gate_clear_without_clean_open",
-                detail=(
-                    f"opened={opened};after_debt={len(after_debt)};"
-                    f"after_blockers={','.join(after_blockers)}"
-                ),
-            )
-        )
     return records
 
 

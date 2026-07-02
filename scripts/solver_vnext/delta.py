@@ -41,17 +41,13 @@ def build_contract_delta(
         prospective_cars=prospective_cars,
         depot_assignment=depot_assignment,
     )
-    opens_serial_gate_lease = envelope.intent == IntentKind.SERIAL_GATE_CLEAR and bool(serial_releases)
-    if after_contract_debt > before_contract_debt and not opens_serial_gate_lease:
+    if after_contract_debt > before_contract_debt:
         broken.append("contract_debt_increased")
-    if after_unsatisfied > before_unsatisfied and not opens_serial_gate_lease:
+    if after_unsatisfied > before_unsatisfied:
         broken.append("global_unsatisfied_increased")
     if serial_releases:
         support_gain = max(support_gain, len(serial_releases))
         reduced.append("serial_line_gate_released")
-    if opens_serial_gate_lease:
-        fulfilled.append("serial_gate_lease_opened")
-        support_gain = max(support_gain, len(serial_releases) + max(0, after_unsatisfied - before_unsatisfied))
     if envelope.resource_request.same_plan_source_return_nos:
         fulfilled.append("same_plan_prefix_returned_to_source")
     if envelope.intent == IntentKind.CUN4_RELEASE_GROUP:
@@ -66,8 +62,8 @@ def build_contract_delta(
         after_release_count = release.cun4_release_group_count(prospective_cars, depot_assignment)
         if before_release_count > after_release_count:
             reduced.append("cun4_release_group_released")
-    if envelope.intent in {IntentKind.DEPOT_REPACK, IntentKind.DEPOT_SLOT_SWAP}:
-        reduced.append("depot_repack_ordered" if envelope.intent == IntentKind.DEPOT_REPACK else "depot_slot_swap_ordered")
+    if envelope.intent == IntentKind.DEPOT_SLOT_SWAP:
+        reduced.append("depot_slot_swap_ordered")
         if after_contract_debt < before_contract_debt:
             reduced.append("depot_contract_debt_reduced")
     return ContractDelta(

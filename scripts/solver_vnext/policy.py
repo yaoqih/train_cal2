@@ -171,7 +171,7 @@ class BaselinePolicy:
         request = candidate.resource_delta.request
         if not physical.is_spotting_line(request.target_line):
             return False
-        return candidate.envelope.template_name in {"spotting_repack", "spotting_target_repack"}
+        return candidate.envelope.template_name == "spotting_repack"
 
     def continues_remote_work(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:

@@ -827,7 +827,7 @@ DIGESTING -> APPROACHING_PORT:
 | 全局只能按阶段走 | 每条 edge 自己有 status |
 | 先决定现在属于哪个阶段 | 先识别哪条边正在推进 |
 | 阶段内再找动作 | 候选动作先解释为 ContractDelta |
-| 异常 case 容易掉到 fallback | 异常 case 可以从中间状态初始化 |
+| 异常 case 容易掉到兜底动作 | 异常 case 可以从中间状态初始化 |
 
 所以它不会把问题绕回原来的 workflow。
 
@@ -3974,7 +3974,7 @@ baseline:
   保留 ordered carry sequence
 
 compressed:
-  使用 LocoCarryState + ordered_contract_segments fallback
+  使用 LocoCarryState + ordered_contract_segments 兜底表示
 ```
 
 注意：
@@ -5186,7 +5186,7 @@ phase_hook_not_higher_than_human =
 
 ### 20B.6 高可解性条件
 
-高可解性不是“能跑出几个案例”，而是每个可进入的阶段都有合法 fallback 和失败定位。
+高可解性不是“能跑出几个案例”，而是每个可进入的阶段都有合法兜底解释和失败定位。
 
 建议门槛：
 
@@ -5201,9 +5201,9 @@ phase_hook_not_higher_than_human =
 | 必需候选 recall | 100% | 100% |
 | resource deadlock 有合法 break action | 100% | 100% |
 
-每个阶段必须有 fallback：
+每个阶段必须有失败定位：
 
-| 阶段 | fallback |
+| 阶段 | 失败定位 |
 |---|---|
 | H1 | 前段组织失败时输出缺失 owner、服务债务、阻塞资源、不可混编原因 |
 | H2 | 存4口成形失败时输出口污染、方向冲突、阻塞合同和合法清口动作 |
@@ -5584,7 +5584,7 @@ improved_secondary_metric_count >= 2
 
 | 阶段 | 若哪些结构达标 | 是否能完成该阶段 | 钩数不高于人工的必要条件 | 可解性条件 |
 |---|---|---|---|---|
-| H1 前段全站组织与服务处理 | `FlowClassify`, `StationFlowContract`, `YARD_REBALANCE`, `FUNCTION_LINE_SERVICE`, `PRE_REPAIR_STAGING`, `DISPATCH_SHED_QUEUE`, `LocoCarryState` | 可以。非大库主体债务和大库主流 owner 能被区分，前段动作不再被当作杂活。 | `front_service_progress >= 0.8`，目标 `>= 0.9`; `manual_H1_hook_count` 可比；同结构搜索不接受劣解。 | `effective_contract_coverage >= 95%`; residual `<= 5%`; 失败有 owner/blocker/fallback。 |
+| H1 前段全站组织与服务处理 | `FlowClassify`, `StationFlowContract`, `YARD_REBALANCE`, `FUNCTION_LINE_SERVICE`, `PRE_REPAIR_STAGING`, `DISPATCH_SHED_QUEUE`, `LocoCarryState` | 可以。非大库主体债务和大库主流 owner 能被区分，前段动作不再被当作杂活。 | `front_service_progress >= 0.8`，目标 `>= 0.9`; `manual_H1_hook_count` 可比；同结构搜索不接受劣解。 | `effective_contract_coverage >= 95%`; residual `<= 5%`; 失败有 owner/blocker/失败定位。 |
 | H2 存4释放口成形与保护 | `CUN4_NORTH_BUFFER`, `FlowPort`, `Blocker`, `Protection`, `TargetContractSelector`, `StationResourceGraph` | 可以。存4北能从普通线路提升为释放口资源，并识别污染、方向和阻塞。 | `cun4_port_shape_ready = true`; 存4污染次数 `<= manual_cun4_dirty_count`。 | `port_shape_reason_coverage = 100%`; `cun4_direction_conflict_accepted = 0`。 |
 | H3 存4大释放-机接硬边界 | `RepairInboundVariant`, `FlowEdgeStatus`, `EdgeContract`, `Protection`, `ResourceRequest`, `AcceptRejectGate` | 可以。标准链能连续处理 `存4 - N 北头摘 -> 机 + N 接`，短链/低信号可合法跳过或保守。 | 标准链 `release_accept_gap <= 2`，目标 `<= 1`; `manual_H3_hook_count` 可比。 | `strict_release_candidate_recall = 100%`; `machine_accept_candidate_recall = 100%`; 低置信跨 `ACCEPTED = 0`。 |
 | H4 修库消化、库位和出入库冲突处理 | `DepotSlotGraph`, `DepotSwapDelta`, `DEPOT_OUTBOUND`, `REPAIR_INBOUND`, `Obligation`, `ResourceDelta`, `ordered carry segments` | 可以。修库摘解、slot/band、stayer、swap 和必要出库腾位能被统一处理。 | `depot_digest_complete = true`; `swap_required_resolved_ratio = 100%`; 大库进出次数 `<= manual_depot_entry_exit_count`。 | `depot_slot_violation_accepted = 0`; `invalid_detach_count = 0`; H4 失败必须给 slot/swap/端别原因。 |

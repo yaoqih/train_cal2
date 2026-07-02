@@ -31,7 +31,7 @@ class StagingIntentRecord:
 
 
 class StagingIntentBuilder:
-    """Extract explicit temporary-assembly facts from selected planlets."""
+    """Extract explicit temporary-assembly facts from selected multi-step candidates."""
 
     PEEL_STAGING_LINES = {
         "存2线",

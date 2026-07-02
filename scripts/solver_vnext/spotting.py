@@ -51,6 +51,12 @@ class _RepackIntent:
     final_order: tuple[dict[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class _SameLinePlacement:
+    move_order: tuple[dict[str, Any], ...]
+    final_positions: dict[str, int]
+
+
 def spotting_nonforced_prefix_would_pollute(
     *,
     contract: Any,
@@ -92,7 +98,7 @@ def spotting_nonforced_prefix_would_pollute(
     return False
 
 
-def build_spotting_target_repack_planlet(
+def build_spotting_cross_line_repack_planlet(
     *,
     case_id: str,
     hook_index: int,
@@ -272,22 +278,31 @@ def build_spotting_same_line_repack_planlet(
     if physical.pull_equivalent(list(line_cars)) > physical.PULL_LIMIT_EQUIVALENT:
         return None
 
-    for final_order in _same_line_final_orders(line=line, line_cars=line_cars, depot_assignment=depot_assignment):
-        if _nos(final_order) == _nos(line_cars):
+    for placement in _same_line_final_placements(line=line, line_cars=line_cars, depot_assignment=depot_assignment):
+        original_positions = {
+            physical.car_no(car): int(car.get("Position") or 0)
+            for car in line_cars
+        }
+        if placement.final_positions == original_positions:
             continue
-        projected = _project_target_order(cars=cars, target_line=line, final_order=final_order)
+        projected = _project_target_positions(
+            cars=cars,
+            target_line=line,
+            final_cars=placement.move_order,
+            final_positions=placement.final_positions,
+        )
         if not _all_spotting_groups_are_acceptable(projected, line, depot_assignment):
             continue
         if frontier.target_put_violation_reasons(
             target_line=line,
-            batch=list(line_cars),
+            batch=list(placement.move_order),
             projected_cars=projected,
             depot_assignment=depot_assignment,
         ):
             continue
         for staging_line in _same_line_staging_lines(
             line=line,
-            batch=line_cars,
+            batch=placement.move_order,
             cars=cars,
             depot_assignment=depot_assignment,
             frontier=frontier,
@@ -295,24 +310,20 @@ def build_spotting_same_line_repack_planlet(
             loco_location=loco_location,
         ):
             staging_positions = planned_positions_for_batch(
-                batch=list(line_cars),
+                batch=list(placement.move_order),
                 target_line=staging_line,
                 cars=cars,
                 depot_assignment=depot_assignment,
-                batch_nos=set(_nos(line_cars)),
+                batch_nos=set(_nos(placement.move_order)),
             )
-            if len(staging_positions) != len(line_cars):
+            if len(staging_positions) != len(placement.move_order):
                 continue
-            final_positions = {
-                physical.car_no(car): position
-                for position, car in enumerate(final_order, start=1)
-            }
-            move_nos = _nos(line_cars)
+            move_nos = _nos(placement.move_order)
             steps = (
                 physical.plan_step("Get", line, move_nos),
                 physical.plan_step("Put", staging_line, move_nos, staging_positions),
                 physical.plan_step("Get", staging_line, move_nos),
-                physical.plan_step("Put", line, move_nos, final_positions),
+                physical.plan_step("Put", line, move_nos, placement.final_positions),
             )
             if not frontier.plan_steps_are_reachable(
                 steps=steps,
@@ -329,7 +340,7 @@ def build_spotting_same_line_repack_planlet(
                 hook_index=hook_index,
                 source_line=line,
                 target_line=line,
-                batch=list(line_cars),
+                batch=list(placement.move_order),
                 steps=steps,
                 reason=f"{reason};spotting_repack=same_line;staging={staging_line}",
                 candidate_kind=candidate_kind,
@@ -447,6 +458,11 @@ def _general_spotting_final_positions(
         batch_nos=all_nos,
     )
     if len(positions) != len(all_cars):
+        positions = _structured_spotting_final_positions(
+            target_line=target_line,
+            all_cars=all_cars,
+        )
+    if len(positions) != len(all_cars):
         return {}
     projected = _project_target_positions(
         cars=cars,
@@ -457,6 +473,58 @@ def _general_spotting_final_positions(
     if not _all_spotting_groups_are_acceptable(projected, target_line, depot_assignment):
         return {}
     return positions
+
+
+def _structured_spotting_final_positions(
+    *,
+    target_line: str,
+    all_cars: tuple[dict[str, Any], ...],
+) -> dict[str, int]:
+    total = physical.SPOTTING_LINE_TOTAL_POSITIONS.get(target_line, 0)
+    if not total or len(all_cars) > total:
+        return {}
+
+    final_positions: dict[str, int] = {}
+    occupied: set[int] = set()
+    forced_groups = tuple(
+        sorted(
+            {
+                physical.force_positions(car)
+                for car in all_cars
+                if physical.force_positions(car)
+                and target_line in (car.get("_TargetLineSet") or set(physical.target_lines(car)))
+            }
+        )
+    )
+    for forced in forced_groups:
+        group = tuple(car for car in all_cars if _same_spotting_target(car, target_line, forced))
+        capacity = physical.spotting_capacity(target_line, forced)
+        if not capacity or len(group) > capacity:
+            return {}
+        for before_count in _physical_before_counts(
+            target_line=target_line,
+            forced=forced,
+            forced_count=len(group),
+        ):
+            segment = tuple(range(before_count + 1, before_count + 1 + len(group)))
+            if any(position in occupied for position in segment):
+                continue
+            for car, position in zip(group, segment):
+                final_positions[physical.car_no(car)] = position
+            occupied.update(segment)
+            break
+        else:
+            return {}
+
+    free_positions = [position for position in range(1, total + 1) if position not in occupied]
+    for car in all_cars:
+        no = physical.car_no(car)
+        if no in final_positions:
+            continue
+        if not free_positions:
+            return {}
+        final_positions[no] = free_positions.pop(0)
+    return final_positions
 
 
 def _target_groups_for_full_line(target_existing: tuple[dict[str, Any], ...]) -> tuple[_TargetGroup, ...]:
@@ -559,12 +627,12 @@ def _source_partition(source_batch: tuple[dict[str, Any], ...]) -> _SourcePartit
     return _SourcePartition(forced=forced, before=before, same=same, after=after)
 
 
-def _same_line_final_orders(
+def _same_line_final_placements(
     *,
     line: str,
     line_cars: tuple[dict[str, Any], ...],
     depot_assignment: Any,
-) -> tuple[tuple[dict[str, Any], ...], ...]:
+) -> tuple[_SameLinePlacement, ...]:
     forced_groups = tuple(
         sorted(
             {
@@ -578,7 +646,7 @@ def _same_line_final_orders(
     if not forced_groups:
         return ()
 
-    orders: list[tuple[dict[str, Any], ...]] = []
+    placements: list[_SameLinePlacement] = []
     original_nos = _nos(line_cars)
     for forced in forced_groups:
         forced_cars = tuple(car for car in line_cars if _same_spotting_target(car, line, forced))
@@ -593,29 +661,45 @@ def _same_line_final_orders(
             if len(ordered_window) < len(forced_cars):
                 continue
             slots = ordered_window[: len(forced_cars)]
-            final: list[dict[str, Any] | None] = [None] * len(line_cars)
+            total = physical.SPOTTING_LINE_TOTAL_POSITIONS.get(line, 0)
+            if not total:
+                continue
+            final_slots: list[dict[str, Any] | None] = [None] * total
             for car, position in zip(forced_cars, slots):
-                if position < 1 or position > len(final):
+                if position < 1 or position > len(final_slots):
                     break
-                final[position - 1] = car
+                final_slots[position - 1] = car
             else:
                 others = iter(other_cars)
-                for index, item in enumerate(final):
+                for index, item in enumerate(final_slots):
                     if item is None:
-                        final[index] = next(others)
-                order = tuple(car for car in final if car is not None)
+                        try:
+                            final_slots[index] = next(others)
+                        except StopIteration:
+                            break
+                order = tuple(car for car in final_slots if car is not None)
                 if set(_nos(order)) == set(original_nos):
-                    projected = _project_target_order(cars=list(line_cars), target_line=line, final_order=order)
+                    final_positions = {
+                        physical.car_no(car): position
+                        for position, car in enumerate(final_slots, start=1)
+                        if car is not None
+                    }
+                    projected = _project_target_positions(
+                        cars=list(line_cars),
+                        target_line=line,
+                        final_cars=order,
+                        final_positions=final_positions,
+                    )
                     if _all_spotting_groups_are_acceptable(projected, line, depot_assignment):
-                        orders.append(order)
-    deduped: list[tuple[dict[str, Any], ...]] = []
-    seen: set[tuple[str, ...]] = set()
-    for order in orders:
-        key = _nos(order)
+                        placements.append(_SameLinePlacement(move_order=order, final_positions=final_positions))
+    deduped: list[_SameLinePlacement] = []
+    seen: set[tuple[tuple[str, int], ...]] = set()
+    for placement in placements:
+        key = tuple(sorted(placement.final_positions.items()))
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(order)
+        deduped.append(placement)
     return tuple(deduped)
 
 

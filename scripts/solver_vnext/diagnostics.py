@@ -287,7 +287,7 @@ def _generation_gap_reason(
     if _subject_is_blocked_inside_prefix(contract, source_prefixes):
         return "source_prefix_blocker_requires_lease"
     if any(physical.is_spotting_line(line) for line in targets):
-        return "spotting_target_repack_required"
+        return "spotting_repack_required"
     return "episode_generated_zero_after_prefilter"
 
 
