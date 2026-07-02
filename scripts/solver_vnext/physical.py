@@ -1533,12 +1533,41 @@ def line_access_order(
     return [car_no(car) for car in line_cars]
 
 
+def car_uses_business_position_on_line(car: dict[str, Any], line: str) -> bool:
+    if not force_positions(car):
+        return False
+    targets = car.get("_TargetLineSet") or set(target_lines(car))
+    return line in targets
+
+
+def line_uses_business_positions(
+    cars: list[dict[str, Any]],
+    line: str,
+    move_nos: set[str] | None = None,
+) -> bool:
+    if line in DEPOT_TARGET_LINES or is_spotting_line(line):
+        return True
+    move_nos = move_nos or set()
+    return any(
+        (car["Line"] == line or car_no(car) in move_nos)
+        and car_uses_business_position_on_line(car, line)
+        for car in cars
+    )
+
+
 def physical_positions_after_put(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
+    planned_positions: dict[str, int] | None = None,
 ) -> dict[str, int]:
     put_order = [no for no in put_order if no]
+    if put_uses_business_positions(cars, line, put_order, planned_positions):
+        return {
+            no: int(planned_positions[no])
+            for no in put_order
+            if planned_positions and no in planned_positions
+        }
     put_nos = set(put_order)
     existing_access_order = [
         no for no in line_access_order(cars, line, put_nos)
@@ -1548,15 +1577,28 @@ def physical_positions_after_put(
     return {no: position for position, no in enumerate(final_access_order, start=1)}
 
 
+def put_uses_business_positions(
+    cars: list[dict[str, Any]],
+    line: str,
+    put_order: list[str],
+    planned_positions: dict[str, int] | None,
+) -> bool:
+    if not planned_positions:
+        return False
+    return line_uses_business_positions(cars, line, set(put_order))
+
+
 def apply_physical_put_order(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
+    planned_positions: dict[str, int] | None = None,
 ) -> None:
     positions = physical_positions_after_put(
         cars,
         line,
         put_order,
+        planned_positions,
     )
     for car in cars:
         no = car_no(car)
@@ -1584,12 +1626,14 @@ def projected_after_physical_put(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
+    planned_positions: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     projected = [dict(car) for car in cars]
     apply_physical_put_order(
         projected,
         line,
         put_order,
+        planned_positions,
     )
     return projected
 
@@ -2566,6 +2610,7 @@ def validate_candidate(
         cars,
         candidate.target_line,
         put_order,
+        candidate.planned_positions,
     )
     position_reasons = validate_target_positions(
         candidate,
@@ -2736,6 +2781,7 @@ def validate_planlet(
                 working_cars,
                 step.line,
                 put_order,
+                step.planned_positions,
             )
             reasons.extend(validate_target_positions(step_candidate, projected_after_put, batch, active_depot_assignment))
             train_consist = [by_no[no] for no in carried_order if no in by_no]
@@ -2748,6 +2794,7 @@ def validate_planlet(
                 working_cars,
                 step.line,
                 put_order,
+                step.planned_positions,
             )
             carried.difference_update(step_nos)
             carried_order = [no for no in carried_order if no not in step_nos]
@@ -3067,6 +3114,7 @@ def apply_candidate(
                 cars,
                 step.line,
                 put_order,
+                step.planned_positions,
             )
             carried_order = [no for no in carried_order if no not in step_nos]
         return
@@ -3088,12 +3136,15 @@ def apply_candidate(
         cars,
         candidate.target_line,
         put_order,
+        candidate.planned_positions,
     )
     if candidate.source_line != candidate.target_line:
         compact_source_positions(cars, candidate.source_line, move_nos)
 
 
 def compact_source_positions(cars: list[dict[str, Any]], source_line: str, moved_nos: set[str]) -> None:
+    if line_uses_business_positions(cars, source_line):
+        return
     remaining = [car for car in cars if car["Line"] == source_line and car_no(car) not in moved_nos]
     remaining.sort(key=lambda item: (int(item.get("Position") or 0), car_no(item)))
     for position, car in enumerate(remaining, start=1):

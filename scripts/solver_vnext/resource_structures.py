@@ -315,7 +315,8 @@ def _serial_gate_record(
     serial_gate_leases: dict[str, SerialGateLease],
 ) -> ResourceStructureRecord:
     blocked: list[str] = []
-    leased_refilled: list[str] = []
+    leased_serving: list[str] = []
+    leased_polluted: list[str] = []
     for blocker_line in sorted(serial.serial_blocker_lines()):
         debt = serial.downstream_debt_nos(
             blocker_line=blocker_line,
@@ -333,9 +334,15 @@ def _serial_gate_record(
                 blocked.append(f"{blocker_line}:{','.join(blockers)}->{','.join(sorted(debt)[:8])}")
                 lease = serial_gate_leases.get(blocker_line)
                 if lease:
-                    leased_refilled.append(f"{blocker_line}:{lease.lease_id}:{','.join(blockers)}")
-    if leased_refilled:
-        mode = "leased_refilled"
+                    pollution_nos = serial.lease_pollution_nos(lease, blockers)
+                    if pollution_nos:
+                        leased_polluted.append(f"{blocker_line}:{lease.lease_id}:{','.join(pollution_nos)}")
+                    else:
+                        leased_serving.append(f"{blocker_line}:{lease.lease_id}:{','.join(blockers)}")
+    if leased_polluted:
+        mode = "leased_polluted"
+    elif leased_serving:
+        mode = "leased_serving"
     elif blocked:
         mode = "blocked_needs_lease"
     else:
@@ -344,14 +351,14 @@ def _serial_gate_record(
         case_id=case_id,
         hook_index=hook_index,
         structure="SERIAL_GATE_LEASE",
-        status="fail" if leased_refilled else "pass",
+        status="fail" if leased_polluted else "pass",
         owner_contract_id="",
         candidate_id="",
         mode=mode,
         resource_key="serial_lines",
         subject_nos="",
-        violation="serial_gate_lease_refilled_before_downstream_clear" if leased_refilled else "",
-        detail="|".join(leased_refilled or blocked),
+        violation="serial_gate_lease_polluted_before_downstream_clear" if leased_polluted else "",
+        detail="|".join(leased_polluted or leased_serving or blocked),
     )
 
 
@@ -647,12 +654,18 @@ def _serial_gate_lifecycle_records(
             for car in prospective_cars
             if car["Line"] == blocker_line
         )
-        if after_blockers and after_debt:
-            mode = "refilled_before_served"
+        pollution_nos = serial.lease_pollution_nos(lease, after_blockers)
+        service_nos = serial.lease_service_nos(lease, after_blockers)
+        if after_debt and pollution_nos:
+            mode = "polluted_before_served"
             status = "fail"
-            violation = "serial_gate_lease_refilled_before_downstream_clear"
+            violation = "serial_gate_lease_polluted_before_downstream_clear"
         elif not after_debt:
             mode = "closed"
+            status = "pass"
+            violation = ""
+        elif service_nos:
+            mode = "serving"
             status = "pass"
             violation = ""
         elif len(after_debt) < len(before_debt):
@@ -678,7 +691,8 @@ def _serial_gate_lifecycle_records(
                 detail=(
                     f"lease_id={lease.lease_id};age={hook_index - lease.opened_hook};"
                     f"before_debt={len(before_debt)};after_debt={len(after_debt)};"
-                    f"after_blockers={','.join(after_blockers)}"
+                    f"after_blockers={','.join(after_blockers)};"
+                    f"service={','.join(service_nos)};pollution={','.join(pollution_nos)}"
                 ),
             )
         )

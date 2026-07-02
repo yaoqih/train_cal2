@@ -10,9 +10,24 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from solver_vnext import physical
+from solver_vnext import serial
 from solver_vnext.placement import planned_positions_for_batch
 from solver_vnext.contracts import classify_family
-from solver_vnext.domain import ContractFamily
+from solver_vnext.domain import (
+    CandidateEnvelope,
+    ContractDelta,
+    ContractFamily,
+    FlowContract,
+    IntentKind,
+    PhaseKind,
+    PhaseState,
+    ResourceDelta,
+    ResourceKind,
+    ResourceRequest,
+    SerialGateLease,
+)
+from solver_vnext.phase import HumanPhaseGate
+from solver_vnext.resources import StationResourceGraph
 
 
 def car(
@@ -235,7 +250,24 @@ def test_spotting_placement_uses_relaxed_business_window_with_fixed_capacity() -
     ) == {}
 
 
-def test_spotting_line_source_positions_compact_after_north_end_remove() -> None:
+def test_plain_line_source_positions_compact_after_north_end_remove() -> None:
+    cars = [
+        car("N1", line="存1线", position=1, target_lines=["存2线"]),
+        car("E1", line="存1线", position=2, target_lines=["存1线"]),
+        car("E2", line="存1线", position=5, target_lines=["存1线"]),
+    ]
+    physical.apply_physical_get_order(cars, "存1线", ("N1",))
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "N1": ("", 0),
+        "E1": ("存1线", 1),
+        "E2": ("存1线", 2),
+    }
+
+
+def test_spotting_line_source_positions_preserve_after_north_end_remove() -> None:
     cars = [
         car("N1", line="抛丸线", position=1, target_lines=["存1线"]),
         car("F1", line="抛丸线", position=2, target_lines=["抛丸线"]),
@@ -244,15 +276,31 @@ def test_spotting_line_source_positions_compact_after_north_end_remove() -> None
     for item in cars[1:]:
         item["_ForcePositions"] = (2, 3)
         item["ForceTargetPosition"] = [2, 3]
-    cars[0]["Line"] = "存1线"
-    physical.compact_source_positions(cars, "抛丸线", {"N1"})
+    physical.apply_physical_get_order(cars, "抛丸线", ("N1",))
     assert {
-        physical.car_no(item): item["Position"]
+        physical.car_no(item): (item["Line"], item["Position"])
         for item in cars
-        if item["Line"] == "抛丸线"
     } == {
-        "F1": 1,
-        "F2": 2,
+        "N1": ("", 0),
+        "F1": ("抛丸线", 2),
+        "F2": ("抛丸线", 3),
+    }
+
+
+def test_depot_source_positions_preserve_after_north_end_remove() -> None:
+    cars = [
+        car("N1", line="修3库内", position=1, target_lines=["存4线"]),
+        car("D1", line="修3库内", position=2, target_lines=["修3库内"]),
+        car("D2", line="修3库内", position=4, target_lines=["修3库内"]),
+    ]
+    physical.apply_physical_get_order(cars, "修3库内", ("N1",))
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "N1": ("", 0),
+        "D1": ("修3库内", 2),
+        "D2": ("修3库内", 4),
     }
 
 
@@ -299,23 +347,231 @@ def test_put_order_allows_only_train_tail_suffix() -> None:
     )
 
 
-def test_put_inserts_from_north_end_and_shifts_existing_on_all_lines() -> None:
+def test_put_inserts_from_north_end_and_shifts_existing_on_plain_lines() -> None:
     cars = [
-        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
-        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
-        car("E1", line="修1库内", position=4, target_lines=["修1库内"]),
-        car("E2", line="修1库内", position=8, target_lines=["修1库内"]),
+        car("M1", line="存1线", position=1, target_lines=["存2线"]),
+        car("M2", line="存1线", position=2, target_lines=["存2线"]),
+        car("E1", line="存2线", position=4, target_lines=["存2线"]),
+        car("E2", line="存2线", position=8, target_lines=["存2线"]),
     ]
-    physical.apply_physical_put_order(cars, "修1库内", ["M1", "M2"])
+    physical.apply_physical_put_order(cars, "存2线", ["M1", "M2"])
     assert {
         physical.car_no(item): (item["Line"], item["Position"])
         for item in cars
     } == {
-        "M1": ("修1库内", 1),
-        "M2": ("修1库内", 2),
-        "E1": ("修1库内", 3),
-        "E2": ("修1库内", 4),
+        "M1": ("存2线", 1),
+        "M2": ("存2线", 2),
+        "E1": ("存2线", 3),
+        "E2": ("存2线", 4),
     }
+
+
+def test_depot_put_uses_business_planned_positions_not_north_end_shift() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
+        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
+        car("E1", line="修1库内", position=1, target_lines=["修1库内"]),
+        car("E2", line="修1库内", position=3, target_lines=["修1库内"]),
+    ]
+    physical.apply_physical_put_order(
+        cars,
+        "修1库内",
+        ["M1", "M2"],
+        {"M1": 4, "M2": 5},
+    )
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "M1": ("修1库内", 4),
+        "M2": ("修1库内", 5),
+        "E1": ("修1库内", 1),
+        "E2": ("修1库内", 3),
+    }
+
+
+def test_forced_position_put_uses_business_position_on_plain_line() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["存2线"]),
+        car("E1", line="存2线", position=1, target_lines=["存2线"]),
+    ]
+    cars[0]["_ForcePositions"] = (3,)
+    cars[0]["ForceTargetPosition"] = [3]
+    physical.apply_physical_put_order(
+        cars,
+        "存2线",
+        ["M1"],
+        {"M1": 3},
+    )
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "M1": ("存2线", 3),
+        "E1": ("存2线", 1),
+    }
+
+
+def test_existing_forced_position_on_plain_target_line_is_not_shifted_by_put() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["存2线"]),
+        car("F1", line="存2线", position=3, target_lines=["存2线"]),
+    ]
+    cars[1]["_ForcePositions"] = (3,)
+    cars[1]["ForceTargetPosition"] = [3]
+    physical.apply_physical_put_order(
+        cars,
+        "存2线",
+        ["M1"],
+        {"M1": 1},
+    )
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in cars
+    } == {
+        "M1": ("存2线", 1),
+        "F1": ("存2线", 3),
+    }
+
+
+def test_serial_gate_lease_allows_only_downstream_debt_service() -> None:
+    lease = SerialGateLease(
+        lease_id="T:机走棚:1",
+        owner_contract_id="C",
+        blocker_line="机走棚",
+        opened_hook=1,
+        blocker_nos=("B1",),
+        debt_nos=("D1", "D2"),
+    )
+    assert serial.lease_allows_put(lease, ("D1",))
+    assert not serial.lease_allows_put(lease, ("B1",))
+    assert not serial.lease_allows_put(lease, ("X1",))
+    assert serial.lease_pollution_nos(lease, ("D1", "B1", "X1")) == ("B1", "X1")
+
+
+def test_serial_gate_resource_uses_put_step_nos_not_whole_candidate_batch() -> None:
+    graph = StationResourceGraph()
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    cars = [
+        car("D1", line="洗罐站", position=1, target_lines=["存2线"]),
+        car("D2", line="洗罐站", position=2, target_lines=["存2线"]),
+        car("B1", line="机走棚", position=1, target_lines=["存1线"]),
+    ]
+    lease = SerialGateLease(
+        lease_id="T:机走棚:1",
+        owner_contract_id="C",
+        blocker_line="机走棚",
+        opened_hook=1,
+        blocker_nos=("B1",),
+        debt_nos=("D1", "D2"),
+    )
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=2,
+        source_line="洗罐站",
+        target_line="机走棚",
+        batch=[cars[0], cars[2]],
+        planned_positions={},
+        generation_reason="test",
+        candidate_kind="test_serial_lease_multidrop",
+        plan_steps=(
+            physical.plan_step("Get", "洗罐站", ("D1", "B1")),
+            physical.plan_step("Put", "机走棚", ("D1",)),
+            physical.plan_step("Put", "存1线", ("B1",)),
+        ),
+    )
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(ResourceKind.SERIAL_LINE_GATE,),
+        source_line="洗罐站",
+        target_line="机走棚",
+        move_nos=("D1", "B1"),
+        touched_lines=("洗罐站", "机走棚", "存1线"),
+        put_lines=("机走棚", "存1线"),
+        intent=IntentKind.PREFIX_DIGEST,
+    )
+    assert graph._serial_blocker_storage_violations(
+        request,
+        candidate=candidate,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        serial_gate_leases={"机走棚": lease},
+    ) == []
+    other_owner_request = ResourceRequest(
+        contract_id="OTHER",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(ResourceKind.SERIAL_LINE_GATE,),
+        source_line="洗罐站",
+        target_line="机走棚",
+        move_nos=("D1", "B1"),
+        touched_lines=("洗罐站", "机走棚", "存1线"),
+        put_lines=("机走棚", "存1线"),
+        intent=IntentKind.PREFIX_DIGEST,
+    )
+    assert graph._serial_blocker_storage_violations(
+        other_owner_request,
+        candidate=candidate,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        serial_gate_leases={"机走棚": lease},
+    )[0].startswith("serial_blocker_storage_before_downstream_clear")
+
+
+def test_h4_blocks_front_work_even_when_it_touches_remote_line() -> None:
+    gate = HumanPhaseGate()
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id="candidate",
+        resources=(),
+        source_line="存5线北",
+        target_line="卸轮线",
+        move_nos=("D1",),
+        touched_lines=("存5线北", "卸轮线"),
+        put_lines=("卸轮线",),
+        intent=IntentKind.FRONT_PREP,
+    )
+    contract = FlowContract(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        subject_nos=("D1",),
+        source_lines=("存5线北",),
+        target_lines=("卸轮线",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    permission = gate.permission(
+        phase_state=PhaseState(
+            phase=PhaseKind.H4_REMOTE_DEPOT,
+            front_debt=1,
+            cun4_port_debt=0,
+            remote_debt=5,
+            closeout_debt=0,
+            reason="remote_session_continuation",
+        ),
+        envelope=CandidateEnvelope(
+            candidate=object(),
+            contract=contract,
+            intent=IntentKind.FRONT_PREP,
+            resource_request=request,
+            template_name="direct_accessible_prefix",
+        ),
+        contract_delta=ContractDelta(
+            contract_id="C",
+            family=ContractFamily.FUNCTION_LINE_SERVICE,
+            before_unsatisfied=5,
+            after_unsatisfied=4,
+            before_contract_debt=1,
+            after_contract_debt=0,
+        ),
+        resource_delta=ResourceDelta(request=request, acquired=(), released_lines=()),
+        remote_session_open=True,
+    )
+    assert not permission.allowed
+    assert permission.reason == "h4_blocks_front_work_until_remote_debt_clear"
 
 
 def test_planlet_rejects_non_tail_put_and_accepts_tail_put_order() -> None:

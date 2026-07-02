@@ -449,12 +449,10 @@ class HumanPhaseGate:
         if phase == "H4" and phase_state.remote_debt > 0:
             if target_phase == "H5":
                 return "h4_remote_debt_before_closeout"
-            if target_phase in {"H1", "H2"} and not touched_remote:
-                if (
-                    target_phase == "H2"
-                    and request.family == ContractFamily.CUN4_PORT_STAGING
-                    and request.target_line == "存4线"
-                ):
+            if target_phase == "H1":
+                return "h4_blocks_front_work_until_remote_debt_clear"
+            if target_phase == "H2":
+                if request.family == ContractFamily.CUN4_PORT_STAGING and request.target_line == "存4线":
                     return ""
                 return "h4_blocks_front_work_until_remote_debt_clear"
         return ""

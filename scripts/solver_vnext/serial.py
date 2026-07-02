@@ -54,3 +54,29 @@ def downstream_debt_nos(
         if car["Line"] in blocked or target_line in blocked:
             debt.append(no)
     return debt
+
+
+def lease_service_nos(lease: Any, car_nos: tuple[str, ...] | list[str] | set[str]) -> tuple[str, ...]:
+    debt_nos = set(getattr(lease, "debt_nos", ()) or ())
+    blocker_nos = set(getattr(lease, "blocker_nos", ()) or ())
+    return tuple(no for no in car_nos if no in debt_nos and no not in blocker_nos)
+
+
+def lease_pollution_nos(lease: Any, car_nos: tuple[str, ...] | list[str] | set[str]) -> tuple[str, ...]:
+    debt_nos = set(getattr(lease, "debt_nos", ()) or ())
+    blocker_nos = set(getattr(lease, "blocker_nos", ()) or ())
+    car_set = set(car_nos)
+    return tuple(sorted((car_set & blocker_nos) | (car_set - debt_nos)))
+
+
+def lease_allows_put(
+    lease: Any,
+    put_nos: tuple[str, ...] | list[str] | set[str],
+    owner_contract_id: str = "",
+) -> bool:
+    if owner_contract_id and getattr(lease, "owner_contract_id", "") != owner_contract_id:
+        return False
+    put_set = set(put_nos)
+    if not put_set:
+        return False
+    return not lease_pollution_nos(lease, put_set) and bool(lease_service_nos(lease, put_set))

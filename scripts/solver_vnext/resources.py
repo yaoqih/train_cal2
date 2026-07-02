@@ -79,6 +79,7 @@ class StationResourceGraph:
                 candidate=candidate,
                 cars=cars,
                 depot_assignment=depot_assignment,
+                serial_gate_leases=serial_gate_leases or {},
             )
         )
         violations.extend(
@@ -176,6 +177,7 @@ class StationResourceGraph:
         candidate: Any,
         cars: list[dict[str, Any]],
         depot_assignment: Any,
+        serial_gate_leases: dict[str, Any],
     ) -> list[str]:
         protected_blockers = {
             "存4线",
@@ -186,12 +188,16 @@ class StationResourceGraph:
             "修4库外",
         }
         move_nos = set(request.move_nos)
+        put_nos_by_line = self._put_nos_by_line(candidate)
         violations: list[str] = []
         for put_line in request.put_lines:
             if put_line in protected_blockers or put_line == request.source_line:
                 continue
             blocked = serial.downstream_lines(put_line)
             if not blocked:
+                continue
+            lease = serial_gate_leases.get(put_line)
+            if lease and serial.lease_allows_put(lease, put_nos_by_line.get(put_line, ()), request.contract_id):
                 continue
             downstream_debt = serial.downstream_debt_nos(
                 blocker_line=put_line,
@@ -221,8 +227,10 @@ class StationResourceGraph:
             return []
         prospective = [dict(car) for car in cars]
         physical.apply_candidate(candidate, prospective, validation)
+        put_nos_by_line = self._put_nos_by_line(candidate)
         violations: list[str] = []
         for blocker_line in leased_put_lines:
+            lease = serial_gate_leases[blocker_line]
             after_debt = serial.downstream_debt_nos(
                 blocker_line=blocker_line,
                 cars=prospective,
@@ -234,13 +242,23 @@ class StationResourceGraph:
                 for car in prospective
                 if car["Line"] == blocker_line
             ]
-            if after_debt and after_blockers:
+            pollution_nos = serial.lease_pollution_nos(lease, after_blockers)
+            put_allowed = serial.lease_allows_put(lease, put_nos_by_line.get(blocker_line, ()), request.contract_id)
+            if after_debt and after_blockers and (pollution_nos or not put_allowed):
                 violations.append(
-                    "serial_gate_lease_refill_before_downstream_clear:"
-                    f"{blocker_line}:{','.join(sorted(after_blockers)[:8])}:"
+                    "serial_gate_lease_polluted_before_downstream_clear:"
+                    f"{blocker_line}:{','.join((pollution_nos or sorted(after_blockers))[:8])}:"
                     f"{','.join(sorted(after_debt)[:8])}"
                 )
         return violations
+
+    def _put_nos_by_line(self, candidate: Any) -> dict[str, tuple[str, ...]]:
+        by_line: dict[str, list[str]] = {}
+        for step in physical.candidate_plan_steps(candidate):
+            if step.action != "Put":
+                continue
+            by_line.setdefault(step.line, []).extend(step.move_car_nos)
+        return {line: tuple(dict.fromkeys(nos)) for line, nos in by_line.items()}
 
     def _depot_slot_violations(
         self,
