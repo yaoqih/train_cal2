@@ -12,7 +12,6 @@ class AccessFrontierRecord:
     case_id: str
     hook_index: int
     loco_line: str
-    loco_node: str
     relevant_line_count: int
     reachable_line_count: int
     route_blocked_line_count: int
@@ -52,13 +51,13 @@ class AccessFrontier:
         prefix_vehicle_count = 0
 
         for line in relevant_lines:
-            static_route = graph.route(loco_location.node, line)
+            static_route = graph.route(loco_location.line, line)
             occupied = physical.occupied_lines_for_get_route(cars, set(), line)
             dynamic_route = graph.route_avoiding_occupied(
-                loco_location.node,
+                loco_location.line,
                 line,
                 occupied,
-                target_nodes=physical.route_target_nodes_for_get(line),
+                target_approach_lines=physical.route_approach_lines_for_get(line),
             )
             if dynamic_route:
                 reachable.append(line)
@@ -87,7 +86,6 @@ class AccessFrontier:
             case_id=case_id,
             hook_index=hook_index,
             loco_line=str(getattr(loco_location, "line", "")),
-            loco_node=str(getattr(loco_location, "node", "")),
             relevant_line_count=len(relevant_lines),
             reachable_line_count=len(reachable),
             route_blocked_line_count=len(route_blocked),

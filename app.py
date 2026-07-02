@@ -1372,7 +1372,6 @@ def _p10_track_count_badges_svg(
 
 
 def _p10_expand_path_for_map(active_path: list[str], tracks: dict) -> list[str]:
-    edge_to_tracks = _vnext_physical_module().SWITCH_EDGE_TRACKS
     endpoint_connectors = {
         "修1库内": ["修1库外", "修1库内"],
         "修1库外": ["修1库外"],
@@ -1394,8 +1393,6 @@ def _p10_expand_path_for_map(active_path: list[str], tracks: dict) -> list[str]:
     expanded: list[str] = []
     for index, item in enumerate(active_path):
         mapped = endpoint_connectors.get(item, [item] if item in tracks else [])
-        if index + 1 < len(active_path):
-            mapped.extend(list(edge_to_tracks.get(frozenset((item, active_path[index + 1])), ())))
         for track in mapped:
             if track in tracks and (not expanded or expanded[-1] != track):
                 expanded.append(track)

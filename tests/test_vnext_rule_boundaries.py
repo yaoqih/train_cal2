@@ -153,6 +153,53 @@ def test_reversal_triplet_rule_does_not_fire_on_unlisted_path() -> None:
     assert reasons == []
 
 
+def test_line_graph_covers_known_lines_and_is_connected() -> None:
+    graph = physical.TrackGraph()
+    known_lines = set(physical.TRACK_SPECS) | physical.RUNNING_LINES
+    missing = [line for line in known_lines if line not in graph._adjacency]
+    assert missing == []
+
+    start = "机库线"
+    unreachable = [
+        line
+        for line in sorted(known_lines)
+        if not graph.route(start, line)
+    ]
+    assert unreachable == []
+
+
+def test_occupied_pre_repair_put_uses_allowed_line_approach() -> None:
+    graph = physical.TrackGraph()
+    cars = [
+        car("P1", line="预修线", position=1, target_lines=["预修线"]),
+        car("M1", line="存5线北", position=1, target_lines=["预修线"]),
+    ]
+    moving_nos = {"M1"}
+    path = graph.route_avoiding_occupied(
+        "存5线北",
+        "预修线",
+        physical.occupied_lines_for_route(cars, moving_nos),
+        target_approach_lines=physical.route_approach_lines_for_put("预修线", cars, moving_nos),
+    )
+    assert path
+    assert path[-2] in {"渡7", "存2线"}
+    assert "预修线" not in path[:-1]
+
+
+def test_empty_pre_repair_put_does_not_force_approach_line() -> None:
+    graph = physical.TrackGraph()
+    cars = [car("M1", line="存5线北", position=1, target_lines=["预修线"])]
+    moving_nos = {"M1"}
+    path = graph.route_avoiding_occupied(
+        "存5线北",
+        "预修线",
+        physical.occupied_lines_for_route(cars, moving_nos),
+        target_approach_lines=physical.route_approach_lines_for_put("预修线", cars, moving_nos),
+    )
+    assert path
+    assert path[-2] == "渡9"
+
+
 def test_spotting_placement_uses_relaxed_business_window_with_fixed_capacity() -> None:
     depot_assignment = physical.DepotAssignment(slots={}, failures={})
     batch = [

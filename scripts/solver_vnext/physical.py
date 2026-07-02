@@ -23,7 +23,6 @@ DEPOT_INNER_BLOCKERS = {
     f"修{index}库内": f"修{index}库外"
     for index in range(1, 5)
 }
-CUN5_SPLIT_NODE = "存5标识桩分界"
 # Internal line keys follow the existing runtime model. LINE_FULL_NAMES records
 # the full table names used by operations for diagnostics and new rules.
 LINE_FULL_NAMES = {
@@ -165,6 +164,8 @@ def normalize_line(value: Any) -> str:
         "修3外": "修3库外",
         "修4": "修4库内",
         "修4外": "修4库外",
+        "预修": "预修线",
+        "联6线": "联6",
         "存1": "存1线",
         "存2": "存2线",
         "注意存2": "存2线",
@@ -247,46 +248,83 @@ TRACK_SPECS: dict[str, TrackSpec] = {
     "修4库内": TrackSpec("修4库内", 151.7, "operation"),
 }
 
-ROUTE_TRACK_ALIASES: dict[str, str] = {
-    "渡1": "L1",
-    "渡2": "L3",
-    "渡3": "L4",
-    "渡4": "L7",
-    "渡5": "Z1",
-    "渡6": "Z2",
-    "渡7": "Z3",
-    "渡8": "L13",
-    "渡9": "L14",
-    "渡10": "L15",
-    "渡11": "L19",
-    "渡12": "L17",
-    "渡13": "L18",
-}
+LINE_GRAPH_EDGES: tuple[tuple[str, str], ...] = (
+    ("修4库内", "修4库外"),
+    ("修3库内", "修3库外"),
+    ("修2库内", "修2库外"),
+    ("修1库内", "修1库外"),
+    ("修4库外", "渡13"),
+    ("修3库外", "渡13"),
+    ("修2库外", "渡12"),
+    ("修1库外", "渡11"),
+    ("卸轮线", "渡11"),
+    ("渡13", "渡12"),
+    ("渡12", "联7"),
+    ("渡11", "联7"),
+    ("抛丸线", "渡10"),
+    ("联7", "渡10"),
+    ("渡10", "渡9"),
+    ("渡10", "机南"),
+    ("渡9", "渡8"),
+    ("渡8", "存4南"),
+    ("渡8", "存5线南"),
+    ("渡9", "预修线"),
+    ("洗罐站", "洗罐线北"),
+    ("洗罐线北", "洗油北"),
+    ("油漆线", "洗油北"),
+    ("机南", "机走棚"),
+    ("洗油北", "机走棚"),
+    ("调梁棚", "调梁线北"),
+    ("机库线", "渡4"),
+    ("预修线", "存2线"),
+    ("预修线", "渡7"),
+    ("调梁线北", "渡4"),
+    ("存5线南", "存5线北"),
+    ("存4南", "存4线"),
+    ("存4南", "存3线"),
+    ("渡7", "存1线"),
+    ("渡7", "渡6"),
+    ("机走北", "渡5"),
+    ("机走棚", "机走北"),
+    ("渡6", "渡5"),
+    ("渡4", "机北2"),
+    ("存5线北", "渡1"),
+    ("存4线", "渡1"),
+    ("存3线", "渡3"),
+    ("存2线", "渡3"),
+    ("存1线", "机北1"),
+    ("机北2", "机北1"),
+    ("渡5", "机北2"),
+    ("机北1", "渡2"),
+    ("渡3", "渡2"),
+    ("渡1", "联6"),
+    ("渡2", "联6"),
+)
 
-LINE_OPERATION_APPROACH_NODES: dict[str, tuple[str, ...]] = {
-    "修4库外": ("L18",),
-    "修3库外": ("L18",),
-    "修2库外": ("L17",),
-    "修1库外": ("L19",),
-    "卸轮线": ("L19",),
-    "抛丸线": ("L15",),
-    "存5线南": (CUN5_SPLIT_NODE,),
-    "存5线北": ("L2",),
-    "存4南": ("Z4",),
-    "存4线": ("L2",),
-    "存3线": ("L4",),
-    "存2线": ("L4",),
-    "存1线": ("L5",),
-    "机北1": ("L3",),
-    "机北2": ("L5",),
-    "机走北": ("Z1",),
-    "调梁线北": ("L7",),
-    "机库线": ("L7",),
-    "机走棚": ("Z1",),
-    "预修线": ("Z3",),
-    "机南": ("L8",),
-    "洗油北": ("L8",),
-    "洗罐线北": ("L9",),
+OCCUPIED_LINE_APPROACH_LINES: dict[str, tuple[str, ...]] = {
+    "修4库外": ("渡13",),
+    "修3库外": ("渡13",),
+    "修2库外": ("渡12",),
+    "修1库外": ("渡11",),
+    "卸轮线": ("渡11",),
+    "抛丸线": ("渡10",),
+    "存5线南": ("存5线北",),
+    "存5线北": ("渡1",),
+    "存4南": ("存4线", "存3线"),
+    "存4线": ("渡1",),
+    "存3线": ("渡3",),
+    "存2线": ("渡3",),
+    "存1线": ("机北1",),
+    "机北1": ("渡2",),
+    "机北2": ("机北1",),
+    "机走北": ("渡5",),
+    "调梁线北": ("渡4",),
+    "机库线": ("渡4",),
+    "机走棚": ("机走北",),
+    "预修线": ("渡7", "存2线"),
+    "机南": ("机走棚",),
+    "洗油北": ("机走棚",),
+    "洗罐线北": ("洗油北",),
 }
 
 REVERSAL_RULES_IGNORE_BLOCKER_LENGTH = (
@@ -301,100 +339,6 @@ REVERSAL_RULES_WITH_BLOCKER_LENGTH = (
     (("存1线", "渡7", "渡6"), (("预修线", 253.9),)),
     (("存4线", "存4南", "存3线"), (("存4南", 154.5),)),
 )
-
-LINE_ATTACHMENTS = {
-    "机北1": ("L3", "L5"),
-    "存1线": ("L5", "Z2"),
-    "存2线": ("L4", "Z3"),
-    "存3线": ("L4", "Z4"),
-    "存4线": ("L2", "Z4"),
-    "存4南": ("Z4", "L12"),
-    "存5线北": ("L2", CUN5_SPLIT_NODE),
-    "存5线南": (CUN5_SPLIT_NODE,),
-    "机北2": ("L5", "L6"),
-    "机库线": ("L7",),
-    "调梁线北": ("L7",),
-    "调梁棚": ("L7",),
-    "机走北": ("Z1",),
-    "机走棚": ("Z1", "L8"),
-    "预修线": ("Z3", "L13"),
-    "洗油北": ("L8", "L9"),
-    "机南": ("L8", "L14"),
-    "洗罐线北": ("L9",),
-    "洗罐站": ("L9",),
-    "抛丸线": ("L15",),
-    "油漆线": ("L9",),
-    "卸轮线": ("L19",),
-    "修1库外": ("L19",),
-    "修1库内": ("L19",),
-    "修2库外": ("L17",),
-    "修2库内": ("L17",),
-    "修3库外": ("L18",),
-    "修3库内": ("L18",),
-    "修4库外": ("L18",),
-    "修4库内": ("L18",),
-}
-
-SWITCH_EDGES = (
-    ("L1", "L2", 37.0),
-    ("L1", "L3", 45.5),
-    ("L3", "L4", 45.4),
-    ("L2", CUN5_SPLIT_NODE, 367.0),
-    ("L2", "L12", 626.3),
-    ("L2", "Z4", 417.7),
-    ("L4", "Z4", 359.2),
-    ("L4", "Z3", 339.9),
-    ("L3", "L5", 131.4),
-    ("L5", "L6", 105.7),
-    ("L5", "Z2", 211.4),
-    ("L6", "Z1", 40.6),
-    ("Z1", "Z2", 68.2),
-    ("Z2", "Z3", 45.4),
-    ("L6", "L7", 41.5),
-    ("Z1", "L8", 229.2),
-    ("Z3", "L13", 262.6),
-    ("Z4", "L12", 207.0),
-    ("L8", "L9", 111.9),
-    ("L8", "L14", 187.7),
-    ("L12", "L13", 36.9),
-    ("L13", "L14", 41.5),
-    ("L14", "L15", 17.9),
-    ("L15", "L16", 161.5),
-    ("L16", "L17", 45.2),
-    ("L16", "L19", 74.9),
-    ("L17", "L18", 55.0),
-)
-
-SWITCH_EDGE_TRACKS: dict[frozenset[str], tuple[str, ...]] = {
-    frozenset(("L1", "L2")): ("渡1",),
-    frozenset(("L1", "L3")): ("渡2",),
-    frozenset(("L3", "L4")): ("渡3",),
-    frozenset(("L2", CUN5_SPLIT_NODE)): ("存5线北",),
-    frozenset(("L2", "L12")): ("存4线", "存4南"),
-    frozenset(("L2", "Z4")): ("存4线",),
-    frozenset(("L4", "Z4")): ("存3线",),
-    frozenset(("L4", "Z3")): ("存2线",),
-    frozenset(("L3", "L5")): ("机北1",),
-    frozenset(("L5", "L6")): ("机北2",),
-    frozenset(("L5", "Z2")): ("存1线",),
-    frozenset(("L6", "Z1")): ("渡5",),
-    frozenset(("Z1", "Z2")): ("渡6",),
-    frozenset(("Z2", "Z3")): ("渡7",),
-    frozenset(("L6", "L7")): ("渡4",),
-    frozenset(("Z1", "L8")): ("机走北", "机走棚"),
-    frozenset(("Z3", "L13")): ("预修线",),
-    frozenset(("Z4", "L12")): ("存4南",),
-    frozenset(("L8", "L9")): ("洗油北",),
-    frozenset(("L8", "L14")): ("机南",),
-    frozenset(("L12", "L13")): ("渡8",),
-    frozenset(("L13", "L14")): ("渡9",),
-    frozenset(("L14", "L15")): ("渡10",),
-    frozenset(("L15", "L16")): ("联7",),
-    frozenset(("L16", "L17")): ("渡12",),
-    frozenset(("L16", "L19")): ("渡11",),
-    frozenset(("L17", "L18")): ("渡13",),
-}
-ROUTE_OCCUPIED_LINE_PENALTY_M = 10000.0
 
 
 @dataclass(frozen=True)
@@ -523,18 +467,19 @@ class OperationTraceRow:
 
 class TrackGraph:
     def __init__(self) -> None:
-        self._adjacency: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        self._adjacency: dict[str, list[str]] = defaultdict(list)
         self._route_cache: dict[tuple[str, str], list[str]] = {}
-        self._occupied_route_cache: dict[tuple[str, str, tuple[str, ...]], list[str]] = {}
-        for line, nodes in LINE_ATTACHMENTS.items():
-            for node in nodes:
-                self._add_edge(line, node, 0.0)
-        for left, right, distance in SWITCH_EDGES:
-            self._add_edge(left, right, distance)
+        self._occupied_route_cache: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], list[str]] = {}
+        for left, right in LINE_GRAPH_EDGES:
+            self._add_edge(left, right)
 
-    def _add_edge(self, left: str, right: str, distance: float) -> None:
-        self._adjacency[left].append((right, distance))
-        self._adjacency[right].append((left, distance))
+    def _add_edge(self, left: str, right: str) -> None:
+        left = normalize_line(left)
+        right = normalize_line(right)
+        if right not in self._adjacency[left]:
+            self._adjacency[left].append(right)
+        if left not in self._adjacency[right]:
+            self._adjacency[right].append(left)
 
     def route(self, source_line: str, target_line: str) -> list[str]:
         return self._route(source_line, target_line, occupied_lines=set())
@@ -544,19 +489,19 @@ class TrackGraph:
         source_line: str,
         target_line: str,
         occupied_lines: set[str],
-        target_nodes: set[str] | None = None,
+        target_approach_lines: set[str] | None = None,
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
         effective_occupied = {normalize_line(line) for line in occupied_lines if normalize_line(line)}
         if source == target and source in self._adjacency:
             return [source]
-        normalized_target_nodes = frozenset(route_node_name(node) for node in (target_nodes or set()))
-        cache_key = (source, target, tuple(sorted(effective_occupied)), tuple(sorted(normalized_target_nodes)))
+        approach_lines = frozenset(normalize_line(line) for line in (target_approach_lines or set()) if normalize_line(line))
+        cache_key = (source, target, tuple(sorted(effective_occupied)), tuple(sorted(approach_lines)))
         cached = self._occupied_route_cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        route = self._route(source, target, occupied_lines=effective_occupied, target_nodes=set(normalized_target_nodes))
+        route = self._route(source, target, occupied_lines=effective_occupied, target_approach_lines=set(approach_lines))
         self._occupied_route_cache[cache_key] = list(route)
         return route
 
@@ -565,37 +510,36 @@ class TrackGraph:
         source_line: str,
         target_line: str,
         occupied_lines: set[str],
-        target_nodes: set[str] | None = None,
+        target_approach_lines: set[str] | None = None,
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
-        target_nodes = target_nodes or set()
-        if not occupied_lines and not target_nodes:
+        target_approach_lines = target_approach_lines or set()
+        if not occupied_lines and not target_approach_lines:
             cache_key = (source, target)
             if cache_key in self._route_cache:
                 return list(self._route_cache[cache_key])
         if source == target and source in self._adjacency:
-            if not occupied_lines and not target_nodes:
+            if not occupied_lines and not target_approach_lines:
                 self._route_cache[(source, target)] = [source]
             return [source]
         if source not in self._adjacency or target not in self._adjacency:
-            if not occupied_lines and not target_nodes:
+            if not occupied_lines and not target_approach_lines:
                 self._route_cache[(source, target)] = []
             return []
 
-        queue: list[tuple[float, str, list[str]]] = [(0.0, source, [source])]
-        best: dict[tuple[str, str], float] = {(source, ""): 0.0}
+        queue: list[tuple[int, int, str, list[str]]] = [(0, 0, source, [source])]
+        best: dict[str, int] = {source: 0}
+        sequence = 1
         while queue:
-            distance, node, path = heapq.heappop(queue)
+            distance, _sequence, node, path = heapq.heappop(queue)
             if node == target:
-                if self._target_node_allowed(path, target, target_nodes):
-                    if not occupied_lines and not target_nodes:
-                        self._route_cache[(source, target)] = path
-                    return path
-            state = (node, self._target_entry_node(path, target))
-            if distance > best.get(state, float("inf")):
+                if not occupied_lines and not target_approach_lines:
+                    self._route_cache[(source, target)] = path
+                return path
+            if distance > best.get(node, 10**9):
                 continue
-            for next_node, edge_cost in self._adjacency[node]:
+            for next_node in self._adjacency[node]:
                 if self._occupied_edge_blocked(
                     node,
                     next_node,
@@ -604,44 +548,16 @@ class TrackGraph:
                     occupied_lines=occupied_lines,
                 ):
                     continue
-                next_distance = distance + edge_cost + self._occupied_penalty(
-                    node,
-                    next_node,
-                    source=source,
-                    target=target,
-                    occupied_lines=occupied_lines,
-                )
-                state_key = (next_node, self._target_entry_node([*path, next_node], target))
-                if next_distance < best.get(state_key, float("inf")):
-                    best[state_key] = next_distance
-                    heapq.heappush(queue, (next_distance, next_node, [*path, next_node]))
-        if not occupied_lines and not target_nodes:
+                if next_node == target and target_approach_lines and node not in target_approach_lines:
+                    continue
+                next_distance = distance + 1
+                if next_distance < best.get(next_node, 10**9):
+                    best[next_node] = next_distance
+                    heapq.heappush(queue, (next_distance, sequence, next_node, [*path, next_node]))
+                    sequence += 1
+        if not occupied_lines and not target_approach_lines:
             self._route_cache[(source, target)] = []
         return []
-
-    def _target_node_allowed(self, path: list[str], target: str, target_nodes: set[str]) -> bool:
-        if not target_nodes:
-            return True
-        entry_node = self._target_entry_node(path, target)
-        return entry_node in target_nodes
-
-    def _target_entry_node(self, path: list[str], target: str) -> str:
-        if len(path) < 2 or path[-1] != target:
-            return ""
-        return path[-2]
-
-    def _occupied_penalty(
-        self,
-        node: str,
-        next_node: str,
-        *,
-        source: str,
-        target: str,
-        occupied_lines: set[str],
-    ) -> float:
-        if next_node in occupied_lines and next_node not in {source, target}:
-            return ROUTE_OCCUPIED_LINE_PENALTY_M
-        return 0.0
 
     def _occupied_edge_blocked(
         self,
@@ -657,42 +573,22 @@ class TrackGraph:
             return True
         if node in occupied_lines and node not in route_endpoints:
             return True
-        edge_key = frozenset((node, next_node))
-        edge_tracks = SWITCH_EDGE_TRACKS.get(edge_key, ())
-        return any(line in occupied_lines for line in edge_tracks)
-
-
-SWITCH_NODES = {node for edge in SWITCH_EDGES for node in edge[:2]}
+        return False
 
 
 @dataclass(frozen=True)
 class LocoLocation:
     line: str
-    node: str
 
 
 def initial_loco_location(loco: dict[str, Any]) -> LocoLocation:
     line = normalize_line(loco.get("Line"))
-    return LocoLocation(line=line, node=line_end_node(line, str(loco.get("End") or "North")))
+    return LocoLocation(line=line)
 
 
-def line_end_node(line: str, end: str) -> str:
-    attachments = LINE_ATTACHMENTS.get(normalize_line(line)) or ()
-    if not attachments:
-        return normalize_line(line)
-    if end == "South" and len(attachments) > 1:
-        return attachments[-1]
-    return attachments[0]
-
-
-def route_node_name(name: str) -> str:
-    normalized = normalize_line(name)
-    return ROUTE_TRACK_ALIASES.get(normalized, normalized)
-
-
-def operation_approach_nodes(line: str) -> set[str]:
+def operation_approach_lines(line: str) -> set[str]:
     normalized = normalize_line(line)
-    return {route_node_name(node) for node in LINE_OPERATION_APPROACH_NODES.get(normalized, ())}
+    return {normalize_line(node) for node in OCCUPIED_LINE_APPROACH_LINES.get(normalized, ())}
 
 
 def line_has_stationary_cars(
@@ -704,37 +600,31 @@ def line_has_stationary_cars(
     return any(car["Line"] == normalized and car_no(car) not in moving_nos for car in cars)
 
 
-def route_target_nodes_for_get(line: str) -> set[str]:
-    return operation_approach_nodes(line)
+def route_approach_lines_for_get(line: str) -> set[str]:
+    return operation_approach_lines(line)
 
 
-def route_target_nodes_for_put(
+def route_approach_lines_for_put(
     line: str,
     cars: list[dict[str, Any]],
     moving_nos: set[str],
 ) -> set[str]:
     if not line_has_stationary_cars(line, cars, moving_nos):
         return set()
-    return operation_approach_nodes(line)
-
-
-def line_operation_node(line: str) -> str:
-    return line_end_node(line, "North")
+    return operation_approach_lines(line)
 
 
 def route_end_location(path: tuple[str, ...] | list[str], fallback_line: str) -> LocoLocation:
     line = normalize_line(fallback_line)
-    for item in reversed(path):
-        normalized = normalize_line(item)
-        if normalized in SWITCH_NODES:
-            return LocoLocation(line=line, node=normalized)
-    return LocoLocation(line=line, node=line_end_node(line, "North"))
+    if path:
+        line = normalize_line(path[-1])
+    return LocoLocation(line=line)
 
 
 def operation_stand_location(path: tuple[str, ...] | list[str], operation_line: str) -> LocoLocation:
     del path
     line = normalize_line(operation_line)
-    return LocoLocation(line=line, node=line_end_node(line, "North"))
+    return LocoLocation(line=line)
 
 
 def route_with_line_prefix(line: str, path: list[str]) -> list[str]:
@@ -746,25 +636,9 @@ def route_with_line_prefix(line: str, path: list[str]) -> list[str]:
 
 def route_for_output(path: tuple[str, ...] | list[str]) -> list[str]:
     output: list[str] = []
-    normalized_path = [normalize_line(item) for item in path if normalize_line(item)]
-    start_index = 0
-    if (
-        len(normalized_path) >= 2
-        and normalized_path[0] in LINE_ATTACHMENTS
-        and normalized_path[1] in LINE_ATTACHMENTS[normalized_path[0]]
-    ):
-        start_index = 1
-    for index in range(start_index, len(normalized_path)):
-        item = normalized_path[index]
+    for item in [normalize_line(item) for item in path if normalize_line(item)]:
         if not output or output[-1] != item:
             output.append(item)
-        if index + 1 >= len(normalized_path):
-            continue
-        for track in SWITCH_EDGE_TRACKS.get(frozenset((item, normalized_path[index + 1])), ()):
-            if index + 2 < len(normalized_path) and track == normalized_path[index + 2]:
-                continue
-            if not output or output[-1] != track:
-                output.append(track)
     return output
 
 
@@ -1657,7 +1531,6 @@ def occupied_lines_for_get_route(cars: list[dict[str, Any]], moving_nos: set[str
 def line_access_order(
     cars: list[dict[str, Any]],
     line: str,
-    access_node: str,
     excluded_nos: set[str] | None = None,
 ) -> list[str]:
     excluded_nos = excluded_nos or set()
@@ -1670,15 +1543,10 @@ def line_access_order(
     return [car_no(car) for car in line_cars]
 
 
-def access_is_south_end(line: str, access_node: str) -> bool:
-    return False
-
-
 def physical_positions_after_put(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
-    access_node: str,
     planned_positions: dict[str, int] | None = None,
     honor_spotting_planned_positions: bool = False,
 ) -> dict[str, int]:
@@ -1691,19 +1559,17 @@ def physical_positions_after_put(
         }
     put_nos = set(put_order)
     existing_access_order = [
-        no for no in line_access_order(cars, line, access_node, put_nos)
+        no for no in line_access_order(cars, line, put_nos)
         if no not in put_nos
     ]
     final_access_order = [*put_order, *existing_access_order]
-    north_order = list(reversed(final_access_order)) if access_is_south_end(line, access_node) else final_access_order
-    return {no: position for position, no in enumerate(north_order, start=1)}
+    return {no: position for position, no in enumerate(final_access_order, start=1)}
 
 
 def apply_physical_put_order(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
-    access_node: str,
     planned_positions: dict[str, int] | None = None,
     honor_spotting_planned_positions: bool = False,
 ) -> None:
@@ -1711,7 +1577,6 @@ def apply_physical_put_order(
         cars,
         line,
         put_order,
-        access_node,
         planned_positions,
         honor_spotting_planned_positions,
     )
@@ -1727,7 +1592,6 @@ def projected_after_physical_put(
     cars: list[dict[str, Any]],
     line: str,
     put_order: list[str],
-    access_node: str,
     planned_positions: dict[str, int] | None = None,
     honor_spotting_planned_positions: bool = False,
 ) -> list[dict[str, Any]]:
@@ -1736,7 +1600,6 @@ def projected_after_physical_put(
         projected,
         line,
         put_order,
-        access_node,
         planned_positions,
         honor_spotting_planned_positions,
     )
@@ -1748,19 +1611,18 @@ def inaccessible_get_reason(
     cars: list[dict[str, Any]],
     line: str,
     move_nos: tuple[str, ...],
-    access_node: str,
     carried_nos: set[str],
     step_index: int,
 ) -> str:
     if not move_nos:
         return ""
-    access_order = line_access_order(cars, line, access_node, carried_nos)
+    access_order = line_access_order(cars, line, carried_nos)
     reachable = access_order[: len(move_nos)]
     if reachable == list(move_nos):
         return ""
     return (
         f"line_end_get_order_violation:step={step_index}:line={line}:"
-        f"access_node={access_node}:reachable={','.join(reachable)}:"
+        f"reachable={','.join(reachable)}:"
         f"move={','.join(move_nos)}"
     )
 
@@ -1770,12 +1632,11 @@ def carried_order_after_get(
     cars: list[dict[str, Any]],
     line: str,
     move_nos: set[str],
-    access_node: str,
     carried_nos: set[str],
 ) -> list[str]:
     return [
         no
-        for no in line_access_order(cars, line, access_node, carried_nos)
+        for no in line_access_order(cars, line, carried_nos)
         if no in move_nos
     ]
 
@@ -1793,37 +1654,6 @@ def inaccessible_put_reason(carried_order: list[str], move_nos: tuple[str, ...],
     )
 
 
-def source_access_node(
-    *,
-    cars: list[dict[str, Any]],
-    line: str,
-    access_context: PhysicalAccessContext | None,
-    moving_nos: set[str] | None = None,
-    carried_nos: set[str] | None = None,
-    current_loco: LocoLocation | None = None,
-) -> str:
-    if not access_context or not access_context.graph:
-        return line_end_node(line, "North")
-    start = current_loco or access_context.loco_location
-    if start is None:
-        return line_end_node(line, "North")
-    occupied = occupied_lines_for_get_route(
-        cars,
-        set(moving_nos or set()) | set(carried_nos or set()),
-        line,
-    )
-    move_nos = set(moving_nos or set()) | set(carried_nos or set())
-    raw_path = access_context.graph.route_avoiding_occupied(
-        start.node,
-        line,
-        occupied,
-        target_nodes=route_target_nodes_for_get(line),
-    )
-    if not raw_path:
-        return line_end_node(line, "North")
-    return operation_stand_location(route_with_line_prefix(start.line, raw_path), line).node
-
-
 def line_cars_in_access_order(
     *,
     cars: list[dict[str, Any]],
@@ -1836,37 +1666,23 @@ def line_cars_in_access_order(
     current_loco: LocoLocation | None = None,
 ) -> list[dict[str, Any]]:
     line = normalize_line(line)
-    if access_context is None and graph is not None:
-        access_context = PhysicalAccessContext(graph=graph, loco_location=loco_location)
-    start = current_loco or (access_context.loco_location if access_context else None)
     moving_key = frozenset(moving_nos or set())
     carried_key = frozenset(carried_nos or set())
     key = (
         id(cars),
-        id(access_context.graph) if access_context and access_context.graph else 0,
         line,
-        str(getattr(start, "line", "")),
-        str(getattr(start, "node", "")),
         moving_key,
         carried_key,
     )
     cached = _access_order_cache.get(key)
     if cached is not None:
         return list(cached)
-    access_node = source_access_node(
-        cars=cars,
-        line=line,
-        access_context=access_context,
-        moving_nos=moving_nos,
-        carried_nos=carried_nos,
-        current_loco=current_loco,
-    )
     by_no = {
         car_no(car): car
         for car in cars
         if car["Line"] == line and car_no(car) not in set(carried_nos or set())
     }
-    ordered = [by_no[no] for no in line_access_order(cars, line, access_node, carried_nos) if no in by_no]
+    ordered = [by_no[no] for no in line_access_order(cars, line, carried_nos) if no in by_no]
     _access_order_cache[key] = list(ordered)
     return ordered
 
@@ -2003,7 +1819,7 @@ def train_length_for_nos(cars: list[dict[str, Any]], nos: set[str]) -> float:
 
 
 def normalized_route_token(value: str) -> str:
-    return route_node_name(value)
+    return normalize_line(value)
 
 
 def route_contains_triplet(path: tuple[str, ...] | list[str], triplet: tuple[str, str, str]) -> bool:
@@ -2544,22 +2360,16 @@ def route_blocking_lines(
         start_node,
         target_line,
         occupied,
-        target_nodes=route_target_nodes_for_put(target_line, cars, moving_nos),
+        target_approach_lines=route_approach_lines_for_put(target_line, cars, moving_nos),
     )
     if available_path:
         return static_path, available_path, ()
 
     blockers: list[str] = []
     route_endpoints = {normalize_line(start_node), normalize_line(target_line)}
-    for left, right in zip(static_path, static_path[1:]):
-        edge_key = frozenset((left, right))
-        for line in (
-            left,
-            right,
-            *SWITCH_EDGE_TRACKS.get(edge_key, ()),
-        ):
-            if line in occupied and line not in route_endpoints and line not in blockers:
-                blockers.append(line)
+    for line in static_path:
+        if line in occupied and line not in route_endpoints and line not in blockers:
+            blockers.append(line)
     return static_path, [], tuple(blockers)
 
 
@@ -2657,40 +2467,38 @@ def validate_candidate(
     occupied_lines = occupied_lines_for_get_route(cars, set(candidate.move_car_nos), candidate.source_line)
     move_nos = set(candidate.move_car_nos)
     get_path = graph.route_avoiding_occupied(
-        loco_location.node,
+        loco_location.line,
         candidate.source_line,
         occupied_lines,
-        target_nodes=route_target_nodes_for_get(candidate.source_line),
+        target_approach_lines=route_approach_lines_for_get(candidate.source_line),
     )
-    get_static_path = graph.route(loco_location.node, candidate.source_line)
+    get_static_path = graph.route(loco_location.line, candidate.source_line)
     source_location = route_end_location(get_path, candidate.source_line) if get_path else LocoLocation(
         line=candidate.source_line,
-        node=line_end_node(candidate.source_line, "North"),
     )
     occupied_after_get = occupied_lines_for_route(cars, set(candidate.move_car_nos))
     if candidate.has_weigh:
         raw_weigh_path = graph.route_avoiding_occupied(
-            source_location.node,
+            source_location.line,
             WEIGH_LINE,
             occupied_after_get,
-            target_nodes=route_target_nodes_for_put(WEIGH_LINE, cars, move_nos),
+            target_approach_lines=route_approach_lines_for_put(WEIGH_LINE, cars, move_nos),
         )
-        weigh_static_path = graph.route(source_location.node, WEIGH_LINE)
+        weigh_static_path = graph.route(source_location.line, WEIGH_LINE)
         weigh_path = route_with_line_prefix(
             candidate.source_line,
             raw_weigh_path,
         )
         weigh_location = route_end_location(weigh_path, WEIGH_LINE) if weigh_path else LocoLocation(
             line=WEIGH_LINE,
-            node=line_end_node(WEIGH_LINE, "North"),
         )
         raw_put_path = graph.route_avoiding_occupied(
-            weigh_location.node,
+            weigh_location.line,
             candidate.target_line,
             occupied_after_get,
-            target_nodes=route_target_nodes_for_put(candidate.target_line, cars, move_nos),
+            target_approach_lines=route_approach_lines_for_put(candidate.target_line, cars, move_nos),
         )
-        put_static_path = graph.route(weigh_location.node, candidate.target_line)
+        put_static_path = graph.route(weigh_location.line, candidate.target_line)
         put_path = route_with_line_prefix(
             WEIGH_LINE,
             raw_put_path,
@@ -2699,12 +2507,12 @@ def validate_candidate(
         weigh_path = []
         weigh_static_path = []
         raw_put_path = graph.route_avoiding_occupied(
-            source_location.node,
+            source_location.line,
             candidate.target_line,
             occupied_after_get,
-            target_nodes=route_target_nodes_for_put(candidate.target_line, cars, move_nos),
+            target_approach_lines=route_approach_lines_for_put(candidate.target_line, cars, move_nos),
         )
-        put_static_path = graph.route(source_location.node, candidate.target_line)
+        put_static_path = graph.route(source_location.line, candidate.target_line)
         put_path = route_with_line_prefix(
             candidate.source_line,
             raw_put_path,
@@ -2717,7 +2525,6 @@ def validate_candidate(
             cars=cars,
             line=candidate.source_line,
             move_nos=candidate.move_car_nos,
-            access_node=source_location.node,
             carried_nos=set(),
             step_index=1,
         )
@@ -2762,13 +2569,11 @@ def validate_candidate(
     active_depot_assignment = current_depot_assignment(depot_assignment, cars)
     put_location = operation_stand_location(put_path, candidate.target_line) if put_path else LocoLocation(
         line=candidate.target_line,
-        node=line_end_node(candidate.target_line, "North"),
     )
     put_order = carried_order_after_get(
         cars=cars,
         line=candidate.source_line,
         move_nos=set(candidate.move_car_nos),
-        access_node=source_location.node,
         carried_nos=set(),
     )
     if not put_order:
@@ -2777,7 +2582,6 @@ def validate_candidate(
         cars,
         candidate.target_line,
         put_order,
-        put_location.node,
         candidate.planned_positions,
         honors_spotting_planned_positions(candidate.candidate_kind),
     )
@@ -2837,12 +2641,12 @@ def validate_planlet(
             occupied_lines = occupied_lines_for_get_route(working_cars, step_nos | carried, step.line)
             moving = step_nos | carried
             raw_path = graph.route_avoiding_occupied(
-                current_loco.node,
+                current_loco.line,
                 step.line,
                 occupied_lines,
-                target_nodes=route_target_nodes_for_get(step.line),
+                target_approach_lines=route_approach_lines_for_get(step.line),
             )
-            static_path = graph.route(current_loco.node, step.line)
+            static_path = graph.route(current_loco.line, step.line)
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
             if not path:
                 reasons.append("get_route_blocked_by_occupied_line" if static_path else "get_route_missing")
@@ -2858,7 +2662,6 @@ def validate_planlet(
                 cars=working_cars,
                 line=step.line,
                 move_nos=step.move_car_nos,
-                access_node=source_location.node,
                 carried_nos=carried,
                 step_index=index,
             )
@@ -2887,7 +2690,6 @@ def validate_planlet(
                 cars=working_cars,
                 line=step.line,
                 move_nos=step_nos,
-                access_node=source_location.node,
                 carried_nos=carried - step_nos,
             ):
                 if no not in carried_order:
@@ -2907,12 +2709,12 @@ def validate_planlet(
             batch = [by_no[no] for no in step.move_car_nos if no in by_no]
             occupied_lines = occupied_lines_for_route(working_cars, carried)
             raw_path = graph.route_avoiding_occupied(
-                current_loco.node,
+                current_loco.line,
                 step.line,
                 occupied_lines,
-                target_nodes=route_target_nodes_for_put(step.line, working_cars, carried),
+                target_approach_lines=route_approach_lines_for_put(step.line, working_cars, carried),
             )
-            static_path = graph.route(current_loco.node, step.line)
+            static_path = graph.route(current_loco.line, step.line)
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
             if not path:
                 reasons.append("put_route_blocked_by_occupied_line" if static_path else "put_route_missing")
@@ -2955,7 +2757,6 @@ def validate_planlet(
                 working_cars,
                 step.line,
                 put_order,
-                put_location.node,
                 step.planned_positions,
                 honors_spotting_planned_positions(candidate.candidate_kind),
             )
@@ -2970,7 +2771,6 @@ def validate_planlet(
                 working_cars,
                 step.line,
                 put_order,
-                put_location.node,
                 step.planned_positions,
                 honors_spotting_planned_positions(candidate.candidate_kind),
             )
@@ -3010,12 +2810,12 @@ def validate_planlet(
                 break
             occupied_lines = occupied_lines_for_route(working_cars, carried)
             raw_path = graph.route_avoiding_occupied(
-                current_loco.node,
+                current_loco.line,
                 WEIGH_LINE,
                 occupied_lines,
-                target_nodes=route_target_nodes_for_put(WEIGH_LINE, working_cars, carried),
+                target_approach_lines=route_approach_lines_for_put(WEIGH_LINE, working_cars, carried),
             )
-            static_path = graph.route(current_loco.node, WEIGH_LINE)
+            static_path = graph.route(current_loco.line, WEIGH_LINE)
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
             if not path:
                 reasons.append("weigh_route_blocked_by_occupied_line" if static_path else "weigh_route_missing")
@@ -3276,13 +3076,12 @@ def apply_candidate(
             step_nos = set(step.move_car_nos)
             if step.action == "Get":
                 source_lines_by_step.append((step.line, step_nos))
-                path = paths.pop(0) if paths else ()
-                access_node = operation_stand_location(path, step.line).node if path else line_end_node(step.line, "North")
+                if paths:
+                    paths.pop(0)
                 for no in carried_order_after_get(
                     cars=cars,
                     line=step.line,
                     move_nos=step_nos,
-                    access_node=access_node,
                     carried_nos=set(carried_order),
                 ):
                     if no not in carried_order:
@@ -3297,14 +3096,13 @@ def apply_candidate(
                 continue
             if step.action != "Put":
                 continue
-            path = paths.pop(0) if paths else ()
-            access_node = operation_stand_location(path, step.line).node if path else line_end_node(step.line, "North")
+            if paths:
+                paths.pop(0)
             put_order = carried_order[-len(step_nos):] if step_nos else []
             apply_physical_put_order(
                 cars,
                 step.line,
                 put_order,
-                access_node,
                 step.planned_positions,
                 honors_spotting_planned_positions(candidate.candidate_kind),
             )
@@ -3321,21 +3119,10 @@ def apply_candidate(
         return
     move_nos = set(candidate.move_car_nos)
     weighed_no = single_hook_weigh_car_no(candidate.move_car_nos, cars) if candidate.has_weigh else ""
-    get_path = validation.get_path if validation else ()
-    put_path = validation.put_path if validation else ()
-    source_location = route_end_location(get_path, candidate.source_line) if get_path else LocoLocation(
-        line=candidate.source_line,
-        node=line_end_node(candidate.source_line, "North"),
-    )
-    put_location = operation_stand_location(put_path, candidate.target_line) if put_path else LocoLocation(
-        line=candidate.target_line,
-        node=line_end_node(candidate.target_line, "North"),
-    )
     put_order = carried_order_after_get(
         cars=cars,
         line=candidate.source_line,
         move_nos=move_nos,
-        access_node=source_location.node,
         carried_nos=set(),
     )
     if not put_order:
@@ -3348,7 +3135,6 @@ def apply_candidate(
         cars,
         candidate.target_line,
         put_order,
-        put_location.node,
         candidate.planned_positions,
         honors_spotting_planned_positions(candidate.candidate_kind),
     )
@@ -3370,10 +3156,9 @@ def compact_source_positions(cars: list[dict[str, Any]], source_line: str, moved
 def state_signature(
     cars: list[dict[str, Any]],
     loco_location: LocoLocation,
-) -> tuple[str, str, tuple[tuple[str, str, int], ...]]:
+) -> tuple[str, tuple[tuple[str, str, int], ...]]:
     return (
         loco_location.line,
-        loco_location.node,
         tuple(
             (car_no(car), car["Line"], int(car.get("Position") or 0))
             for car in sorted(cars, key=lambda item: car_no(item))
