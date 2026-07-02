@@ -17,7 +17,7 @@ from .diagnostics import (
     build_structure_node_record,
 )
 from .delta import build_contract_delta, simulate_candidate
-from .domain import CaseResult, CandidateEnvelope, ResourceDelta, SolverState, StepTrace
+from .domain import CaseResult, CandidateEnvelope, RemoteSessionState, ResourceDelta, SolverState, StepTrace
 from .episodes import EPISODES
 from .flow import FlowEdgeRecord, build_flow_edge_records
 from .frontier import AccessFrontier, AccessFrontierRecord
@@ -100,6 +100,9 @@ def _trace_row(
         phase_remote_debt=phase_state.remote_debt,
         phase_closeout_debt=phase_state.closeout_debt,
         remote_session_open=policy_context.remote_session_open,
+        remote_session_id=policy_context.remote_session.session_id,
+        remote_session_owner=policy_context.remote_session.owner_contract_id,
+        remote_session_mode=policy_context.remote_session.mode,
         candidate_id=candidate.candidate_id,
         contract_id=envelope.contract.contract_id,
         family=envelope.contract.family.value,
@@ -210,8 +213,8 @@ class VNextSolver:
             )
             policy_context = PolicyContext(
                 phase_state=active_phase_state,
+                remote_session=raw_policy_context.remote_session,
                 remote_open=current_phase == "H4",
-                remote_session_open=raw_policy_context.remote_session_open,
                 last_business_remote=raw_policy_context.last_business_remote,
             )
             last_policy_context = policy_context
@@ -354,7 +357,7 @@ class VNextSolver:
                                     envelope=envelope,
                                     contract_delta=contract_delta,
                                     resource_delta=resource_delta,
-                                    remote_session_open=policy_context.remote_session_open,
+                                    remote_session=policy_context.remote_session,
                                 )
                                 if not phase_permission.allowed:
                                     gate_accepted = False
@@ -455,7 +458,7 @@ class VNextSolver:
                 envelope=envelope,
                 contract_delta=selected.contract_delta,
                 resource_delta=selected.resource_delta,
-                remote_session_open=policy_context.remote_session_open,
+                remote_session=policy_context.remote_session,
             )
             if not phase_permission.allowed:
                 accepted_without_phase_permission += 1
@@ -580,17 +583,14 @@ class VNextSolver:
                 line in physical.REMOTE_INTERACTION_LINES
                 for line in envelope.resource_request.touched_lines
             )
-            state.remote_session_open = bool(
-                _remote_unsatisfied_count(state.cars, state.depot_assignment)
-                and touched_remote
-                and (
-                    state.remote_session_open
-                    or (
-                        phase_permission.allowed
-                        and phase_permission.target_phase in {"H3", "H4"}
-                    )
-                    or self.policy.opens_remote_session(selected)
-                )
+            state.remote_session = self._next_remote_session_state(
+                case_id=state.case_id,
+                hook_index=state.hook_index,
+                current_state=state.remote_session,
+                selected=selected,
+                phase_permission=phase_permission,
+                touched_remote=touched_remote,
+                remote_debt=policy_context.phase_state.remote_debt,
             )
             business_lines = [
                 step.line
@@ -678,6 +678,48 @@ class VNextSolver:
             generation_gap_records,
         )
 
+    def _next_remote_session_state(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        current_state: RemoteSessionState,
+        selected: EvaluatedCandidate,
+        phase_permission: Any,
+        touched_remote: bool,
+        remote_debt: int,
+    ) -> RemoteSessionState:
+        should_be_active = bool(
+            remote_debt
+            and (
+                current_state.active
+                or touched_remote
+                or (phase_permission.allowed and phase_permission.target_phase in {"H3", "H4"})
+                or self.policy.opens_remote_session(selected)
+            )
+        )
+        if not should_be_active:
+            return RemoteSessionState()
+
+        contract = selected.envelope.contract
+        request = selected.resource_delta.request
+        source_lines = tuple(dict.fromkeys((*current_state.source_lines, *contract.source_lines, request.source_line)))
+        target_lines = tuple(dict.fromkeys((*current_state.target_lines, *contract.target_lines, request.target_line)))
+        owner_contract_id = current_state.owner_contract_id or contract.contract_id
+        session_id = current_state.session_id or f"{case_id}:remote:{owner_contract_id}:{current_state.opened_hook or hook_index}"
+        opened_hook = current_state.opened_hook or hook_index
+        return RemoteSessionState(
+            active=True,
+            session_id=session_id,
+            owner_contract_id=owner_contract_id,
+            opened_hook=opened_hook,
+            last_touched_hook=hook_index,
+            source_lines=source_lines,
+            target_lines=target_lines,
+            debt_nos=tuple(contract.subject_nos),
+            mode=phase_permission.target_phase if getattr(phase_permission, "target_phase", "") else contract.family.value,
+        )
+
 
 def write_artifacts(
     output_dir: Path,
@@ -716,6 +758,7 @@ def write_artifacts(
             resource_structure_records=resource_structure_records,
         ),
     )
+
     route_blocked_counts = [row.route_blocked_line_count for row in frontier_records]
     serial_blocker_counts = [row.serial_blocker_line_count for row in frontier_records]
     summary = {

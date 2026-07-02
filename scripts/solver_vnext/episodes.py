@@ -388,6 +388,7 @@ class RemoteDepotEpisode(DirectMoveEpisode):
         serial_gate_leases: dict[str, Any] | None = None,
         remote_prefix_leases: dict[str, Any] | None = None,
     ) -> CandidateEnvelope | None:
+        return None
         if remote_prefix.lease_key(source_line) in (remote_prefix_leases or {}):
             return None
         blocker_batch, target_batch = self._source_access_batch(line_cars, contract)
@@ -3735,7 +3736,6 @@ EPISODES: tuple[Episode, ...] = (
     DepotMultiDropEpisode(),
     DepotSlotFillEpisode(),
     DepotSlotSwapEpisode(),
-    RemotePrefixLeaseServiceEpisode(),
     RemoteDepotEpisode(),
     TailCloseoutEpisode(),
 )

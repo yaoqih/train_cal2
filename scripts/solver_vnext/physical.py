@@ -459,7 +459,10 @@ class TrackGraph:
     def __init__(self) -> None:
         self._adjacency: dict[str, list[str]] = defaultdict(list)
         self._route_cache: dict[tuple[str, str], list[str]] = {}
-        self._occupied_route_cache: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], list[str]] = {}
+        self._occupied_route_cache: dict[
+            tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+            list[str],
+        ] = {}
         for left, right in LINE_GRAPH_EDGES:
             self._add_edge(left, right)
 
@@ -479,6 +482,7 @@ class TrackGraph:
         source_line: str,
         target_line: str,
         occupied_lines: set[str],
+        source_departure_lines: set[str] | None = None,
         target_approach_lines: set[str] | None = None,
     ) -> list[str]:
         source = normalize_line(source_line)
@@ -486,12 +490,25 @@ class TrackGraph:
         effective_occupied = {normalize_line(line) for line in occupied_lines if normalize_line(line)}
         if source == target and source in self._adjacency:
             return [source]
+        departure_lines = frozenset(normalize_line(line) for line in (source_departure_lines or set()) if normalize_line(line))
         approach_lines = frozenset(normalize_line(line) for line in (target_approach_lines or set()) if normalize_line(line))
-        cache_key = (source, target, tuple(sorted(effective_occupied)), tuple(sorted(approach_lines)))
+        cache_key = (
+            source,
+            target,
+            tuple(sorted(effective_occupied)),
+            tuple(sorted(departure_lines)),
+            tuple(sorted(approach_lines)),
+        )
         cached = self._occupied_route_cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        route = self._route(source, target, occupied_lines=effective_occupied, target_approach_lines=set(approach_lines))
+        route = self._route(
+            source,
+            target,
+            occupied_lines=effective_occupied,
+            source_departure_lines=set(departure_lines),
+            target_approach_lines=set(approach_lines),
+        )
         self._occupied_route_cache[cache_key] = list(route)
         return route
 
@@ -500,21 +517,23 @@ class TrackGraph:
         source_line: str,
         target_line: str,
         occupied_lines: set[str],
+        source_departure_lines: set[str] | None = None,
         target_approach_lines: set[str] | None = None,
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
+        source_departure_lines = source_departure_lines or set()
         target_approach_lines = target_approach_lines or set()
-        if not occupied_lines and not target_approach_lines:
+        if not occupied_lines and not source_departure_lines and not target_approach_lines:
             cache_key = (source, target)
             if cache_key in self._route_cache:
                 return list(self._route_cache[cache_key])
         if source == target and source in self._adjacency:
-            if not occupied_lines and not target_approach_lines:
+            if not occupied_lines and not source_departure_lines and not target_approach_lines:
                 self._route_cache[(source, target)] = [source]
             return [source]
         if source not in self._adjacency or target not in self._adjacency:
-            if not occupied_lines and not target_approach_lines:
+            if not occupied_lines and not source_departure_lines and not target_approach_lines:
                 self._route_cache[(source, target)] = []
             return []
 
@@ -530,6 +549,8 @@ class TrackGraph:
             if distance > best.get(node, 10**9):
                 continue
             for next_node in self._adjacency[node]:
+                if node == source and source_departure_lines and next_node not in source_departure_lines:
+                    continue
                 if self._occupied_edge_blocked(
                     node,
                     next_node,
@@ -545,7 +566,7 @@ class TrackGraph:
                     best[next_node] = next_distance
                     heapq.heappush(queue, (next_distance, sequence, next_node, [*path, next_node]))
                     sequence += 1
-        if not occupied_lines and not target_approach_lines:
+        if not occupied_lines and not source_departure_lines and not target_approach_lines:
             self._route_cache[(source, target)] = []
         return []
 
@@ -591,6 +612,16 @@ def line_has_stationary_cars(
 
 
 def route_approach_lines_for_get(line: str) -> set[str]:
+    return operation_approach_lines(line)
+
+
+def route_departure_lines_for_source(
+    line: str,
+    cars: list[dict[str, Any]],
+    moving_nos: set[str],
+) -> set[str]:
+    if not line_has_stationary_cars(line, cars, moving_nos):
+        return set()
     return operation_approach_lines(line)
 
 
@@ -2392,6 +2423,7 @@ def route_blocking_lines(
         start_node,
         target_line,
         occupied,
+        source_departure_lines=route_departure_lines_for_source(start_node, cars, moving_nos),
         target_approach_lines=route_approach_lines_for_put(target_line, cars, moving_nos),
     )
     if available_path:
@@ -2501,6 +2533,7 @@ def validate_candidate(
         loco_location.line,
         candidate.source_line,
         occupied_lines,
+        source_departure_lines=route_departure_lines_for_source(loco_location.line, cars, move_nos),
         target_approach_lines=route_approach_lines_for_get(candidate.source_line),
     )
     get_static_path = graph.route(loco_location.line, candidate.source_line)
@@ -2513,6 +2546,7 @@ def validate_candidate(
             source_location.line,
             WEIGH_LINE,
             occupied_after_get,
+            source_departure_lines=route_departure_lines_for_source(source_location.line, cars, move_nos),
             target_approach_lines=route_approach_lines_for_put(WEIGH_LINE, cars, move_nos),
         )
         weigh_static_path = graph.route(source_location.line, WEIGH_LINE)
@@ -2527,6 +2561,7 @@ def validate_candidate(
             weigh_location.line,
             candidate.target_line,
             occupied_after_get,
+            source_departure_lines=route_departure_lines_for_source(weigh_location.line, cars, move_nos),
             target_approach_lines=route_approach_lines_for_put(candidate.target_line, cars, move_nos),
         )
         put_static_path = graph.route(weigh_location.line, candidate.target_line)
@@ -2541,6 +2576,7 @@ def validate_candidate(
             source_location.line,
             candidate.target_line,
             occupied_after_get,
+            source_departure_lines=route_departure_lines_for_source(source_location.line, cars, move_nos),
             target_approach_lines=route_approach_lines_for_put(candidate.target_line, cars, move_nos),
         )
         put_static_path = graph.route(source_location.line, candidate.target_line)
@@ -2669,6 +2705,7 @@ def validate_planlet(
                 current_loco.line,
                 step.line,
                 occupied_lines,
+                source_departure_lines=route_departure_lines_for_source(current_loco.line, working_cars, step_nos | carried),
                 target_approach_lines=route_approach_lines_for_get(step.line),
             )
             static_path = graph.route(current_loco.line, step.line)
@@ -2737,6 +2774,7 @@ def validate_planlet(
                 current_loco.line,
                 step.line,
                 occupied_lines,
+                source_departure_lines=route_departure_lines_for_source(current_loco.line, working_cars, carried),
                 target_approach_lines=route_approach_lines_for_put(step.line, working_cars, carried),
             )
             static_path = graph.route(current_loco.line, step.line)
@@ -2826,6 +2864,7 @@ def validate_planlet(
                 current_loco.line,
                 WEIGH_LINE,
                 occupied_lines,
+                source_departure_lines=route_departure_lines_for_source(current_loco.line, working_cars, carried),
                 target_approach_lines=route_approach_lines_for_put(WEIGH_LINE, working_cars, carried),
             )
             static_path = graph.route(current_loco.line, WEIGH_LINE)

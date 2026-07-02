@@ -5,7 +5,7 @@ from typing import Any
 
 from . import physical
 from . import plan_facts
-from .domain import ContractDelta, ContractFamily, IntentKind, PhaseKind, PhaseState, ResourceDelta
+from .domain import ContractDelta, ContractFamily, IntentKind, PhaseKind, PhaseState, RemoteSessionState, ResourceDelta
 
 
 PHASE_CODE = {
@@ -112,16 +112,16 @@ class HumanPhaseGate:
         cun4_port_debt: int,
         remote_debt: int,
         closeout_debt: int,
-        remote_session_open: bool,
+        remote_session: RemoteSessionState,
         cun4_release_ready: bool = False,
         cun4_port_mode: str = "",
         cun4_release_count: int = 0,
         cun4_prefix_hold_count: int = 0,
         active_variant: str = "",
     ) -> PhaseState:
-        if remote_session_open and remote_debt:
+        if remote_session.active and remote_debt:
             phase = PhaseKind.H4_REMOTE_DEPOT
-            reason = "remote_session_continuation"
+            reason = f"remote_session_continuation:{remote_session.session_id or remote_session.owner_contract_id}"
         elif cun4_release_ready and remote_debt:
             phase = PhaseKind.H3_RELEASE_ACCEPT
             reason = f"cun4_release_ready:{cun4_port_mode}:{cun4_release_count}"
@@ -208,21 +208,21 @@ class HumanPhaseGate:
         envelope: Any,
         contract_delta: ContractDelta,
         resource_delta: ResourceDelta,
-        remote_session_open: bool,
+        remote_session: RemoteSessionState,
     ) -> PhasePermission:
         phase = self.phase_code(phase_state.phase)
         target_phase = self.target_phase(
             envelope=envelope,
             resource_delta=resource_delta,
-            remote_session_open=remote_session_open,
         )
         family = envelope.contract.family
         hard_veto = self._hard_boundary_veto(
             phase=phase,
             phase_state=phase_state,
             target_phase=target_phase,
+            contract_delta=contract_delta,
             resource_delta=resource_delta,
-            remote_session_open=remote_session_open,
+            remote_session=remote_session,
         )
         if hard_veto:
             return PhasePermission(False, "veto_candidate", target_phase, hard_veto)
@@ -257,7 +257,7 @@ class HumanPhaseGate:
             return PhasePermission(True, "support", target_phase, "positive_support_delta")
         return PhasePermission(False, "veto_candidate", target_phase, "phase_family_not_allowed")
 
-    def target_phase(self, *, envelope: Any, resource_delta: ResourceDelta, remote_session_open: bool) -> str:
+    def target_phase(self, *, envelope: Any, resource_delta: ResourceDelta) -> str:
         family = envelope.contract.family
         request = resource_delta.request
         if request.intent == IntentKind.CUN4_RELEASE_GROUP:
@@ -270,7 +270,7 @@ class HumanPhaseGate:
             return "H4"
         if plan_facts.is_remote_outbound_session_release(envelope, request):
             return "H3"
-        if family == ContractFamily.CUN4_PORT_STAGING or request.target_line == "存4线":
+        if family == ContractFamily.CUN4_PORT_STAGING:
             return "H2"
         if family in {ContractFamily.REPAIR_INBOUND, ContractFamily.DEPOT_SLOT, ContractFamily.DEPOT_OUTBOUND}:
             return "H4"
@@ -424,15 +424,16 @@ class HumanPhaseGate:
         phase: str,
         phase_state: PhaseState,
         target_phase: str,
+        contract_delta: ContractDelta,
         resource_delta: ResourceDelta,
-        remote_session_open: bool,
+        remote_session: RemoteSessionState,
     ) -> str:
         request = resource_delta.request
         touched_remote = any(line in physical.REMOTE_INTERACTION_LINES for line in request.touched_lines)
         if phase == "H2" and phase_state.cun4_release_ready:
             if target_phase == "H3":
                 return ""
-            if target_phase == "H4" and remote_session_open:
+            if target_phase == "H4" and remote_session.active:
                 return ""
             return "h2_release_ready_requires_h3_release_accept"
         if phase == "H2" and not phase_state.cun4_release_ready:
@@ -443,7 +444,7 @@ class HumanPhaseGate:
         if phase == "H3":
             if target_phase == "H3":
                 return ""
-            if target_phase == "H4" and (remote_session_open or touched_remote):
+            if target_phase == "H4" and (remote_session.active or touched_remote):
                 return ""
             return "h3_release_accept_atomic_boundary"
         if phase == "H4" and phase_state.remote_debt > 0:

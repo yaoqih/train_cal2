@@ -21,6 +21,7 @@ from solver_vnext.domain import (
     IntentKind,
     PhaseKind,
     PhaseState,
+    RemoteSessionState,
     ResourceDelta,
     ResourceKind,
     ResourceRequest,
@@ -434,6 +435,64 @@ def test_existing_forced_position_on_plain_target_line_is_not_shifted_by_put() -
     }
 
 
+def route_after_get_from_source(
+    source_line: str,
+    target_line: str,
+    *,
+    target_occupied: bool = False,
+) -> list[str]:
+    cars = [
+        car("M1", line=source_line, position=1, target_lines=[target_line]),
+        car("S1", line=source_line, position=2, target_lines=[source_line]),
+    ]
+    if target_occupied:
+        cars.append(car("T1", line=target_line, position=1, target_lines=[target_line]))
+    moving_nos = {"M1"}
+    return physical.TrackGraph().route_avoiding_occupied(
+        source_line,
+        target_line,
+        physical.occupied_lines_for_route(cars, moving_nos),
+        source_departure_lines=physical.route_departure_lines_for_source(source_line, cars, moving_nos),
+        target_approach_lines=physical.route_approach_lines_for_put(target_line, cars, moving_nos),
+    )
+
+
+def test_occupied_source_line_departure_uses_configured_operation_end() -> None:
+    cases = [
+        ("存5线南", "预修线", True, {"存5线北"}, {"渡7", "存2线"}),
+        ("预修线", "存5线南", True, {"渡7", "存2线"}, {"存5线北"}),
+        ("存3线", "洗罐站", False, {"渡3"}, None),
+        ("存4线", "修3库内", False, {"渡1"}, None),
+    ]
+    for source_line, target_line, target_occupied, allowed_first, allowed_before_target in cases:
+        path = route_after_get_from_source(
+            source_line,
+            target_line,
+            target_occupied=target_occupied,
+        )
+        assert path, (source_line, target_line)
+        assert path[1] in allowed_first, path
+        if allowed_before_target:
+            assert path[-2] in allowed_before_target, path
+
+
+def test_unoccupied_source_line_can_depart_from_other_end_when_target_requires_it() -> None:
+    cars = [
+        car("M1", line="存5线南", position=1, target_lines=["预修线"]),
+        car("T1", line="预修线", position=1, target_lines=["预修线"]),
+    ]
+    moving_nos = {"M1"}
+    path = physical.TrackGraph().route_avoiding_occupied(
+        "存5线南",
+        "预修线",
+        physical.occupied_lines_for_route(cars, moving_nos),
+        source_departure_lines=physical.route_departure_lines_for_source("存5线南", cars, moving_nos),
+        target_approach_lines=physical.route_approach_lines_for_put("预修线", cars, moving_nos),
+    )
+    assert path[1] == "渡8"
+    assert path[-2] in {"渡7", "存2线"}
+
+
 def test_serial_gate_lease_allows_only_downstream_debt_service() -> None:
     lease = SerialGateLease(
         lease_id="T:机走棚:1",
@@ -568,10 +627,100 @@ def test_h4_blocks_front_work_even_when_it_touches_remote_line() -> None:
             after_contract_debt=0,
         ),
         resource_delta=ResourceDelta(request=request, acquired=(), released_lines=()),
-        remote_session_open=True,
+        remote_session=RemoteSessionState(active=True),
     )
     assert not permission.allowed
     assert permission.reason == "h4_blocks_front_work_until_remote_debt_clear"
+
+
+def test_target_line_staging_to_cun4_does_not_force_h2_by_itself() -> None:
+    gate = HumanPhaseGate()
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.DEPOT_OUTBOUND,
+        candidate_id="candidate",
+        resources=(),
+        source_line="修2库内",
+        target_line="存4线",
+        move_nos=("D1",),
+        touched_lines=("修2库内", "存4线"),
+        put_lines=("存4线",),
+        intent=IntentKind.REMOTE_DEPOT,
+    )
+    contract = FlowContract(
+        contract_id="C",
+        family=ContractFamily.DEPOT_OUTBOUND,
+        subject_nos=("D1",),
+        source_lines=("修2库内",),
+        target_lines=("存4线",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    target_phase = gate.target_phase(
+        envelope=CandidateEnvelope(
+            candidate=object(),
+            contract=contract,
+            intent=IntentKind.REMOTE_DEPOT,
+            resource_request=request,
+            template_name="remote_depot_direct_accessible_prefix",
+        ),
+        resource_delta=ResourceDelta(request=request, acquired=(), released_lines=()),
+    )
+    assert target_phase == "H4"
+
+
+def test_h4_allows_cun4_port_support_for_remote_debt() -> None:
+    gate = HumanPhaseGate()
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.CUN4_PORT_STAGING,
+        candidate_id="candidate",
+        resources=(),
+        source_line="存2线",
+        target_line="存4线",
+        move_nos=("D1", "D2"),
+        touched_lines=("存2线", "存4线"),
+        put_lines=("存4线",),
+        intent=IntentKind.FRONT_PREP,
+    )
+    contract = FlowContract(
+        contract_id="C",
+        family=ContractFamily.CUN4_PORT_STAGING,
+        subject_nos=("D1", "D2"),
+        source_lines=("存2线",),
+        target_lines=("存4线",),
+        priority=1,
+        obligations=("shape_cun4_release_port",),
+    )
+    permission = gate.permission(
+        phase_state=PhaseState(
+            phase=PhaseKind.H4_REMOTE_DEPOT,
+            front_debt=0,
+            cun4_port_debt=2,
+            remote_debt=5,
+            closeout_debt=0,
+            reason="remote_session_continuation",
+        ),
+        envelope=CandidateEnvelope(
+            candidate=object(),
+            contract=contract,
+            intent=IntentKind.FRONT_PREP,
+            resource_request=request,
+            template_name="direct_accessible_prefix",
+        ),
+        contract_delta=ContractDelta(
+            contract_id="C",
+            family=ContractFamily.CUN4_PORT_STAGING,
+            before_unsatisfied=5,
+            after_unsatisfied=4,
+            before_contract_debt=2,
+            after_contract_debt=1,
+        ),
+        resource_delta=ResourceDelta(request=request, acquired=(), released_lines=()),
+        remote_session=RemoteSessionState(active=True),
+    )
+    assert permission.allowed
+    assert permission.relation == "support"
 
 
 def test_planlet_rejects_non_tail_put_and_accepts_tail_put_order() -> None:

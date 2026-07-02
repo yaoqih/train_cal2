@@ -196,6 +196,19 @@ class RemotePrefixLease:
     restore_positions: tuple[tuple[str, int], ...]
 
 
+@dataclass(frozen=True)
+class RemoteSessionState:
+    active: bool = False
+    session_id: str = ""
+    owner_contract_id: str = ""
+    opened_hook: int = 0
+    last_touched_hook: int = 0
+    source_lines: tuple[str, ...] = ()
+    target_lines: tuple[str, ...] = ()
+    debt_nos: tuple[str, ...] = ()
+    mode: str = ""
+
+
 @dataclass
 class SolverState:
     case_id: str
@@ -205,10 +218,14 @@ class SolverState:
     hook_index: int = 1
     accepted_candidate_ids: set[str] = field(default_factory=set)
     visited_signatures: set[tuple[str, str, tuple[tuple[str, str, int], ...]]] = field(default_factory=set)
-    remote_session_open: bool = False
+    remote_session: RemoteSessionState = field(default_factory=RemoteSessionState)
     last_business_remote: bool | None = None
     serial_gate_leases: dict[str, SerialGateLease] = field(default_factory=dict)
     remote_prefix_leases: dict[str, RemotePrefixLease] = field(default_factory=dict)
+
+    @property
+    def remote_session_open(self) -> bool:
+        return self.remote_session.active
 
 
 @dataclass(frozen=True)
@@ -222,6 +239,9 @@ class StepTrace:
     phase_remote_debt: int
     phase_closeout_debt: int
     remote_session_open: bool
+    remote_session_id: str
+    remote_session_owner: str
+    remote_session_mode: str
     candidate_id: str
     contract_id: str
     family: str

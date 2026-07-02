@@ -57,6 +57,7 @@ class AccessFrontier:
                 loco_location.line,
                 line,
                 occupied,
+                source_departure_lines=physical.route_departure_lines_for_source(loco_location.line, cars, set()),
                 target_approach_lines=physical.route_approach_lines_for_get(line),
             )
             if dynamic_route:

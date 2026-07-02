@@ -6,6 +6,7 @@ from typing import Any
 from . import physical
 from . import plan_facts
 from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, IntentKind, PhaseKind, PhaseState, ResourceDelta, SolverState
+from .domain import RemoteSessionState
 from .flow import classify_flow_facts
 from .phase import HumanPhaseGate
 
@@ -13,9 +14,13 @@ from .phase import HumanPhaseGate
 @dataclass(frozen=True)
 class PolicyContext:
     phase_state: PhaseState
+    remote_session: RemoteSessionState
     remote_open: bool
-    remote_session_open: bool
     last_business_remote: bool | None
+
+    @property
+    def remote_session_open(self) -> bool:
+        return self.remote_session.active
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,7 @@ class BaselinePolicy:
             cun4_port_debt=flow_facts.cun4_port_debt,
             remote_debt=flow_facts.remote_debt,
             closeout_debt=flow_facts.closeout_debt,
-            remote_session_open=state.remote_session_open,
+            remote_session=state.remote_session,
             cun4_release_ready=flow_facts.cun4_release_ready,
             cun4_port_mode=flow_facts.cun4_port_mode,
             cun4_release_count=flow_facts.cun4_release_count,
@@ -56,8 +61,8 @@ class BaselinePolicy:
         remote_open = phase_state.phase == PhaseKind.H4_REMOTE_DEPOT
         return PolicyContext(
             phase_state=phase_state,
+            remote_session=state.remote_session,
             remote_open=remote_open,
-            remote_session_open=state.remote_session_open,
             last_business_remote=state.last_business_remote,
         )
 
