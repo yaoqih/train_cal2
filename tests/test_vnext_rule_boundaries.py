@@ -35,6 +35,7 @@ from solver_vnext.episodes import (
     Stage4LinearSweepEpisode,
     DepotCun4SourceRepackExchangeEpisode,
     DepotCun4InboundOutboundExchangeEpisode,
+    DirectMoveEpisode,
     DepotOutboundSessionEpisode,
     EPISODES,
     _depot_inbound_multisource_stepwise_put_plan,
@@ -718,6 +719,87 @@ def test_source_prefix_release_returns_satisfied_source_blocker() -> None:
     assert validation.accepted, validation.reasons
 
 
+def test_direct_move_handles_same_line_pending_weigh() -> None:
+    cars = [
+        car("W1", line="存4线", position=1, target_lines=["存4线"], weigh=True),
+        car("S1", line="存4线", position=2, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="SPECIAL_REPAIR_PROCESS:存4线->存4线:W1",
+        family=ContractFamily.SPECIAL_REPAIR_PROCESS,
+        subject_nos=("W1",),
+        source_lines=("存4线",),
+        target_lines=("存4线",),
+        priority=1,
+        obligations=("move_to_target", "weigh_tail_only"),
+    )
+    envelopes = list(
+        DirectMoveEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    assert [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps] == [
+        ("Get", "存4线", ("W1",)),
+        ("Weigh", "机库线", ("W1",)),
+        ("Put", "存4线", ("W1",)),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存4线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelopes[0].candidate, cars, validation)
+    assert next(item for item in prospective if physical.car_no(item) == "W1")["_Weighed"]
+
+
+def test_source_prefix_release_allows_completed_weigh_blocker() -> None:
+    cars = [
+        car("W1", line="存4线", position=1, target_lines=["存4线"], weigh=True),
+        car("T1", line="存4线", position=2, target_lines=["油漆线"]),
+    ]
+    cars[0]["_Weighed"] = True
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="FUNCTION_LINE_SERVICE:存4线->油漆线:T1",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        subject_nos=("T1",),
+        source_lines=("存4线",),
+        target_lines=("油漆线",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SourcePrefixReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    assert [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps] == [
+        ("Get", "存4线", ("W1", "T1")),
+        ("Put", "油漆线", ("T1",)),
+        ("Put", "存4线", ("W1",)),
+    ]
+
+
 def test_source_prefix_release_marks_cun4_to_unwheel_as_release_accept() -> None:
     cars = [
         car("B1", line="存4线", position=1, target_lines=["存4线"]),
@@ -794,15 +876,136 @@ def test_spotting_repack_restores_existing_target_in_contiguous_chunks() -> None
         if step.action == "Put" and step.line == "调梁棚"
     ]
     assert [step.move_car_nos for step in repair_puts] == [
+        ("F1", "F2", "F3", "F4"),
         ("S1", "S2", "S3", "S4"),
         ("E1",),
-        ("F1", "F2", "F3", "F4"),
     ]
     validation = physical.validate_candidate(
         physical.TrackGraph(),
         envelopes[0].candidate,
         cars,
         physical.LocoLocation("存5线北"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+
+
+def test_spotting_same_line_repack_gets_current_order_then_chunk_puts_final_order() -> None:
+    cars = [
+        car("N1", line="调梁棚", position=1, target_lines=["调梁棚"]),
+        car("N2", line="调梁棚", position=2, target_lines=["调梁棚"]),
+        car("N3", line="调梁棚", position=3, target_lines=["调梁棚"]),
+        car("N4", line="调梁棚", position=4, target_lines=["调梁棚"]),
+        car("F1", line="调梁棚", position=5, target_lines=["调梁棚"]),
+        car("F2", line="调梁棚", position=6, target_lines=["调梁棚"]),
+        car("F3", line="调梁棚", position=7, target_lines=["调梁棚"]),
+        car("F4", line="调梁棚", position=8, target_lines=["调梁棚"]),
+        car("S1", line="调梁棚", position=9, target_lines=["调梁棚"]),
+        car("S2", line="调梁棚", position=16, target_lines=["调梁棚"]),
+    ]
+    for item in cars[4:8]:
+        item["_ForcePositions"] = (6, 7, 8, 9)
+        item["ForceTargetPosition"] = [6, 7, 8, 9]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="DISPATCH_SHED_QUEUE:调梁棚->调梁棚:F1,F2,F3,F4",
+        family=ContractFamily.DISPATCH_SHED_QUEUE,
+        subject_nos=("F1", "F2", "F3", "F4"),
+        source_lines=("调梁棚",),
+        target_lines=("调梁棚",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SpottingRepackEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("调梁棚"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    steps = envelopes[0].candidate.plan_steps
+    assert steps[0] == physical.plan_step(
+        "Get",
+        "调梁棚",
+        ("N1", "N2", "N3", "N4", "F1", "F2", "F3", "F4", "S1", "S2"),
+    )
+    assert [step.move_car_nos for step in steps if step.action == "Put" and step.line == "调梁棚"] == [
+        ("F1", "F2", "F3", "F4", "S1", "S2"),
+        ("N1", "N2", "N3", "N4"),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("调梁棚"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelopes[0].candidate, cars, validation)
+    assert physical.spotting_group_is_acceptable(
+        prospective,
+        "调梁棚",
+        (6, 7, 8, 9),
+        depot_assignment,
+    )
+
+
+def test_spotting_same_line_repack_stages_satisfied_route_blocker() -> None:
+    cars = [
+        car("B", line="调梁线北", position=1, target_lines=["调梁线北"]),
+        car("N1", line="调梁棚", position=1, target_lines=["调梁棚"]),
+        car("N2", line="调梁棚", position=2, target_lines=["调梁棚"]),
+        car("N3", line="调梁棚", position=3, target_lines=["调梁棚"]),
+        car("N4", line="调梁棚", position=4, target_lines=["调梁棚"]),
+        car("F1", line="调梁棚", position=5, target_lines=["调梁棚"]),
+        car("F2", line="调梁棚", position=6, target_lines=["调梁棚"]),
+        car("F3", line="调梁棚", position=7, target_lines=["调梁棚"]),
+        car("F4", line="调梁棚", position=8, target_lines=["调梁棚"]),
+        car("S1", line="调梁棚", position=9, target_lines=["调梁棚"]),
+        car("S2", line="调梁棚", position=16, target_lines=["调梁棚"]),
+    ]
+    for item in cars[5:9]:
+        item["_ForcePositions"] = (6, 7, 8, 9)
+        item["ForceTargetPosition"] = [6, 7, 8, 9]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="DISPATCH_SHED_QUEUE:调梁棚->调梁棚:F1,F2,F3,F4",
+        family=ContractFamily.DISPATCH_SHED_QUEUE,
+        subject_nos=("F1", "F2", "F3", "F4"),
+        source_lines=("调梁棚",),
+        target_lines=("调梁棚",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SpottingRepackEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    steps = envelopes[0].candidate.plan_steps
+    assert steps[0].action == "Get" and steps[0].line == "调梁线北" and steps[0].move_car_nos == ("B",)
+    assert steps[1].action == "Put" and steps[1].line != "调梁线北" and steps[1].move_car_nos == ("B",)
+    assert steps[-2].action == "Get" and steps[-2].line == steps[1].line and steps[-2].move_car_nos == ("B",)
+    assert steps[-1] == physical.plan_step("Put", "调梁线北", ("B",), {"B": 1})
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存4线"),
         depot_assignment,
     )
     assert validation.accepted, validation.reasons
@@ -924,28 +1127,33 @@ def test_put_inserts_from_north_end_and_shifts_existing_on_plain_lines() -> None
     }
 
 
-def test_depot_put_uses_business_planned_positions_not_north_end_shift() -> None:
+def test_business_position_put_rejects_depot_slot_behind_existing_access_car() -> None:
     cars = [
         car("M1", line="存1线", position=1, target_lines=["修1库内"]),
-        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
         car("E1", line="修1库内", position=1, target_lines=["修1库内"]),
-        car("E2", line="修1库内", position=3, target_lines=["修1库内"]),
     ]
-    physical.apply_physical_put_order(
-        cars,
-        "修1库内",
-        ["M1", "M2"],
-        {"M1": 4, "M2": 5},
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=6,
+        source_line="存1线",
+        target_line="修1库内",
+        batch=cars[:1],
+        planned_positions={"M1": 2},
+        generation_reason="test",
+        candidate_kind="target_move",
     )
-    assert {
-        physical.car_no(item): (item["Line"], item["Position"])
-        for item in cars
-    } == {
-        "M1": ("修1库内", 4),
-        "M2": ("修1库内", 5),
-        "E1": ("修1库内", 1),
-        "E2": ("修1库内", 3),
-    }
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert not validation.accepted
+    assert any(
+        reason.startswith("business_position_put_blocked_by_access_end:修1库内:")
+        for reason in validation.reasons
+    )
 
 
 def test_business_planned_positions_must_preserve_put_order() -> None:
@@ -1000,20 +1208,23 @@ def test_business_planned_positions_must_be_contiguous_translation() -> None:
     assert any(reason.startswith("target_put_order_violation:修1库内:") for reason in validation.reasons)
 
 
-def test_business_planned_positions_allow_contiguous_offset_translation() -> None:
+def test_business_planned_positions_allow_offset_before_existing_access_car() -> None:
     cars = [
-        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
-        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
-        car("E1", line="修1库内", position=1, target_lines=["修1库内"]),
-        car("E2", line="修1库内", position=3, target_lines=["修1库内"]),
+        car("M1", line="存1线", position=1, target_lines=["存2线"]),
+        car("M2", line="存1线", position=2, target_lines=["存2线"]),
+        car("E1", line="存2线", position=5, target_lines=["存2线"]),
     ]
+    cars[0]["_ForcePositions"] = (3,)
+    cars[0]["ForceTargetPosition"] = [3]
+    cars[1]["_ForcePositions"] = (4,)
+    cars[1]["ForceTargetPosition"] = [4]
     candidate = physical.hook_candidate(
         case_id="T",
         hook_index=9,
         source_line="存1线",
-        target_line="修1库内",
+        target_line="存2线",
         batch=cars[:2],
-        planned_positions={"M1": 4, "M2": 5},
+        planned_positions={"M1": 3, "M2": 4},
         generation_reason="test",
         candidate_kind="target_move",
     )
@@ -3738,9 +3949,13 @@ def test_depot_inbound_assembly_release_splits_tail_when_assigned_slots_reverse_
     steps = [(step.action, step.line, step.move_car_nos, step.planned_positions) for step in envelopes[0].candidate.plan_steps]
     assert steps == [
         ("Get", "洗油北", ("A", "B", "C"), {}),
-        ("Put", "修2库内", ("C",), {"C": 1}),
-        ("Put", "修2库内", ("B",), {"B": 2}),
+        ("Put", "存4线", ("C",), {"C": 1}),
+        ("Put", "存4线", ("B",), {"B": 2}),
         ("Put", "修2库内", ("A",), {"A": 3}),
+        ("Get", "存4线", ("B",), {}),
+        ("Put", "修2库内", ("B",), {"B": 2}),
+        ("Get", "存4线", ("C",), {}),
+        ("Put", "修2库内", ("C",), {"C": 1}),
     ]
     validation = physical.validate_candidate(
         physical.TrackGraph(),
@@ -4398,8 +4613,19 @@ def test_depot_inbound_assembly_release_uses_rolling_depot_positions() -> None:
         for step in envelopes[0].candidate.plan_steps
         if step.action == "Put" and step.line == "修1库内"
     ]
-    assert repair_puts[0].planned_positions == {"C": 3}
-    assert repair_puts[1].planned_positions == {"A": 4}
+    assert [step.planned_positions for step in repair_puts] == [
+        {"C": 4},
+        {"A": 3},
+        {"E1": 1, "E2": 2},
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("机南"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
 
 
 def test_depot_outbound_assembly_plan_orders_non_cun4_before_cun4() -> None:

@@ -1912,6 +1912,42 @@ def target_put_order_reasons(
     return reasons
 
 
+def business_position_put_access_reasons(
+    candidate: HookCandidate,
+    projected_cars: list[dict[str, Any]],
+    batch_nos: set[str],
+    actual_positions: dict[str, int],
+) -> list[str]:
+    if not put_uses_business_positions(
+        projected_cars,
+        candidate.target_line,
+        list(candidate.move_car_nos),
+        candidate.planned_positions,
+    ):
+        return []
+    incoming_positions = [position for position in actual_positions.values() if position > 0]
+    if not incoming_positions:
+        return []
+    existing_positions = [
+        int(car.get("Position") or 0)
+        for car in projected_cars
+        if car["Line"] == candidate.target_line
+        and car_no(car) not in batch_nos
+        and int(car.get("Position") or 0) > 0
+    ]
+    if not existing_positions:
+        return []
+    first_existing = min(existing_positions)
+    deepest_incoming = max(incoming_positions)
+    if deepest_incoming < first_existing:
+        return []
+    return [
+        "business_position_put_blocked_by_access_end:"
+        f"{candidate.target_line}:incoming_max={deepest_incoming}:"
+        f"first_existing={first_existing}"
+    ]
+
+
 def line_cars_in_access_order(
     *,
     cars: list[dict[str, Any]],
@@ -3194,6 +3230,14 @@ def validate_target_positions(
     if len(target_positions) != len(set(target_positions)):
         reasons.append("target_position_collision_inside_batch")
     reasons.extend(target_put_order_reasons(candidate.target_line, candidate.move_car_nos, actual_positions))
+    reasons.extend(
+        business_position_put_access_reasons(
+            candidate,
+            projected_cars,
+            batch_nos,
+            actual_positions,
+        )
+    )
     occupied_positions = {
         int(car.get("Position") or 0)
         for car in projected_cars

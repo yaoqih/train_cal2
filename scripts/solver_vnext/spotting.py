@@ -195,7 +195,6 @@ def build_spotting_cross_line_repack_planlet(
     ):
         return None
 
-    target_after_batch = [*target_existing, *source_cars]
     for intent in _repack_intents(
         target_existing=target_existing,
         target_line=target_line,
@@ -204,11 +203,8 @@ def build_spotting_cross_line_repack_planlet(
         if not _intent_is_target_valid(
             intent=intent,
             target_line=target_line,
-            forced=source.forced,
             cars=cars,
             depot_assignment=depot_assignment,
-            frontier=frontier,
-            target_after_batch=target_after_batch,
         ):
             continue
         plan = _build_plan_for_intent(
@@ -293,64 +289,135 @@ def build_spotting_same_line_repack_planlet(
         )
         if not _all_spotting_groups_are_acceptable(projected, line, depot_assignment):
             continue
-        if frontier.target_put_violation_reasons(
-            target_line=line,
-            batch=list(placement.move_order),
-            projected_cars=projected,
-            depot_assignment=depot_assignment,
-        ):
+        if not _spotting_final_state_is_valid(projected, line, depot_assignment):
             continue
-        for staging_line in _same_line_staging_lines(
+        move_set = set(_nos(placement.move_order))
+        current_order = tuple(car for car in line_cars if physical.car_no(car) in move_set)
+        current_nos = _nos(current_order)
+        if set(current_nos) != move_set:
+            continue
+        route_blocker_options = _same_line_route_blocker_stage_options(
             line=line,
-            batch=placement.move_order,
             cars=cars,
             depot_assignment=depot_assignment,
-            frontier=frontier,
             graph=graph,
             loco_location=loco_location,
-        ):
-            staging_positions = planned_positions_for_batch(
-                batch=list(placement.move_order),
-                target_line=staging_line,
-                cars=cars,
-                depot_assignment=depot_assignment,
-                batch_nos=set(_nos(placement.move_order)),
-            )
-            if len(staging_positions) != len(placement.move_order):
-                continue
-            move_nos = _nos(placement.move_order)
-            steps = (
-                physical.plan_step("Get", line, move_nos),
-                physical.plan_step("Put", staging_line, move_nos, staging_positions),
-                physical.plan_step("Get", staging_line, move_nos),
-                physical.plan_step("Put", line, move_nos, placement.final_positions),
-            )
-            if not frontier.plan_steps_are_reachable(
-                steps=steps,
-                cars=cars,
-                depot_assignment=depot_assignment,
-                graph=graph,
-                loco_location=loco_location,
-                serial_gate_leases=serial_gate_leases,
-                candidate_kind=candidate_kind,
-            ):
-                continue
-            candidate = physical.build_planlet_candidate(
-                case_id=case_id,
-                hook_index=hook_index,
-                source_line=line,
-                target_line=line,
-                batch=list(placement.move_order),
-                steps=steps,
-                reason=f"{reason};spotting_repack=same_line;staging={staging_line}",
-                candidate_kind=candidate_kind,
-            )
-            return SpottingRepackPlan(
-                candidate=candidate,
-                progressed_nos=move_nos,
-                source_return_nos=(),
-            )
+        )
+        for blocker_pre_steps, blocker_post_steps, blocker_cars, blocker_staging_line in route_blocker_options:
+            if blocker_pre_steps:
+                staging_lines = _same_line_candidate_staging_lines(
+                    line=line,
+                    excluded_lines={blocker_staging_line},
+                )
+            else:
+                staging_lines = _same_line_staging_lines(
+                    line=line,
+                    batch=current_order,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    frontier=frontier,
+                    graph=graph,
+                    loco_location=loco_location,
+                )
+            for staging_line in staging_lines:
+                if staging_line == blocker_staging_line:
+                    continue
+                plan = _same_line_repack_plan_with_staging(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    line=line,
+                    staging_line=staging_line,
+                    current_order=current_order,
+                    current_nos=current_nos,
+                    final_positions=placement.final_positions,
+                    blocker_pre_steps=blocker_pre_steps,
+                    blocker_post_steps=blocker_post_steps,
+                    blocker_cars=blocker_cars,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    reason=reason,
+                    candidate_kind=candidate_kind,
+                    frontier=frontier,
+                    graph=graph,
+                    loco_location=loco_location,
+                    serial_gate_leases=serial_gate_leases,
+                )
+                if plan is not None:
+                    return plan
     return None
+
+
+def _same_line_repack_plan_with_staging(
+    *,
+    case_id: str,
+    hook_index: int,
+    line: str,
+    staging_line: str,
+    current_order: tuple[dict[str, Any], ...],
+    current_nos: tuple[str, ...],
+    final_positions: dict[str, int],
+    blocker_pre_steps: tuple[Any, ...],
+    blocker_post_steps: tuple[Any, ...],
+    blocker_cars: tuple[dict[str, Any], ...],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    reason: str,
+    candidate_kind: str,
+    frontier: Any,
+    graph: Any,
+    loco_location: Any,
+    serial_gate_leases: dict[str, Any],
+) -> SpottingRepackPlan | None:
+    staging_positions = planned_positions_for_batch(
+        batch=list(current_order),
+        target_line=staging_line,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        batch_nos=set(current_nos),
+    )
+    if len(staging_positions) != len(current_order):
+        return None
+    steps = [
+        *blocker_pre_steps,
+        physical.plan_step("Get", line, current_nos),
+        physical.plan_step("Put", staging_line, current_nos, staging_positions),
+        physical.plan_step("Get", staging_line, current_nos),
+    ]
+    for put_nos in _target_group_put_chunks(current_nos, final_positions):
+        steps.append(
+            physical.plan_step(
+                "Put",
+                line,
+                put_nos,
+                {no: final_positions[no] for no in put_nos},
+            )
+        )
+    steps.extend(blocker_post_steps)
+    if not frontier.plan_steps_are_reachable(
+        steps=tuple(steps),
+        cars=cars,
+        depot_assignment=depot_assignment,
+        graph=graph,
+        loco_location=loco_location,
+        serial_gate_leases=serial_gate_leases,
+        candidate_kind=candidate_kind,
+    ):
+        return None
+    candidate = physical.build_planlet_candidate(
+        case_id=case_id,
+        hook_index=hook_index,
+        source_line=line,
+        target_line=line,
+        batch=[*current_order, *blocker_cars],
+        steps=tuple(steps),
+        reason=f"{reason};spotting_repack=same_line;staging={staging_line}",
+        candidate_kind=candidate_kind,
+    )
+    return SpottingRepackPlan(
+        candidate=candidate,
+        progressed_nos=current_nos,
+        source_return_nos=(),
+    )
 
 
 def _build_general_spotting_planlet(
@@ -584,61 +651,17 @@ def _general_plan_steps(
     cars: list[dict[str, Any]],
     depot_assignment: Any,
 ) -> tuple[Any, ...]:
-    steps: list[Any] = []
-    for group, staging_line in zip(target_groups, staging_assignment):
-        positions = planned_positions_for_batch(
-            batch=list(group.cars),
-            target_line=staging_line,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            batch_nos=set(group.nos),
-        )
-        if len(positions) != len(group.cars):
-            return ()
-        steps.append(physical.plan_step("Get", target_line, group.nos))
-        steps.append(physical.plan_step("Put", staging_line, group.nos, positions))
-
-    source_batch = (*source_blockers, *source_cars)
-    steps.append(physical.plan_step("Get", source_line, _nos(source_batch)))
-    source_nos = set(_nos(source_cars))
-    remaining_source_nos = [no for no in _nos(source_cars) if no in source_nos]
-    remaining_staged_nos = [no for group in target_groups for no in group.nos]
-
-    # Rebuild the target line from the tail of the carried/staged groups.  This
-    # keeps the planlet small and leaves order feasibility to the hard validator.
-    put_source_nos = _nos(source_cars)
-    for put_nos in _target_group_put_chunks(put_source_nos, final_positions):
-        steps.append(
-            physical.plan_step(
-                "Put",
-                target_line,
-                put_nos,
-                {no: final_positions[no] for no in put_nos if no in final_positions},
-            )
-        )
-        remaining_source_nos = [no for no in remaining_source_nos if no not in set(put_nos)]
-    for group, staging_line in reversed(list(zip(target_groups, staging_assignment))):
-        steps.append(physical.plan_step("Get", staging_line, group.nos))
-        for put_nos in _target_group_put_chunks(group.nos, final_positions):
-            steps.append(
-                physical.plan_step(
-                    "Put",
-                    target_line,
-                    put_nos,
-                    {no: final_positions[no] for no in put_nos if no in final_positions},
-                )
-            )
-            remaining_staged_nos = [no for no in remaining_staged_nos if no not in set(put_nos)]
-
-    if remaining_source_nos or remaining_staged_nos:
-        return ()
-    if source_blockers:
-        restore_positions = {
-            physical.car_no(car): int(car.get("Position") or index)
-            for index, car in enumerate(source_blockers, start=1)
-        }
-        steps.append(physical.plan_step("Put", source_line, _nos(source_blockers), restore_positions))
-    return tuple(steps)
+    return _target_line_rebuild_steps(
+        source_line=source_line,
+        target_line=target_line,
+        source_batch=source_cars,
+        source_blockers=source_blockers,
+        target_groups=target_groups,
+        staging_assignment=staging_assignment,
+        final_positions=final_positions,
+        cars=cars,
+        depot_assignment=depot_assignment,
+    )
 
 
 def _target_group_put_chunks(
@@ -724,18 +747,37 @@ def _same_line_final_placements(
             if not total:
                 continue
             final_slots: list[dict[str, Any] | None] = [None] * total
+            forced_nos = set(_nos(forced_cars))
+            forced_indexes = [
+                index
+                for index, car in enumerate(line_cars)
+                if physical.car_no(car) in forced_nos
+            ]
+            if not forced_indexes:
+                continue
+            before_cars = tuple(
+                car
+                for car in line_cars[: forced_indexes[0]]
+                if physical.car_no(car) not in forced_nos
+            )
+            after_cars = tuple(
+                car
+                for car in line_cars[forced_indexes[-1] + 1 :]
+                if physical.car_no(car) not in forced_nos
+            )
             for car, position in zip(forced_cars, slots):
                 if position < 1 or position > len(final_slots):
                     break
                 final_slots[position - 1] = car
             else:
-                others = iter(other_cars)
-                for index, item in enumerate(final_slots):
-                    if item is None:
-                        try:
-                            final_slots[index] = next(others)
-                        except StopIteration:
-                            break
+                before_positions = [index for index in range(0, slots[0] - 1) if final_slots[index] is None]
+                after_positions = [index for index in range(slots[-1], total) if final_slots[index] is None]
+                if len(before_cars) > len(before_positions) or len(after_cars) > len(after_positions):
+                    continue
+                for car, index in zip(before_cars, before_positions):
+                    final_slots[index] = car
+                for car, index in zip(after_cars, after_positions):
+                    final_slots[index] = car
                 order = tuple(car for car in final_slots if car is not None)
                 if set(_nos(order)) == set(original_nos):
                     final_positions = {
@@ -782,6 +824,95 @@ def _same_line_staging_lines(
         candidate_lines=SPOTTING_REPACK_STAGING_LINES,
         excluded_lines={line},
     )
+
+
+def _same_line_candidate_staging_lines(
+    *,
+    line: str,
+    excluded_lines: set[str],
+) -> tuple[str, ...]:
+    lines: list[str] = []
+    for candidate in SPOTTING_REPACK_STAGING_LINES:
+        if candidate == line or candidate in excluded_lines:
+            continue
+        if candidate in physical.RUNNING_LINES or candidate in physical.DEPOT_TARGET_LINES:
+            continue
+        if candidate not in physical.TRACK_SPECS:
+            continue
+        lines.append(candidate)
+    return tuple(lines)
+
+
+def _same_line_route_blocker_stage_options(
+    *,
+    line: str,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    graph: Any,
+    loco_location: Any,
+) -> tuple[tuple[tuple[Any, ...], tuple[Any, ...], tuple[dict[str, Any], ...], str], ...]:
+    options: list[tuple[tuple[Any, ...], tuple[Any, ...], tuple[dict[str, Any], ...], str]] = [
+        ((), (), (), "")
+    ]
+    blocker_lines = tuple(physical.SERIAL_LINE_BLOCKERS.get(line, ()))
+    if not blocker_lines:
+        return tuple(options)
+    loads = physical.line_loads(cars)
+    for blocker_line in blocker_lines:
+        blocker_cars = tuple(
+            physical.line_cars_in_access_order(
+                cars=cars,
+                line=blocker_line,
+                graph=graph,
+                loco_location=loco_location,
+            )
+        )
+        if not blocker_cars:
+            continue
+        if physical.pull_equivalent(list(blocker_cars)) > physical.PULL_LIMIT_EQUIVALENT:
+            continue
+        if any(car.get("IsWeigh") and not car.get("_Weighed") for car in blocker_cars):
+            continue
+        if any(not physical.car_is_satisfied(car, depot_assignment, cars) for car in blocker_cars):
+            continue
+        if any(
+            physical.planned_target_for_car(car, cars, depot_assignment, loads)[0] != blocker_line
+            for car in blocker_cars
+        ):
+            continue
+        blocker_nos = _nos(blocker_cars)
+        restore_positions = {
+            physical.car_no(car): int(car.get("Position") or index)
+            for index, car in enumerate(blocker_cars, start=1)
+        }
+        for staging_line in _same_line_candidate_staging_lines(
+            line=line,
+            excluded_lines={blocker_line},
+        ):
+            positions = planned_positions_for_batch(
+                batch=list(blocker_cars),
+                target_line=staging_line,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                batch_nos=set(blocker_nos),
+            )
+            if len(positions) != len(blocker_cars):
+                continue
+            options.append(
+                (
+                    (
+                        physical.plan_step("Get", blocker_line, blocker_nos),
+                        physical.plan_step("Put", staging_line, blocker_nos, positions),
+                    ),
+                    (
+                        physical.plan_step("Get", staging_line, blocker_nos),
+                        physical.plan_step("Put", blocker_line, blocker_nos, restore_positions),
+                    ),
+                    blocker_cars,
+                    staging_line,
+                )
+            )
+    return tuple(options)
 
 
 def _repack_intents(
@@ -930,23 +1061,15 @@ def _intent_is_target_valid(
     *,
     intent: _RepackIntent,
     target_line: str,
-    forced: tuple[int, ...],
     cars: list[dict[str, Any]],
     depot_assignment: Any,
-    frontier: Any,
-    target_after_batch: list[dict[str, Any]],
 ) -> bool:
     projected = _project_target_order(cars=cars, target_line=target_line, final_order=intent.final_order)
     return _all_spotting_groups_are_acceptable(
         projected,
         target_line,
         depot_assignment,
-    ) and not frontier.target_put_violation_reasons(
-        target_line=target_line,
-        batch=target_after_batch,
-        projected_cars=projected,
-        depot_assignment=depot_assignment,
-    )
+    ) and _spotting_final_state_is_valid(projected, target_line, depot_assignment)
 
 
 def _all_spotting_groups_are_acceptable(
@@ -965,6 +1088,26 @@ def _all_spotting_groups_are_acceptable(
         physical.spotting_group_is_acceptable(cars, target_line, forced, depot_assignment)
         for forced in forced_groups
     )
+
+
+def _spotting_final_state_is_valid(
+    cars: list[dict[str, Any]],
+    target_line: str,
+    depot_assignment: Any,
+) -> bool:
+    total = physical.SPOTTING_LINE_TOTAL_POSITIONS.get(target_line, 0)
+    if not total:
+        return False
+    positions = [
+        int(car.get("Position") or 0)
+        for car in cars
+        if car["Line"] == target_line
+    ]
+    if any(position <= 0 or position > total for position in positions):
+        return False
+    if len(positions) != len(set(positions)):
+        return False
+    return _all_spotting_groups_are_acceptable(cars, target_line, depot_assignment)
 
 
 def _project_target_order(
@@ -1084,12 +1227,39 @@ def _plan_steps_for_assignment(
     cars: list[dict[str, Any]],
     depot_assignment: Any,
 ) -> tuple[Any, ...]:
-    steps: list[Any] = []
-    staged_by_group: dict[int, str] = {}
     final_positions = {
         physical.car_no(car): position
         for position, car in enumerate(final_order, start=1)
     }
+    source_batch = (*source.before, *source.same, *source.after)
+    return _target_line_rebuild_steps(
+        source_line=source_line,
+        target_line=target_line,
+        source_batch=source_batch,
+        source_blockers=source_blockers,
+        target_groups=target_groups,
+        staging_assignment=staging_assignment,
+        final_positions=final_positions,
+        cars=cars,
+        depot_assignment=depot_assignment,
+    )
+
+
+def _target_line_rebuild_steps(
+    *,
+    source_line: str,
+    target_line: str,
+    source_batch: tuple[dict[str, Any], ...],
+    source_blockers: tuple[dict[str, Any], ...],
+    target_groups: tuple[_TargetGroup, ...],
+    staging_assignment: tuple[str, ...],
+    final_positions: dict[str, int],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+) -> tuple[Any, ...]:
+    steps: list[Any] = []
+    staged_by_group: dict[int, str] = {}
+    target_access_chunks: dict[int, tuple[tuple[str, ...], ...]] = {}
     for group_index, group in enumerate(target_groups):
         staging_line = staging_assignment[group_index]
         positions = planned_positions_for_batch(
@@ -1101,19 +1271,50 @@ def _plan_steps_for_assignment(
         )
         if len(positions) != len(group.cars):
             return ()
+        tail_chunks = _target_group_put_chunks(group.nos, final_positions)
+        if not tail_chunks:
+            return ()
         steps.append(physical.plan_step("Get", target_line, group.nos))
-        steps.append(physical.plan_step("Put", staging_line, group.nos, positions))
+        for put_nos in tail_chunks:
+            steps.append(physical.plan_step("Put", staging_line, put_nos, _positions_for(put_nos, positions)))
         staged_by_group[group_index] = staging_line
+        target_access_chunks[group_index] = tuple(reversed(tail_chunks))
 
-    source_batch = (*source.before, *source.same, *source.after)
-    steps.append(physical.plan_step("Get", source_line, _nos((*source_blockers, *source_batch))))
-    _append_put(steps, target_line, source.after, final_positions)
-    _append_return_groups(steps, target_line, "after", target_groups, staged_by_group, final_positions)
-    _append_return_groups(steps, target_line, "same", target_groups, staged_by_group, final_positions)
-    _append_put(steps, target_line, source.same, final_positions)
-    _append_put(steps, target_line, source.before, final_positions)
-    _append_return_groups(steps, target_line, "before", target_groups, staged_by_group, final_positions)
+    source_with_blockers = (*source_blockers, *source_batch)
+    if source_with_blockers:
+        steps.append(physical.plan_step("Get", source_line, _nos(source_with_blockers)))
+    source_chunks = _target_group_put_chunks(_nos(source_batch), final_positions) if source_batch else ()
 
+    rebuild_chunks: list[tuple[str, int, tuple[str, ...]]] = []
+    for group_index, chunks in target_access_chunks.items():
+        for chunk in chunks:
+            rebuild_chunks.append(("target", group_index, chunk))
+    for chunk in source_chunks:
+        rebuild_chunks.append(("source", -1, chunk))
+    rebuild_chunks.sort(key=lambda item: _deep_to_near_chunk_key(item[2], final_positions))
+
+    next_source_chunk = 0
+    next_target_chunk = {group_index: 0 for group_index in target_access_chunks}
+    for origin, group_index, chunk in rebuild_chunks:
+        if origin == "source":
+            if next_source_chunk >= len(source_chunks) or source_chunks[next_source_chunk] != chunk:
+                return ()
+            steps.append(physical.plan_step("Put", target_line, chunk, _positions_for(chunk, final_positions)))
+            next_source_chunk += 1
+            continue
+        chunks = target_access_chunks[group_index]
+        chunk_index = next_target_chunk[group_index]
+        if chunk_index >= len(chunks) or chunks[chunk_index] != chunk:
+            return ()
+        staging_line = staged_by_group[group_index]
+        steps.append(physical.plan_step("Get", staging_line, chunk))
+        steps.append(physical.plan_step("Put", target_line, chunk, _positions_for(chunk, final_positions)))
+        next_target_chunk[group_index] = chunk_index + 1
+
+    if next_source_chunk != len(source_chunks):
+        return ()
+    if any(next_target_chunk[index] != len(chunks) for index, chunks in target_access_chunks.items()):
+        return ()
     if source_blockers:
         restore_positions = {
             physical.car_no(car): int(car.get("Position") or index)
@@ -1121,6 +1322,16 @@ def _plan_steps_for_assignment(
         }
         steps.append(physical.plan_step("Put", source_line, _nos(source_blockers), restore_positions))
     return tuple(steps)
+
+
+def _deep_to_near_chunk_key(
+    chunk: tuple[str, ...],
+    final_positions: dict[str, int],
+) -> tuple[int, int, tuple[str, ...]]:
+    positions = [final_positions[no] for no in chunk if no in final_positions]
+    if not positions:
+        return (0, 0, chunk)
+    return (-max(positions), -min(positions), chunk)
 
 
 def _candidate_plan(
@@ -1219,31 +1430,6 @@ def _staging_line_accepts(
         and physical.candidate_positions_available(staging_line, positions, cars, moving_nos, grouped)
         and physical.line_has_length_capacity(staging_line, cars, list(batch), moving_nos, grouped=grouped)
     )
-
-
-def _append_return_groups(
-    steps: list[Any],
-    target_line: str,
-    role: str,
-    groups: tuple[_TargetGroup, ...],
-    staged_by_group: dict[int, str],
-    final_positions: dict[str, int],
-) -> None:
-    for group_index, group in reversed([(index, group) for index, group in enumerate(groups) if group.role == role]):
-        staging_line = staged_by_group[group_index]
-        steps.append(physical.plan_step("Get", staging_line, group.nos))
-        steps.append(physical.plan_step("Put", target_line, group.nos, _positions_for(group.nos, final_positions)))
-
-
-def _append_put(
-    steps: list[Any],
-    target_line: str,
-    cars: tuple[dict[str, Any], ...],
-    final_positions: dict[str, int],
-) -> None:
-    if cars:
-        nos = _nos(cars)
-        steps.append(physical.plan_step("Put", target_line, nos, _positions_for(nos, final_positions)))
 
 
 def _positions_for(nos: tuple[str, ...], final_positions: dict[str, int]) -> dict[str, int]:
