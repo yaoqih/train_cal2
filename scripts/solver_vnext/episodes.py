@@ -7015,6 +7015,15 @@ class Stage4LinearSweepEpisode(Episode):
         remaining = list(all_nos)
         progressed: list[str] = []
         while remaining:
+            current_remaining_cars = [no_to_car[no] for no in remaining]
+            target_by_no = self._target_by_no(
+                source_line=source_line,
+                line_cars=current_remaining_cars,
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+            )
+            if not target_by_no:
+                return None
             target_line = target_by_no[remaining[-1]]
             if target_line == source_line:
                 if any(target_by_no[no] != source_line for no in remaining[:-1]):
