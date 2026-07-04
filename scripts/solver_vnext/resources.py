@@ -97,7 +97,9 @@ class StationResourceGraph:
                 depot_assignment=depot_assignment,
             )
         )
-        if "存4线" in request.put_lines and request.family not in {
+        if (
+            "存4线" in request.put_lines
+            and request.family not in {
             ContractFamily.REMOTE_SESSION,
             ContractFamily.REPAIR_INBOUND,
             ContractFamily.DEPOT_SLOT,
@@ -106,7 +108,9 @@ class StationResourceGraph:
             ContractFamily.PRE_REPAIR_STAGING,
             ContractFamily.LOCO_AREA_STAGING,
             ContractFamily.SPECIAL_REPAIR_PROCESS,
-        }:
+            }
+            and not self._cun4_put_is_same_plan_source_return(request, candidate)
+        ):
             violations.append("cun4_buffer_requires_owner")
         if any(line in physical.DEPOT_OUTSIDE_LINES for line in request.put_lines) and request.family not in {
             ContractFamily.REMOTE_SESSION,
@@ -149,6 +153,20 @@ class StationResourceGraph:
         for put_line in request.put_lines:
             if put_line in protected_blockers or put_line == request.source_line:
                 continue
+            if self._depot_inbound_assembly_put_owned(
+                request=request,
+                put_line=put_line,
+                put_nos=put_nos_by_line.get(put_line, ()),
+                cars=cars,
+                depot_assignment=depot_assignment,
+            ):
+                continue
+            if self._same_plan_repack_staging_cleared(
+                candidate=candidate,
+                line=put_line,
+                put_nos=put_nos_by_line.get(put_line, ()),
+            ):
+                continue
             blocked = serial.downstream_lines(put_line)
             if not blocked:
                 continue
@@ -167,6 +185,63 @@ class StationResourceGraph:
                     f"{put_line}:{','.join(sorted(blocked))}:{','.join(sorted(downstream_debt)[:8])}"
                 )
         return violations
+
+    def _same_plan_repack_staging_cleared(
+        self,
+        *,
+        candidate: Any,
+        line: str,
+        put_nos: tuple[str, ...],
+    ) -> bool:
+        if getattr(candidate, "candidate_kind", "") != "vnext_depot_cun4_source_repack_exchange":
+            return False
+        if not put_nos:
+            return False
+        pending: set[str] = set()
+        cleared: set[str] = set()
+        for step in physical.candidate_plan_steps(candidate):
+            if step.line != line:
+                continue
+            step_nos = set(step.move_car_nos)
+            if step.action == "Put":
+                pending.update(step_nos)
+                cleared.difference_update(step_nos)
+            elif step.action == "Get":
+                cleared.update(step_nos & pending)
+        return set(put_nos) <= cleared
+
+    def _depot_inbound_assembly_put_owned(
+        self,
+        *,
+        request: ResourceRequest,
+        put_line: str,
+        put_nos: tuple[str, ...],
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+    ) -> bool:
+        if request.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            return False
+        if put_line not in physical.DEPOT_INBOUND_ASSEMBLY_LINES:
+            return False
+        if not put_nos:
+            return False
+        loads = physical.line_loads(cars)
+        by_no = {physical.car_no(car): car for car in cars}
+        for no in put_nos:
+            car = by_no.get(no)
+            if car is None:
+                return False
+            if car.get("IsWeigh"):
+                return False
+            target_line, _position, _reason = physical.planned_target_for_car(
+                car,
+                cars,
+                depot_assignment,
+                loads,
+            )
+            if target_line not in physical.DEPOT_INBOUND_DESTINATION_LINES:
+                return False
+        return True
 
     def _serial_gate_lease_violations(
         self,
@@ -216,6 +291,20 @@ class StationResourceGraph:
             by_line.setdefault(step.line, []).extend(step.move_car_nos)
         return {line: tuple(dict.fromkeys(nos)) for line, nos in by_line.items()}
 
+    def _cun4_put_is_same_plan_source_return(self, request: ResourceRequest, candidate: Any) -> bool:
+        if not request.same_plan_source_return_nos:
+            return False
+        cun4_put_nos = set(self._put_nos_by_line(candidate).get("存4线", ()))
+        if not cun4_put_nos or not cun4_put_nos <= set(request.same_plan_source_return_nos):
+            return False
+        cun4_get_nos = {
+            no
+            for step in physical.candidate_plan_steps(candidate)
+            if step.action == "Get" and step.line == "存4线"
+            for no in step.move_car_nos
+        }
+        return cun4_put_nos <= cun4_get_nos
+
     def _depot_slot_violations(
         self,
         request: ResourceRequest,
@@ -225,10 +314,62 @@ class StationResourceGraph:
         cars: list[dict[str, Any]],
         depot_assignment: Any,
     ) -> list[str]:
-        return physical.depot_resource_violations(
+        violations = physical.depot_resource_violations(
             request,
             candidate=candidate,
             validation=validation,
             cars=cars,
             depot_assignment=depot_assignment,
         )
+        if getattr(candidate, "candidate_kind", "") != "vnext_depot_inbound_cun4_open_release":
+            return violations
+        allowed_nos = self._cun4_open_temporary_depot_put_nos(
+            candidate=candidate,
+            cars=cars,
+            depot_assignment=depot_assignment,
+        )
+        if not allowed_nos:
+            return violations
+        return [
+            violation
+            for violation in violations
+            if not self._cun4_open_violation_allowed(violation=violation, allowed_nos=allowed_nos)
+        ]
+
+    def _cun4_open_temporary_depot_put_nos(
+        self,
+        *,
+        candidate: Any,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+    ) -> set[str]:
+        origin_by_no: dict[str, str] = {}
+        for step in physical.candidate_plan_steps(candidate):
+            if step.action != "Get":
+                continue
+            for no in step.move_car_nos:
+                origin_by_no[no] = step.line
+        loads = physical.line_loads(cars)
+        by_no = {physical.car_no(car): car for car in cars}
+        allowed: set[str] = set()
+        for no, origin_line in origin_by_no.items():
+            if origin_line != "存4线":
+                continue
+            car = by_no.get(no)
+            if car is None:
+                continue
+            target_line, _position, _reason = physical.planned_target_for_car(
+                car,
+                cars,
+                depot_assignment,
+                loads,
+            )
+            if target_line in physical.DEPOT_INBOUND_DESTINATION_LINES:
+                allowed.add(no)
+        return allowed
+
+    def _cun4_open_violation_allowed(self, *, violation: str, allowed_nos: set[str]) -> bool:
+        if not violation.startswith("depot_slot_unsatisfied_put:"):
+            return False
+        parts = violation.split(":", 2)
+        return len(parts) >= 2 and parts[1] in allowed_nos

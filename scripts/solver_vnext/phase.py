@@ -249,6 +249,13 @@ class HumanPhaseGate:
             return PhasePermission(True, "primary", "H3", "cun4_release_accept_boundary")
         if resource_delta.request.intent == IntentKind.CUN4_OUTBOUND_HOLD and phase in {"H2", "H3", "H4"}:
             return PhasePermission(True, "primary", "H4", "depot_outbound_h4_release")
+        if (
+            resource_delta.request.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY
+            and phase in {"H1", "H2", "H4"}
+            and contract_delta.effective_gain > 0
+        ):
+            relation = "primary" if phase == "H4" else "support"
+            return PhasePermission(True, relation, "H4", "depot_inbound_assembly_boundary")
         if self._is_structural_support(
             phase=phase,
             target_phase=target_phase,
@@ -270,6 +277,8 @@ class HumanPhaseGate:
             return "H4"
         if request.intent == IntentKind.CUN4_RELEASE_ACCEPT:
             return "H3"
+        if request.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            return "H4"
         if plan_facts.is_remote_outbound_session_release(envelope, request):
             return "H3"
         if family == ContractFamily.CUN4_PORT_STAGING:
@@ -443,6 +452,8 @@ class HumanPhaseGate:
                 return ""
             return "h2_release_ready_requires_h3_release_accept"
         if phase == "H2" and not phase_state.cun4_release_ready:
+            if target_phase == "H4" and request.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
+                return ""
             if target_phase in {"H3", "H4"} and "存4线" not in request.put_lines:
                 if self._h2_port_can_exit_without_release(phase_state):
                     return ""
@@ -457,11 +468,22 @@ class HumanPhaseGate:
             if target_phase == "H5":
                 return "h4_remote_debt_before_closeout"
             if target_phase == "H1":
+                if not phase_state.depot_inbound_assembly_complete:
+                    return ""
                 return "h4_blocks_front_work_until_remote_debt_clear"
             if target_phase == "H2":
                 if request.family == ContractFamily.CUN4_PORT_STAGING and request.target_line == "存4线":
                     return ""
                 return "h4_blocks_front_work_until_remote_debt_clear"
+        if phase == "H4" and not phase_state.depot_outbound_assembly_complete and target_phase == "H5":
+            return "h4_depot_outbound_assembly_before_closeout"
+        if phase == "H4" and not phase_state.depot_inbound_assembly_complete and target_phase == "H5":
+            return "h4_depot_inbound_assembly_before_closeout"
+        if phase == "H1" and not phase_state.front_topology_clear_for_remote:
+            if target_phase in {"H3", "H4"}:
+                if request.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
+                    return ""
+                return "h1_front_topology_requires_service_before_remote"
         return ""
 
     def _h2_port_can_exit_without_release(self, phase_state: PhaseState) -> bool:
@@ -511,6 +533,10 @@ class HumanPhaseGate:
             "cun4_release_count": phase_state.cun4_release_count,
             "cun4_prefix_hold_count": phase_state.cun4_prefix_hold_count,
             "phase_reason": phase_state.reason,
+            "front_topology_clear_for_remote": phase_state.front_topology_clear_for_remote,
+            "depot_inbound_assembly_complete": phase_state.depot_inbound_assembly_complete,
+            "depot_outbound_assembly_complete": phase_state.depot_outbound_assembly_complete,
+            "strategic_plan_reason": phase_state.strategic_plan_reason,
             "transition": transition_type,
         }
         if permission:

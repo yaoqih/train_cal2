@@ -51,7 +51,7 @@ def cun4_release_group(
     loco_location: Any | None = None,
     min_count: int = STANDARD_RELEASE_MIN_COUNT,
 ) -> Cun4ReleaseGroup:
-    """Return the currently exposed repair-bound group at the CUN4 release port.
+    """Return the currently exposed inbound group at the CUN4 release port.
 
     This is a mechanism fact. It does not decide whether the group should be
     released now; phase/policy layers consume the fact.
@@ -84,7 +84,7 @@ def cun4_release_group(
         if not group and target_line == "存4线":
             prefix_hold.append(physical.car_no(car))
             continue
-        if target_line in physical.DEPOT_TARGET_LINES:
+        if target_line in physical.DEPOT_INBOUND_DESTINATION_LINES:
             group.append(car)
             target_lines.append(target_line)
             continue
@@ -155,7 +155,7 @@ def cun4_port_state(
         if target_line == "存4线":
             outbound_hold.append(no)
             continue
-        if target_line in physical.DEPOT_TARGET_LINES:
+        if target_line in physical.DEPOT_INBOUND_DESTINATION_LINES:
             dirty.append(no)
             continue
         if target_line and target_line != "存4线":

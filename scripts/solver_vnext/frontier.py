@@ -59,6 +59,9 @@ class AccessFrontier:
                 occupied,
                 source_departure_lines=physical.route_departure_lines_for_source(loco_location.line, cars, set()),
                 target_approach_lines=physical.route_approach_lines_for_get(line),
+                cars=cars,
+                moving_nos=set(),
+                train_length_m=0.0,
             )
             if dynamic_route:
                 reachable.append(line)
@@ -170,7 +173,7 @@ class AccessFrontier:
         cars: list[dict[str, Any]],
         graph: Any,
         loco_location: Any,
-        depot_assignment: Any | None = None,
+        depot_assignment: Any,
         serial_gate_leases: dict[str, Any] | None = None,
         planned_positions: dict[str, int] | None = None,
         candidate_kind: str = "frontier_direct_probe",
@@ -196,7 +199,7 @@ class AccessFrontier:
             candidate,
             cars,
             loco_location,
-            self._depot_assignment_or_empty(depot_assignment),
+            depot_assignment,
         )
 
     def direct_move_is_reachable(
@@ -208,7 +211,7 @@ class AccessFrontier:
         cars: list[dict[str, Any]],
         graph: Any,
         loco_location: Any,
-        depot_assignment: Any | None = None,
+        depot_assignment: Any,
         serial_gate_leases: dict[str, Any] | None = None,
         planned_positions: dict[str, int] | None = None,
     ) -> bool:
@@ -232,7 +235,7 @@ class AccessFrontier:
         cars: list[dict[str, Any]],
         graph: Any,
         loco_location: Any,
-        depot_assignment: Any | None = None,
+        depot_assignment: Any,
         serial_gate_leases: dict[str, Any] | None = None,
         candidate_kind: str = "frontier_planlet_probe",
     ) -> physical.PhysicalValidation:
@@ -287,7 +290,7 @@ class AccessFrontier:
             candidate,
             cars,
             loco_location,
-            self._depot_assignment_or_empty(depot_assignment),
+            depot_assignment,
         )
 
     def plan_steps_are_reachable(
@@ -297,7 +300,7 @@ class AccessFrontier:
         cars: list[dict[str, Any]],
         graph: Any,
         loco_location: Any,
-        depot_assignment: Any | None = None,
+        depot_assignment: Any,
         serial_gate_leases: dict[str, Any] | None = None,
         candidate_kind: str = "frontier_planlet_probe",
     ) -> bool:
@@ -369,9 +372,6 @@ class AccessFrontier:
             projected_cars=projected_cars,
             depot_assignment=depot_assignment,
         )
-
-    def _depot_assignment_or_empty(self, depot_assignment: Any | None) -> Any:
-        return depot_assignment if depot_assignment is not None else physical.DepotAssignment({}, {})
 
     def _rejected(self, reason: str) -> physical.PhysicalValidation:
         return physical.PhysicalValidation(

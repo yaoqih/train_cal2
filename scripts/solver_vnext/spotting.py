@@ -457,10 +457,25 @@ def _general_spotting_final_positions(
         depot_assignment=depot_assignment,
         batch_nos=all_nos,
     )
-    if len(positions) != len(all_cars):
+    if (
+        len(positions) != len(all_cars)
+        or physical.target_put_order_reasons(target_line, _nos(source_cars), positions)
+        or physical.target_put_order_reasons(target_line, _nos(target_existing), positions)
+    ):
         positions = _structured_spotting_final_positions(
             target_line=target_line,
             all_cars=all_cars,
+        )
+    if (
+        not target_existing
+        and len(positions) == len(all_cars)
+        and physical.target_put_order_reasons(target_line, _nos(source_cars), positions)
+    ):
+        positions = _empty_target_ordered_spotting_positions(
+            target_line=target_line,
+            source_cars=source_cars,
+            cars=cars,
+            depot_assignment=depot_assignment,
         )
     if len(positions) != len(all_cars):
         return {}
@@ -473,6 +488,32 @@ def _general_spotting_final_positions(
     if not _all_spotting_groups_are_acceptable(projected, target_line, depot_assignment):
         return {}
     return positions
+
+
+def _empty_target_ordered_spotting_positions(
+    *,
+    target_line: str,
+    source_cars: tuple[dict[str, Any], ...],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+) -> dict[str, int]:
+    total = physical.SPOTTING_LINE_TOTAL_POSITIONS.get(target_line, 0)
+    if not total or len(source_cars) > total:
+        return {}
+    for start in range(1, total - len(source_cars) + 2):
+        positions = {
+            physical.car_no(car): start + index
+            for index, car in enumerate(source_cars)
+        }
+        projected = _project_target_positions(
+            cars=cars,
+            target_line=target_line,
+            final_cars=source_cars,
+            final_positions=positions,
+        )
+        if _all_spotting_groups_are_acceptable(projected, target_line, depot_assignment):
+            return positions
+    return {}
 
 
 def _structured_spotting_final_positions(
@@ -566,20 +607,19 @@ def _general_plan_steps(
     # Rebuild the target line from the tail of the carried/staged groups.  This
     # keeps the planlet small and leaves order feasibility to the hard validator.
     put_source_nos = _nos(source_cars)
-    if put_source_nos:
+    for put_nos in _target_group_put_chunks(put_source_nos, final_positions):
         steps.append(
             physical.plan_step(
                 "Put",
                 target_line,
-                put_source_nos,
-                {no: final_positions[no] for no in put_source_nos if no in final_positions},
+                put_nos,
+                {no: final_positions[no] for no in put_nos if no in final_positions},
             )
         )
-        remaining_source_nos = [no for no in remaining_source_nos if no not in set(put_source_nos)]
+        remaining_source_nos = [no for no in remaining_source_nos if no not in set(put_nos)]
     for group, staging_line in reversed(list(zip(target_groups, staging_assignment))):
         steps.append(physical.plan_step("Get", staging_line, group.nos))
-        put_nos = group.nos
-        if put_nos:
+        for put_nos in _target_group_put_chunks(group.nos, final_positions):
             steps.append(
                 physical.plan_step(
                     "Put",
@@ -599,6 +639,25 @@ def _general_plan_steps(
         }
         steps.append(physical.plan_step("Put", source_line, _nos(source_blockers), restore_positions))
     return tuple(steps)
+
+
+def _target_group_put_chunks(
+    group_nos: tuple[str, ...],
+    final_positions: dict[str, int],
+) -> tuple[tuple[str, ...], ...]:
+    remaining = list(group_nos)
+    chunks: list[tuple[str, ...]] = []
+    while remaining:
+        selected_start = len(remaining) - 1
+        for start in range(0, len(remaining)):
+            candidate = tuple(remaining[start:])
+            if not physical.target_put_order_reasons("target", candidate, final_positions):
+                selected_start = start
+                break
+        chunk = tuple(remaining[selected_start:])
+        chunks.append(chunk)
+        del remaining[selected_start:]
+    return tuple(chunks)
 
 
 def _source_partition(source_batch: tuple[dict[str, Any], ...]) -> _SourcePartition | None:

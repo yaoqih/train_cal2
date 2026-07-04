@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from . import physical
 from . import plan_facts
+from . import serial
+from . import strategic_plan as strategic
 from .domain import CandidateEnvelope, ContractDelta, ContractFamily, FlowContract, IntentKind, PhaseKind, PhaseState, ResourceDelta, SolverState
 from .domain import RemoteSessionState
 from .flow import classify_flow_facts
@@ -17,6 +19,7 @@ class PolicyContext:
     remote_session: RemoteSessionState
     remote_open: bool
     last_business_remote: bool | None
+    strategic_plan: strategic.StrategicPlan
 
     @property
     def remote_session_open(self) -> bool:
@@ -43,6 +46,7 @@ class BaselinePolicy:
 
     def __init__(self) -> None:
         self.phase_gate = HumanPhaseGate()
+        self.graph = physical.TrackGraph()
 
     def context(self, state: SolverState) -> PolicyContext:
         flow_facts = classify_flow_facts(state.cars, state.depot_assignment)
@@ -58,13 +62,120 @@ class BaselinePolicy:
             cun4_prefix_hold_count=flow_facts.cun4_prefix_hold_count,
             active_variant=flow_facts.active_variant,
         )
+        plan = strategic.build_strategic_plan(
+            phase=phase_state.phase,
+            cars=state.cars,
+            depot_assignment=state.depot_assignment,
+            remote_session=state.remote_session,
+            remote_debt=flow_facts.remote_debt,
+            depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
+        )
+        if (
+            not state.remote_session.active
+            and state.depot_inbound_assembly_accepted
+            and plan.depot_outbound.outbound_nos
+            and phase_state.phase != PhaseKind.H4_REMOTE_DEPOT
+        ):
+            phase_state = replace(
+                phase_state,
+                phase=PhaseKind.H4_REMOTE_DEPOT,
+                reason="depot_outbound_after_inbound_assembly_accepted",
+            )
+            plan = strategic.build_strategic_plan(
+                phase=phase_state.phase,
+                cars=state.cars,
+                depot_assignment=state.depot_assignment,
+                remote_session=state.remote_session,
+                remote_debt=flow_facts.remote_debt,
+                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
+            )
+        elif (
+            not state.remote_session.active
+            and state.depot_inbound_assembly_accepted
+            and self._depot_inbound_release_pending(state.cars, state.depot_assignment)
+            and phase_state.phase != PhaseKind.H4_REMOTE_DEPOT
+        ):
+            phase_state = replace(
+                phase_state,
+                phase=PhaseKind.H4_REMOTE_DEPOT,
+                reason="depot_inbound_release_after_assembly_accepted",
+            )
+            plan = strategic.build_strategic_plan(
+                phase=phase_state.phase,
+                cars=state.cars,
+                depot_assignment=state.depot_assignment,
+                remote_session=state.remote_session,
+                remote_debt=flow_facts.remote_debt,
+                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
+            )
+        elif (
+            not state.remote_session.active
+            and plan.front_topology.must_finish_before_remote
+            and phase_state.phase != PhaseKind.H1_FRONT_SERVICE
+        ):
+            phase_state = replace(
+                phase_state,
+                phase=PhaseKind.H1_FRONT_SERVICE,
+                reason=f"front_topology_priority_before_remote:{','.join(plan.front_topology.priority_lines)}",
+            )
+            plan = strategic.build_strategic_plan(
+                phase=phase_state.phase,
+                cars=state.cars,
+                depot_assignment=state.depot_assignment,
+                remote_session=state.remote_session,
+                remote_debt=flow_facts.remote_debt,
+                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
+            )
+        elif (
+            not state.remote_session.active
+            and flow_facts.remote_debt
+            and phase_state.phase == PhaseKind.H1_FRONT_SERVICE
+            and plan.front_topology.clear_for_remote
+            and plan.depot_inbound.ungrouped_nos
+        ):
+            phase_state = replace(
+                phase_state,
+                phase=PhaseKind.H4_REMOTE_DEPOT,
+                reason="front_topology_clear_depot_inbound_priority",
+            )
+            plan = strategic.build_strategic_plan(
+                phase=phase_state.phase,
+                cars=state.cars,
+                depot_assignment=state.depot_assignment,
+                remote_session=state.remote_session,
+                remote_debt=flow_facts.remote_debt,
+                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
+            )
+        phase_state = replace(
+            phase_state,
+            front_topology_clear_for_remote=plan.front_topology.clear_for_remote,
+            depot_inbound_assembly_complete=plan.depot_inbound.assembly_complete,
+            depot_outbound_assembly_complete=plan.depot_outbound.assembly_complete,
+            strategic_plan_reason=plan.completion.reason,
+        )
         remote_open = phase_state.phase == PhaseKind.H4_REMOTE_DEPOT
         return PolicyContext(
             phase_state=phase_state,
             remote_session=state.remote_session,
             remote_open=remote_open,
             last_business_remote=state.last_business_remote,
+            strategic_plan=plan,
         )
+
+    def _depot_inbound_release_pending(self, cars: list[dict[str, Any]], depot_assignment: Any) -> bool:
+        loads = physical.line_loads(cars)
+        for car in physical.unsatisfied_cars(cars, depot_assignment):
+            if car["Line"] not in physical.DEPOT_INBOUND_ASSEMBLY_LINES:
+                continue
+            target_line, _position, _reason = physical.planned_target_for_car(
+                car,
+                cars,
+                depot_assignment,
+                loads,
+            )
+            if target_line in physical.DEPOT_INBOUND_DESTINATION_LINES:
+                return True
+        return False
 
     def order_contracts(self, contracts: list[FlowContract], context: PolicyContext) -> list[FlowContract]:
         return sorted(contracts, key=lambda contract: self._contract_key(contract, context))
@@ -92,6 +203,8 @@ class BaselinePolicy:
         lane = self._candidate_lane(candidate, context)
         return (
             lane,
+            self._depot_inbound_prospective_route_debt(candidate, context),
+            self._plan_candidate_rank(candidate, context),
             self._special_candidate_rank(candidate, context),
             self._contract_phase_key(envelope.contract, context),
             self._remote_penalty(touched_remote, context),
@@ -110,11 +223,17 @@ class BaselinePolicy:
         )
 
     def _special_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        if self.clears_depot_inbound_assembly_line(candidate, context):
+            return 0
+        if self.opens_cun4_for_depot_outbound(candidate, context):
+            return 0
         if self.resolves_spotting_closeout(candidate, context):
             return 0
         if candidate.envelope.intent == IntentKind.CUN4_RELEASE_ACCEPT:
             return 0
         if candidate.envelope.intent == IntentKind.CUN4_RELEASE_GROUP:
+            return 0
+        if self.forms_depot_inbound_assembly(candidate, context):
             return 0
         if candidate.envelope.intent == IntentKind.CUN4_OUTBOUND_HOLD:
             return 1
@@ -129,9 +248,35 @@ class BaselinePolicy:
     def _candidate_lane(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
         if candidate.envelope.intent == IntentKind.CUN4_RELEASE_ACCEPT:
             return 0
-        if context.phase_state.phase in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT} and self.front_access_shaping(candidate, context):
+        if self.clears_depot_inbound_assembly_line(candidate, context):
             return 0
         if candidate.envelope.intent == IntentKind.CUN4_RELEASE_GROUP:
+            return 0
+        if self.opens_cun4_for_depot_outbound(candidate, context):
+            return 0
+        if self.releases_depot_inbound_assembly(candidate, context):
+            if candidate.resource_delta.request.source_line == "存4线":
+                return 0
+            return 4
+        if self.forms_depot_inbound_assembly(candidate, context):
+            route_debt = self._depot_inbound_prospective_route_debt(candidate, context)
+            if route_debt and route_debt >= self._depot_inbound_remaining_after_move_count(candidate, context):
+                return 35
+            if self.closes_depot_inbound_route_before_complete(candidate, context):
+                return 35
+            if (
+                context.phase_state.phase == PhaseKind.H1_FRONT_SERVICE
+                and context.strategic_plan.front_topology.must_finish_before_remote
+                and candidate.resource_delta.request.source_line not in context.strategic_plan.front_topology.priority_lines
+            ):
+                return 25
+            return 0
+        if context.phase_state.phase in {PhaseKind.H1_FRONT_SERVICE, PhaseKind.H2_CUN4_PORT} and self.front_access_shaping(candidate, context):
+            if (
+                context.strategic_plan.depot_inbound.ungrouped_nos
+                and not self._front_topology_priority_move(candidate, context)
+            ):
+                return 2
             return 0
         if candidate.envelope.intent == IntentKind.CUN4_OUTBOUND_HOLD:
             return 1
@@ -162,6 +307,13 @@ class BaselinePolicy:
         if candidate.envelope.intent == IntentKind.BLOCKER_STAGING:
             return 40
         return 10
+
+    def _front_topology_priority_move(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if not context.strategic_plan.front_topology.must_finish_before_remote:
+            return False
+        request = candidate.resource_delta.request
+        priority_lines = set(context.strategic_plan.front_topology.priority_lines)
+        return request.source_line in priority_lines or request.target_line in priority_lines
 
     def resolves_spotting_closeout(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase not in {PhaseKind.H4_REMOTE_DEPOT, PhaseKind.H5_CLOSEOUT}:
@@ -264,6 +416,148 @@ class BaselinePolicy:
             and candidate.contract_delta.contract_reduction > 0
         )
 
+    def forms_depot_inbound_assembly(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if candidate.envelope.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            return False
+        if candidate.contract_delta.support_gain <= 0:
+            return False
+        moved = set(candidate.envelope.candidate.move_car_nos)
+        if moved & set(context.strategic_plan.depot_inbound.ungrouped_nos):
+            return True
+        if not context.strategic_plan.depot_inbound.ungrouped_nos:
+            return False
+        return bool(
+            set(candidate.contract_delta.reduced)
+            & {
+                "serial_line_gate_released",
+                "side_target_completion",
+                "inner_target_segment_extended",
+            }
+        )
+
+    def closes_depot_inbound_route_before_complete(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if candidate.envelope.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            return False
+        remaining = set(context.strategic_plan.depot_inbound.ungrouped_nos) - set(candidate.envelope.candidate.move_car_nos)
+        if not remaining:
+            return False
+        after_by_no = {physical.car_no(car): car for car in candidate.prospective_cars}
+        remaining_lines = {
+            after_by_no[no]["Line"]
+            for no in remaining
+            if no in after_by_no
+        }
+        for put_line in candidate.resource_delta.request.put_lines:
+            if remaining_lines & serial.downstream_lines(put_line):
+                return True
+        return False
+
+    def _depot_inbound_prospective_route_debt(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        if candidate.envelope.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            return 0
+        remaining = set(context.strategic_plan.depot_inbound.ungrouped_nos) - set(candidate.envelope.candidate.move_car_nos)
+        if not remaining:
+            return 0
+        after_by_no = {physical.car_no(car): car for car in candidate.prospective_cars}
+        remaining_by_line: dict[str, int] = {}
+        for no in remaining:
+            car = after_by_no.get(no)
+            if not car:
+                continue
+            line = car["Line"]
+            remaining_by_line[line] = remaining_by_line.get(line, 0) + 1
+        if not remaining_by_line:
+            return 0
+        reachable = {
+            line
+            for line in remaining_by_line
+            if self._line_reachable_after_depot_inbound_candidate(
+                cars=candidate.prospective_cars,
+                loco_line=getattr(candidate.next_loco_location, "line", ""),
+                line=line,
+            )
+        }
+        if reachable:
+            return sum(count for line, count in remaining_by_line.items() if line not in reachable)
+        return sum(remaining_by_line.values())
+
+    def _depot_inbound_remaining_after_move_count(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        if candidate.envelope.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            return 0
+        return len(
+            set(context.strategic_plan.depot_inbound.ungrouped_nos)
+            - set(candidate.envelope.candidate.move_car_nos)
+        )
+
+    def _line_reachable_after_depot_inbound_candidate(
+        self,
+        *,
+        cars: list[dict[str, Any]],
+        loco_line: str,
+        line: str,
+    ) -> bool:
+        if not loco_line or not line:
+            return False
+        occupied = physical.occupied_lines_for_get_route(cars, set(), line)
+        route = self.graph.route_avoiding_occupied(
+            loco_line,
+            line,
+            occupied,
+            source_departure_lines=physical.route_departure_lines_for_source(loco_line, cars, set()),
+            target_approach_lines=physical.route_approach_lines_for_get(line),
+            cars=cars,
+            moving_nos=set(),
+            train_length_m=0.0,
+        )
+        return bool(route)
+
+    def clears_depot_inbound_assembly_line(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        dirty_nos = set(context.strategic_plan.depot_inbound.purity_violation_nos)
+        if not dirty_nos:
+            return False
+        request = candidate.resource_delta.request
+        dirty_lines = set(context.strategic_plan.depot_inbound.purity_violation_lines)
+        if request.source_line not in dirty_lines:
+            return False
+        moved_dirty_nos = set(candidate.envelope.candidate.move_car_nos) & dirty_nos
+        if not moved_dirty_nos:
+            return False
+        origin_lines = {
+            no: step.line
+            for step in physical.candidate_plan_steps(candidate.envelope.candidate)
+            if step.action == "Get"
+            for no in step.move_car_nos
+        }
+        if not any(origin_lines.get(no) in dirty_lines for no in moved_dirty_nos):
+            return False
+        after_by_no = {physical.car_no(car): car for car in candidate.prospective_cars}
+        return all(
+            after_by_no.get(no, {}).get("Line") not in physical.DEPOT_INBOUND_ASSEMBLY_LINES
+            for no in moved_dirty_nos
+        )
+
+    def releases_depot_inbound_assembly(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        envelope = candidate.envelope
+        request = candidate.resource_delta.request
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        if envelope.template_name != "depot_inbound_assembly_release":
+            return False
+        return (
+            any(line in physical.DEPOT_INBOUND_DESTINATION_LINES for line in request.put_lines)
+            and request.source_line in physical.DEPOT_INBOUND_ASSEMBLY_LINES
+            and candidate.contract_delta.contract_reduction > 0
+        )
+
+    def opens_cun4_for_depot_outbound(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
+            return False
+        if not context.strategic_plan.depot_inbound.assembly_complete:
+            return False
+        if not context.strategic_plan.depot_outbound.outbound_nos:
+            return False
+        return candidate.envelope.template_name == "depot_inbound_cun4_open_release"
+
     def swaps_depot_slot(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
         if context.phase_state.phase != PhaseKind.H4_REMOTE_DEPOT:
             return False
@@ -327,8 +621,79 @@ class BaselinePolicy:
             and len(envelope.candidate.move_car_nos) <= 2
         )
 
-    def _contract_key(self, contract: FlowContract, context: PolicyContext) -> tuple[int, int, str, str, str]:
+    def _plan_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        request = candidate.resource_delta.request
+        plan = context.strategic_plan
+        if (
+            context.phase_state.phase == PhaseKind.H1_FRONT_SERVICE
+            and plan.front_topology.must_finish_before_remote
+        ):
+            if self.clears_depot_inbound_assembly_line(candidate, context):
+                return -20
+            if candidate.envelope.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
+                if request.source_line in plan.front_topology.priority_lines:
+                    return -10
+                return 25 + self._depot_inbound_source_rank(request.source_line)
+            if request.source_line in plan.front_topology.priority_lines or request.target_line in plan.front_topology.priority_lines:
+                return 0
+            if plan_facts.touches_remote(request):
+                return 30
+            return 10
+        if self.clears_depot_inbound_assembly_line(candidate, context):
+            return -20
+        if candidate.envelope.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
+            source_rank = self._depot_inbound_source_rank(request.source_line)
+            return -100 + source_rank
+        if self.opens_cun4_for_depot_outbound(candidate, context):
+            return -30
+        if self.releases_depot_inbound_assembly(candidate, context):
+            return 0 if plan.depot_inbound.assembly_complete else 30
+        if candidate.envelope.intent == IntentKind.CUN4_OUTBOUND_HOLD:
+            moved = set(candidate.envelope.candidate.move_car_nos)
+            if candidate.envelope.candidate.candidate_kind in {
+                "vnext_depot_cun4_inbound_outbound_exchange",
+                "vnext_depot_cun4_source_repack_exchange",
+            }:
+                return -20
+            if candidate.envelope.candidate.candidate_kind == "vnext_depot_outbound_plan_session":
+                return -10
+            if moved & set(plan.depot_outbound.outbound_nos):
+                return 0
+        if plan.remote_session.should_continue_remote:
+            return 0 if plan_facts.touches_remote(request) else 20
+        return 10
+
+    def _depot_inbound_source_rank(self, line: str) -> int:
+        priority = (
+            "洗罐线北",
+            "洗罐站",
+            "油漆线",
+            "抛丸线",
+            "卸轮线",
+            "存5线北",
+            "存5线南",
+            "存4南",
+            "存3线",
+            "存2线",
+            "存1线",
+            "调梁棚",
+            "调梁线北",
+            "机库线",
+            "预修线",
+            "存4线",
+            "机南",
+            "机走棚",
+            "机走北",
+            "洗油北",
+        )
+        try:
+            return priority.index(line)
+        except ValueError:
+            return len(priority)
+
+    def _contract_key(self, contract: FlowContract, context: PolicyContext) -> tuple[int, int, int, str, str, str]:
         return (
+            self._strategic_contract_rank(contract, context),
             self._phase_family_rank(contract.family, context),
             contract.priority,
             contract.family.value,
@@ -336,12 +701,38 @@ class BaselinePolicy:
             contract.target_lines[0] if contract.target_lines else "",
         )
 
-    def _contract_phase_key(self, contract: FlowContract, context: PolicyContext) -> tuple[int, int, str]:
+    def _contract_phase_key(self, contract: FlowContract, context: PolicyContext) -> tuple[int, int, int, str]:
         return (
+            self._strategic_contract_rank(contract, context),
             self._phase_family_rank(contract.family, context),
             contract.priority,
             contract.family.value,
         )
+
+    def _strategic_contract_rank(self, contract: FlowContract, context: PolicyContext) -> int:
+        plan = context.strategic_plan
+        if plan.depot_inbound.purity_violation_nos:
+            lines = set(contract.source_lines)
+            if lines & set(plan.depot_inbound.purity_violation_lines):
+                if set(contract.subject_nos) & set(plan.depot_inbound.purity_violation_nos):
+                    return 0
+        if (
+            context.phase_state.phase == PhaseKind.H1_FRONT_SERVICE
+            and plan.front_topology.must_finish_before_remote
+        ):
+            lines = set(contract.source_lines) | set(contract.target_lines)
+            if lines & set(plan.front_topology.priority_lines):
+                return 0
+            if any(line in physical.REMOTE_INTERACTION_LINES for line in lines):
+                return 30
+            return 10
+        if contract.family == ContractFamily.REMOTE_SESSION and plan.depot_outbound.outbound_nos:
+            if set(contract.subject_nos) & set(plan.depot_outbound.outbound_nos):
+                return 0
+        if contract.family == ContractFamily.REMOTE_SESSION and plan.depot_inbound.ungrouped_nos:
+            if set(contract.subject_nos) & set(plan.depot_inbound.ungrouped_nos):
+                return 0
+        return 10
 
     def _phase_family_rank(self, family: ContractFamily, context: PolicyContext) -> int:
         phase = context.phase_state.phase

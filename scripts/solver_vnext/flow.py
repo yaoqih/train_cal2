@@ -69,8 +69,10 @@ def classify_flow_facts(cars: list[dict[str, Any]], depot_assignment: Any) -> Fl
     depot_outbound_debt = sum(ref.contract_family == ContractFamily.DEPOT_OUTBOUND for ref in refs)
     cun4_port_debt = sum(
         ref.contract_family == ContractFamily.CUN4_PORT_STAGING
-        or ref.target_line == "存4线"
-        or ref.line == "存4线"
+        or (
+            ref.contract_family != ContractFamily.DEPOT_OUTBOUND
+            and (ref.target_line == "存4线" or ref.line == "存4线")
+        )
         for ref in refs
     )
     remote_debt = sum(

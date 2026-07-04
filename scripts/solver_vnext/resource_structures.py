@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import physical
+from . import depot_inbound_plan
+from . import depot_outbound_plan
 from . import release
 from . import serial
 from .contracts import build_car_refs
@@ -32,12 +34,45 @@ def hook_resource_records(
     hook_index: int,
     cars: list[dict[str, Any]],
     depot_assignment: Any,
+    strategic_plan: Any,
     serial_gate_leases: dict[str, SerialGateLease] | None = None,
 ) -> list[ResourceStructureRecord]:
     serial_gate_leases = serial_gate_leases or {}
     return [
+        _front_topology_plan_record(
+            case_id=case_id,
+            hook_index=hook_index,
+            strategic_plan=strategic_plan,
+        ),
         _cun4_record(case_id=case_id, hook_index=hook_index, cars=cars, depot_assignment=depot_assignment),
+        _cun4_release_port_plan_record(
+            case_id=case_id,
+            hook_index=hook_index,
+            strategic_plan=strategic_plan,
+        ),
         _depot_slot_record(case_id=case_id, hook_index=hook_index, cars=cars, depot_assignment=depot_assignment),
+        _depot_inbound_assembly_record(
+            case_id=case_id,
+            hook_index=hook_index,
+            strategic_plan=strategic_plan,
+        ),
+        _depot_outbound_assembly_record(
+            case_id=case_id,
+            hook_index=hook_index,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            strategic_plan=strategic_plan,
+        ),
+        _remote_session_continuity_plan_record(
+            case_id=case_id,
+            hook_index=hook_index,
+            strategic_plan=strategic_plan,
+        ),
+        _phase_completion_plan_record(
+            case_id=case_id,
+            hook_index=hook_index,
+            strategic_plan=strategic_plan,
+        ),
         _serial_gate_record(
             case_id=case_id,
             hook_index=hook_index,
@@ -200,6 +235,232 @@ def _depot_slot_record(
             f"reserved_missing={reserved_missing};locked={locked_stayers};"
             f"failures={len(getattr(depot_assignment, 'failures', {}) or {})};"
             f"capacities={capacities}"
+        ),
+    )
+
+
+def _front_topology_plan_record(
+    *,
+    case_id: str,
+    hook_index: int,
+    strategic_plan: Any,
+) -> ResourceStructureRecord:
+    plan = strategic_plan.front_topology
+    return ResourceStructureRecord(
+        case_id=case_id,
+        hook_index=hook_index,
+        structure="FRONT_TOPOLOGY_PLAN",
+        status=plan.status,
+        owner_contract_id="",
+        candidate_id="",
+        mode=plan.reason,
+        resource_key="|".join(plan.priority_lines),
+        subject_nos="|".join(plan.priority_nos),
+        violation="",
+        detail=(
+            f"priority_lines={','.join(plan.priority_lines)};"
+            f"blocked_risk_lines={','.join(plan.blocked_risk_lines)};"
+            f"must_finish_before_remote={plan.must_finish_before_remote};"
+            f"clear_for_remote={plan.clear_for_remote};"
+            f"reason={plan.reason}"
+        ),
+    )
+
+
+def _cun4_release_port_plan_record(
+    *,
+    case_id: str,
+    hook_index: int,
+    strategic_plan: Any,
+) -> ResourceStructureRecord:
+    plan = strategic_plan.cun4_release
+    return ResourceStructureRecord(
+        case_id=case_id,
+        hook_index=hook_index,
+        structure="CUN4_RELEASE_PORT_PLAN",
+        status=plan.status,
+        owner_contract_id="",
+        candidate_id="",
+        mode=plan.owner,
+        resource_key="存4线",
+        subject_nos="|".join((*plan.release_nos, *plan.outbound_hold_nos, *plan.dirty_nos)),
+        violation="cun4_release_port_dirty" if plan.status == "fail" else "",
+        detail=(
+            f"mode={plan.mode};owner={plan.owner};"
+            f"release={','.join(plan.release_nos)};"
+            f"outbound={','.join(plan.outbound_hold_nos)};"
+            f"dirty={','.join(plan.dirty_nos)};"
+            f"reason={plan.reason}"
+        ),
+    )
+
+
+def _depot_outbound_assembly_record(
+    *,
+    case_id: str,
+    hook_index: int,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    strategic_plan: Any | None = None,
+) -> ResourceStructureRecord:
+    plan = (
+        strategic_plan.depot_outbound
+        if strategic_plan is not None
+        else depot_outbound_plan.build_depot_outbound_assembly_plan(
+            cars=cars,
+            depot_assignment=depot_assignment,
+        )
+    )
+    groups = "|".join(
+        f"{group.line}:{','.join(group.vehicle_nos)}:{group.length_m:.1f}/{group.capacity_m:.1f}"
+        for group in plan.groups
+        if group.vehicle_nos
+    )
+    detail = ";".join(
+        (
+            f"reason={plan.reason}",
+            f"sources={','.join(plan.source_lines)}",
+            f"targets={','.join(plan.target_lines)}",
+            f"route_blocker={','.join(plan.route_blocker_nos)}",
+            f"non_cun4={','.join(plan.non_cun4_nos)}",
+            f"cun4_target={','.join(plan.cun4_target_nos)}",
+            f"pull_order={','.join(plan.pull_order_nos)}",
+            f"cun4_prefix_unsafe={','.join(plan.cun4_prefix_unsafe_nos)}",
+            f"cun4_outbound_hold={','.join(plan.cun4_reserved_by_outbound_hold_nos)}",
+            f"cun4_budget_m={plan.cun4_budget_m:.1f}",
+            f"cun4_free_m={plan.cun4_free_m:.1f}",
+            f"pullout_required_m={plan.pullout_required_m:.1f}",
+            f"depot_inner_free_after_pull_m={plan.depot_inner_free_after_pull_m:.1f}",
+            f"depot_outer_free_after_pull_m={plan.depot_outer_free_after_pull_m:.1f}",
+            f"remote_surplus_after_pull_m={plan.remote_surplus_after_pull_m:.1f}",
+            f"pull_equivalent={plan.pull_equivalent}",
+            f"groups={groups}",
+            f"unplaced={','.join(plan.unplaced_nos)}",
+        )
+    )
+    return ResourceStructureRecord(
+        case_id=case_id,
+        hook_index=hook_index,
+        structure="DEPOT_OUTBOUND_ASSEMBLY_PLAN",
+        status=plan.status,
+        owner_contract_id="",
+        candidate_id="",
+        mode=plan.reason,
+        resource_key="存4线|" + "|".join(depot_outbound_plan.OVERFLOW_ASSEMBLY_LINES),
+        subject_nos="|".join(plan.cun4_nos),
+        violation="overflow_assembly_capacity_insufficient" if plan.unplaced_nos else "",
+        detail=detail,
+    )
+
+
+def _depot_inbound_assembly_record(
+    *,
+    case_id: str,
+    hook_index: int,
+    strategic_plan: Any,
+) -> ResourceStructureRecord:
+    plan = strategic_plan.depot_inbound
+    groups = "|".join(
+        f"{group.line}:{','.join(group.vehicle_nos)}:{group.length_m:.1f}/{group.capacity_m:.1f}:free={group.free_m:.1f}"
+        for group in plan.groups
+        if group.vehicle_nos
+    )
+    detail = ";".join(
+        (
+            f"reason={plan.reason}",
+            f"sources={','.join(plan.source_lines)}",
+            f"targets={','.join(plan.target_lines)}",
+            f"grouped={','.join(plan.grouped_nos)}",
+            f"ungrouped={','.join(plan.ungrouped_nos)}",
+            f"unassigned={','.join(plan.unassigned_nos)}",
+            f"purity_nos={','.join(plan.purity_violation_nos)}",
+            f"purity_lines={','.join(plan.purity_violation_lines)}",
+            f"purity_exempt={','.join(plan.purity_exempt_nos)}",
+            f"total_length_m={plan.total_length_m:.1f}",
+            f"pullout_required_m={plan.pullout_required_m:.1f}",
+            f"depot_free_m={plan.depot_free_m:.1f}",
+            f"depot_surplus_after_pull_m={plan.depot_surplus_after_pull_m:.1f}",
+            f"cun4_budget_m={plan.cun4_budget_m:.1f}",
+            f"cun4_vehicle_budget={plan.cun4_vehicle_budget}",
+            f"assembly_capacity_m={plan.assembly_capacity_m:.1f}",
+            f"assembly_free_m={plan.assembly_free_m:.1f}",
+            f"groups={groups}",
+        )
+    )
+    if plan.purity_violation_nos:
+        violation = "inbound_assembly_line_purity_violation"
+    elif plan.unassigned_nos:
+        violation = "inbound_assembly_capacity_insufficient"
+    else:
+        violation = ""
+    return ResourceStructureRecord(
+        case_id=case_id,
+        hook_index=hook_index,
+        structure="DEPOT_INBOUND_ASSEMBLY_PLAN",
+        status=plan.status,
+        owner_contract_id="",
+        candidate_id="",
+        mode=plan.reason,
+        resource_key="|".join(depot_inbound_plan.ASSEMBLY_LINES),
+        subject_nos="|".join(plan.inbound_nos),
+        violation=violation,
+        detail=detail,
+    )
+
+
+def _remote_session_continuity_plan_record(
+    *,
+    case_id: str,
+    hook_index: int,
+    strategic_plan: Any,
+) -> ResourceStructureRecord:
+    plan = strategic_plan.remote_session
+    return ResourceStructureRecord(
+        case_id=case_id,
+        hook_index=hook_index,
+        structure="REMOTE_SESSION_CONTINUITY_PLAN",
+        status=plan.status,
+        owner_contract_id="",
+        candidate_id="",
+        mode=plan.reason,
+        resource_key="remote_session",
+        subject_nos="",
+        violation="",
+        detail=(
+            f"should_continue_remote={plan.should_continue_remote};"
+            f"remote_debt={plan.remote_debt};"
+            f"depot_inbound_debt={plan.depot_inbound_debt};"
+            f"depot_outbound_debt={plan.depot_outbound_debt};"
+            f"preferred={','.join(plan.preferred_structures)};"
+            f"reason={plan.reason}"
+        ),
+    )
+
+
+def _phase_completion_plan_record(
+    *,
+    case_id: str,
+    hook_index: int,
+    strategic_plan: Any,
+) -> ResourceStructureRecord:
+    plan = strategic_plan.completion
+    return ResourceStructureRecord(
+        case_id=case_id,
+        hook_index=hook_index,
+        structure="PHASE_COMPLETION_PLAN",
+        status=plan.status,
+        owner_contract_id="",
+        candidate_id="",
+        mode=plan.reason,
+        resource_key=strategic_plan.phase.value,
+        subject_nos="",
+        violation="",
+        detail=(
+            f"h1_can_exit={plan.h1_can_exit};"
+            f"h4_can_close={plan.h4_can_close};"
+            f"depot_inbound_complete={strategic_plan.depot_inbound.assembly_complete};"
+            f"depot_outbound_complete={strategic_plan.depot_outbound.assembly_complete};"
+            f"reason={plan.reason}"
         ),
     )
 

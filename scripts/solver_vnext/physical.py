@@ -19,6 +19,8 @@ LINE_LENGTH_TOLERANCE_M = 0.5
 DEPOT_LINES = {"修1库内", "修2库内", "修3库内", "修4库内"}
 DEPOT_OUTSIDE_LINES = {"修1库外", "修2库外", "修3库外", "修4库外"}
 DEPOT_TARGET_LINES = DEPOT_LINES | DEPOT_OUTSIDE_LINES
+DEPOT_INBOUND_DESTINATION_LINES = DEPOT_TARGET_LINES | {"卸轮线"}
+DEPOT_INBOUND_ASSEMBLY_LINES = ("存4线", "机南", "机走棚", "机走北", "洗油北")
 DEPOT_INNER_BLOCKERS = {
     f"修{index}库内": f"修{index}库外"
     for index in range(1, 5)
@@ -89,6 +91,15 @@ STAGING_CANDIDATE_KINDS = {
     "capacity_release_to_staging",
     "same_line_stage_out",
     "spot_release_to_staging",
+    "vnext_depot_outbound_session",
+    "vnext_depot_outbound_plan_session",
+    "vnext_depot_cun4_source_repack_exchange",
+    "vnext_depot_inbound_assembly_session",
+    "vnext_depot_inbound_assembly_rebalance",
+    "vnext_depot_inbound_route_blocker_digest",
+    "vnext_depot_inbound_dirty_exchange_session",
+    "vnext_depot_inbound_mixed_extraction_session",
+    "vnext_depot_inbound_prefix_assembly_session",
 }
 ENABLE_SPOTTING_WINDOW_VALIDATION = True
 SPOTTING_LINE_TOTAL_POSITIONS = {
@@ -98,9 +109,9 @@ SPOTTING_LINE_TOTAL_POSITIONS = {
     "抛丸线": 3,
 }
 _normalize_line_cache: dict[Any, str] = {}
-_access_order_cache: dict[tuple[int, int, str, str, str, frozenset[str], frozenset[str]], list[dict[str, Any]]] = {}
+_access_order_cache: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
 _unsatisfied_cache: dict[tuple[Any, ...], tuple[dict[str, Any], ...]] = {}
-_line_loads_cache: dict[tuple[tuple[str, str, int], ...], Counter[str]] = {}
+_line_loads_cache: dict[tuple[Any, ...], Counter[str]] = {}
 
 
 def clear_access_order_cache() -> None:
@@ -483,6 +494,9 @@ class TrackGraph:
         occupied_lines: set[str],
         source_departure_lines: set[str] | None = None,
         target_approach_lines: set[str] | None = None,
+        cars: list[dict[str, Any]] | None = None,
+        moving_nos: set[str] | None = None,
+        train_length_m: float = 0.0,
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
@@ -491,6 +505,7 @@ class TrackGraph:
             return [source]
         departure_lines = frozenset(normalize_line(line) for line in (source_departure_lines or set()) if normalize_line(line))
         approach_lines = frozenset(normalize_line(line) for line in (target_approach_lines or set()) if normalize_line(line))
+        has_reversal_context = cars is not None
         cache_key = (
             source,
             target,
@@ -498,17 +513,22 @@ class TrackGraph:
             tuple(sorted(departure_lines)),
             tuple(sorted(approach_lines)),
         )
-        cached = self._occupied_route_cache.get(cache_key)
-        if cached is not None:
-            return list(cached)
+        if not has_reversal_context:
+            cached = self._occupied_route_cache.get(cache_key)
+            if cached is not None:
+                return list(cached)
         route = self._route(
             source,
             target,
             occupied_lines=effective_occupied,
             source_departure_lines=set(departure_lines),
             target_approach_lines=set(approach_lines),
+            cars=cars,
+            moving_nos=moving_nos or set(),
+            train_length_m=train_length_m,
         )
-        self._occupied_route_cache[cache_key] = list(route)
+        if not has_reversal_context:
+            self._occupied_route_cache[cache_key] = list(route)
         return route
 
     def _route(
@@ -518,71 +538,134 @@ class TrackGraph:
         occupied_lines: set[str],
         source_departure_lines: set[str] | None = None,
         target_approach_lines: set[str] | None = None,
+        cars: list[dict[str, Any]] | None = None,
+        moving_nos: set[str] | None = None,
+        train_length_m: float = 0.0,
     ) -> list[str]:
         source = normalize_line(source_line)
         target = normalize_line(target_line)
         source_departure_lines = source_departure_lines or set()
         target_approach_lines = target_approach_lines or set()
-        if not occupied_lines and not source_departure_lines and not target_approach_lines:
+        moving_nos = moving_nos or set()
+        has_reversal_context = cars is not None
+        if not occupied_lines and not source_departure_lines and not target_approach_lines and not has_reversal_context:
             cache_key = (source, target)
             if cache_key in self._route_cache:
                 return list(self._route_cache[cache_key])
         if source == target and source in self._adjacency:
-            if not occupied_lines and not source_departure_lines and not target_approach_lines:
+            if not occupied_lines and not source_departure_lines and not target_approach_lines and not has_reversal_context:
                 self._route_cache[(source, target)] = [source]
             return [source]
         if source not in self._adjacency or target not in self._adjacency:
-            if not occupied_lines and not source_departure_lines and not target_approach_lines:
+            if not occupied_lines and not source_departure_lines and not target_approach_lines and not has_reversal_context:
                 self._route_cache[(source, target)] = []
             return []
 
-        queue: list[tuple[int, int, str, list[str]]] = [(0, 0, source, [source])]
-        best: dict[str, int] = {source: 0}
+        queue: list[tuple[int, int, str | None, str, list[str]]] = [(0, 0, None, source, [source])]
+        seen: set[tuple[str | None, str, frozenset[str]]] = {
+            (None, source, frozenset({source})),
+        }
         sequence = 1
         while queue:
-            distance, _sequence, node, path = heapq.heappop(queue)
+            distance, _sequence, previous_node, node, path = heapq.heappop(queue)
             if node == target:
-                if not occupied_lines and not source_departure_lines and not target_approach_lines:
+                if not occupied_lines and not source_departure_lines and not target_approach_lines and not has_reversal_context:
                     self._route_cache[(source, target)] = path
                 return path
-            if distance > best.get(node, 10**9):
-                continue
             for next_node in self._adjacency[node]:
+                if next_node in path:
+                    continue
                 if node == source and source_departure_lines and next_node not in source_departure_lines:
                     continue
-                if self._occupied_edge_blocked(
+                if self._route_step_blocked(
+                    previous_node,
                     node,
                     next_node,
                     source=source,
                     target=target,
                     occupied_lines=occupied_lines,
+                    cars=cars,
+                    moving_nos=moving_nos,
+                    train_length_m=train_length_m,
                 ):
                     continue
                 if next_node == target and target_approach_lines and node not in target_approach_lines:
                     continue
                 next_distance = distance + 1
-                if next_distance < best.get(next_node, 10**9):
-                    best[next_node] = next_distance
-                    heapq.heappush(queue, (next_distance, sequence, next_node, [*path, next_node]))
-                    sequence += 1
-        if not occupied_lines and not source_departure_lines and not target_approach_lines:
+                next_path = [*path, next_node]
+                next_state = (node, next_node, frozenset(next_path))
+                if next_state in seen:
+                    continue
+                seen.add(next_state)
+                heapq.heappush(queue, (next_distance, sequence, node, next_node, next_path))
+                sequence += 1
+        if not occupied_lines and not source_departure_lines and not target_approach_lines and not has_reversal_context:
             self._route_cache[(source, target)] = []
         return []
 
-    def _occupied_edge_blocked(
+    def _route_step_blocked(
         self,
+        previous_node: str | None,
         node: str,
         next_node: str,
         *,
         source: str,
         target: str,
         occupied_lines: set[str],
+        cars: list[dict[str, Any]] | None,
+        moving_nos: set[str],
+        train_length_m: float,
     ) -> bool:
         route_endpoints = {source, target}
-        if next_node in occupied_lines and next_node not in route_endpoints:
-            return True
         if node in occupied_lines and node not in route_endpoints:
-            return True
+            if previous_node is None or not reversal_triplet_allows_occupied_line(
+                (previous_node, node, next_node),
+                node,
+                cars,
+                moving_nos,
+                train_length_m,
+            ):
+                return True
+        if next_node in occupied_lines and next_node not in route_endpoints:
+            if not self._occupied_line_can_be_entered_as_reversal_middle(
+                node,
+                next_node,
+                cars=cars,
+                moving_nos=moving_nos,
+                train_length_m=train_length_m,
+            ):
+                return True
+        if previous_node is not None and cars is not None:
+            return bool(pre_repair_reversal_reasons(
+                (previous_node, node, next_node),
+                cars,
+                moving_nos,
+                train_length_m,
+            ))
+        return False
+
+    def _occupied_line_can_be_entered_as_reversal_middle(
+        self,
+        node: str,
+        next_node: str,
+        *,
+        cars: list[dict[str, Any]] | None,
+        moving_nos: set[str],
+        train_length_m: float,
+    ) -> bool:
+        if cars is None:
+            return False
+        for following_node in self._adjacency[next_node]:
+            if following_node == node:
+                continue
+            if reversal_triplet_allows_occupied_line(
+                (node, next_node, following_node),
+                next_node,
+                cars,
+                moving_nos,
+                train_length_m,
+            ):
+                return True
         return False
 
 
@@ -644,6 +727,14 @@ def route_end_location(path: tuple[str, ...] | list[str], default_line: str) -> 
 def operation_stand_location(path: tuple[str, ...] | list[str], operation_line: str) -> LocoLocation:
     del path
     line = normalize_line(operation_line)
+    return LocoLocation(line=line)
+
+
+def post_put_loco_location(path: tuple[str, ...] | list[str], operation_line: str) -> LocoLocation:
+    line = normalize_line(operation_line)
+    normalized_path = [normalize_line(node) for node in path if normalize_line(node)]
+    if len(normalized_path) >= 2 and normalized_path[-1] == line:
+        return LocoLocation(line=normalized_path[-2])
     return LocoLocation(line=line)
 
 
@@ -798,6 +889,7 @@ def normalized_car(car: dict[str, Any]) -> dict[str, Any]:
     item = dict(car)
     item["_No"] = str(item.get("No") or "")
     item["Line"] = normalize_line(item.get("Line"))
+    item["_InitialLine"] = normalize_line(item.get("_InitialLine") or item["Line"])
     item["TargetLines"] = [normalize_line(line) for line in item.get("TargetLines") or []]
     item["_TargetLineSet"] = set(item["TargetLines"])
     item["_ForcePositions"] = tuple(int(value) for value in item.get("ForceTargetPosition") or [] if int(value) > 0)
@@ -1422,12 +1514,13 @@ def planned_positions_for_batch(
         no = car_no(car)
         slot = depot_assignment.slots.get(no)
         if slot and slot.line == target_line:
-            position = slot.position
-            if position in occupied:
-                return {}
-            planned[no] = position
-            occupied.add(position)
-            continue
+            if slot.locked:
+                position = slot.position
+                if position in occupied:
+                    return {}
+                planned[no] = position
+                occupied.add(position)
+                continue
 
         forced = [position for position in force_positions(car)]
         for position in sorted(
@@ -1435,12 +1528,29 @@ def planned_positions_for_batch(
             key=lambda item: forced_position_preference(item, occupants, target_line, depot_assignment, cars),
         ):
             if position not in occupied:
+                if target_line in DEPOT_LINES:
+                    capacity = depot_line_capacity(
+                        depot_assignment,
+                        target_line,
+                        minimum_position=max((*occupied, position), default=position),
+                    )
+                    if not depot_actual_position_allowed(car, target_line, position, capacity):
+                        continue
+                    projected = [dict(item) for item in cars]
+                    projected_car = next((item for item in projected if car_no(item) == no), None)
+                    if projected_car is None:
+                        projected_car = dict(car)
+                        projected.append(projected_car)
+                    projected_car["Line"] = target_line
+                    projected_car["Position"] = position
+                    if not depot_section_repair_position_allowed(projected_car, target_line, position, projected):
+                        continue
                 planned[no] = position
                 occupied.add(position)
                 break
         if no in planned:
             continue
-        if forced:
+        if forced and target_line not in DEPOT_LINES:
             next_forced = min(
                 (position for position in forced if position not in planned.values()),
                 key=lambda item: forced_position_preference(item, occupants, target_line, depot_assignment, cars),
@@ -1457,6 +1567,36 @@ def planned_positions_for_batch(
                     break
             if no in planned:
                 continue
+        if target_line in DEPOT_LINES:
+            capacity = depot_line_capacity(
+                depot_assignment,
+                target_line,
+                minimum_position=max(occupied or {0}) + len(batch),
+            )
+            preferred_positions: list[int] = []
+            if slot and slot.line == target_line:
+                preferred_positions.append(slot.position)
+            preferred_positions.extend(range(1, capacity + 1))
+            for position in dict.fromkeys(preferred_positions):
+                if position in occupied:
+                    continue
+                if not depot_actual_position_allowed(car, target_line, position, capacity):
+                    continue
+                projected = [dict(item) for item in cars]
+                projected_car = next((item for item in projected if car_no(item) == no), None)
+                if projected_car is None:
+                    projected_car = dict(car)
+                    projected.append(projected_car)
+                projected_car["Line"] = target_line
+                projected_car["Position"] = position
+                if not depot_section_repair_position_allowed(projected_car, target_line, position, projected):
+                    continue
+                planned[no] = position
+                occupied.add(position)
+                break
+            if no in planned:
+                continue
+            return {}
         while next_position in occupied:
             next_position += 1
         planned[no] = next_position
@@ -1515,9 +1655,16 @@ def line_loads(cars: list[dict[str, Any]]) -> Counter[str]:
     return cached.copy()
 
 
-def cars_cache_key(cars: list[dict[str, Any]]) -> tuple[tuple[str, str, int], ...]:
+def cars_cache_key(cars: list[dict[str, Any]]) -> tuple[tuple[str, str, int, tuple[str, ...], str, bool], ...]:
     return tuple(
-        (car_no(car), car["Line"], int(car.get("Position") or 0))
+        (
+            car_no(car),
+            car["Line"],
+            int(car.get("Position") or 0),
+            tuple(target_lines(car)),
+            car["_InitialLine"],
+            bool(car.get("_Weighed")),
+        )
         for car in sorted(cars, key=lambda item: car_no(item))
     )
 
@@ -1741,6 +1888,27 @@ def inaccessible_put_reason(carried_order: list[str], move_nos: tuple[str, ...],
     )
 
 
+def target_put_order_reasons(
+    target_line: str,
+    move_nos: tuple[str, ...],
+    actual_positions: dict[str, int],
+) -> list[str]:
+    ordered = [
+        (no, actual_positions[no])
+        for no in move_nos
+        if no in actual_positions
+    ]
+    reasons: list[str] = []
+    for (left_no, left_position), (right_no, right_position) in zip(ordered, ordered[1:]):
+        if right_position == left_position + 1:
+            continue
+        reasons.append(
+            "target_put_order_violation:"
+            f"{target_line}:{left_no}@{left_position}->{right_no}@{right_position}"
+        )
+    return reasons
+
+
 def line_cars_in_access_order(
     *,
     cars: list[dict[str, Any]],
@@ -1756,7 +1924,7 @@ def line_cars_in_access_order(
     moving_key = frozenset(moving_nos or set())
     carried_key = frozenset(carried_nos or set())
     key = (
-        id(cars),
+        cars_cache_key(cars),
         line,
         moving_key,
         carried_key,
@@ -1915,6 +2083,47 @@ def route_contains_triplet(path: tuple[str, ...] | list[str], triplet: tuple[str
         window = route[index : index + 3]
         if window == target or window == reversed_target:
             return True
+    return False
+
+
+def reversal_triplet_allows_occupied_line(
+    triplet: tuple[str, str, str],
+    occupied_line: str,
+    cars: list[dict[str, Any]] | None,
+    moving_nos: set[str],
+    train_length_m: float,
+) -> bool:
+    if cars is None:
+        return False
+    normalized_triplet = tuple(normalize_line(item) for item in triplet)
+    normalized_occupied = normalize_line(occupied_line)
+    required_base = train_length_m + LOCO_LENGTH_M
+
+    for rule_triplet, blocker_limits in REVERSAL_RULES_IGNORE_BLOCKER_LENGTH:
+        normalized_rule = tuple(normalize_line(item) for item in rule_triplet)
+        if normalized_triplet not in {normalized_rule, tuple(reversed(normalized_rule))}:
+            continue
+        for blocker_line, limit_m in blocker_limits:
+            blocker = normalize_line(blocker_line)
+            if blocker != normalized_occupied:
+                continue
+            if not any(car["Line"] == blocker and car_no(car) not in moving_nos for car in cars):
+                return True
+            return required_base <= limit_m + LINE_LENGTH_TOLERANCE_M
+
+    for rule_triplet, blocker_limits in REVERSAL_RULES_WITH_BLOCKER_LENGTH:
+        normalized_rule = tuple(normalize_line(item) for item in rule_triplet)
+        if normalized_triplet not in {normalized_rule, tuple(reversed(normalized_rule))}:
+            continue
+        for blocker_line, limit_m in blocker_limits:
+            blocker = normalize_line(blocker_line)
+            if blocker != normalized_occupied:
+                continue
+            blocker_length = line_length_load(cars, blocker, moving_nos)
+            if blocker_length <= 0:
+                return True
+            return required_base + blocker_length <= limit_m + LINE_LENGTH_TOLERANCE_M
+
     return False
 
 
@@ -2461,6 +2670,9 @@ def route_blocking_lines(
         occupied,
         source_departure_lines=route_departure_lines_for_source(start_node, cars, moving_nos),
         target_approach_lines=route_approach_lines_for_put(target_line, cars, moving_nos),
+        cars=cars,
+        moving_nos=moving_nos,
+        train_length_m=train_length_for_nos(cars, moving_nos),
     )
     if available_path:
         return static_path, available_path, ()
@@ -2571,6 +2783,9 @@ def validate_candidate(
         occupied_lines,
         source_departure_lines=route_departure_lines_for_source(loco_location.line, cars, move_nos),
         target_approach_lines=route_approach_lines_for_get(candidate.source_line),
+        cars=cars,
+        moving_nos=move_nos,
+        train_length_m=0.0,
     )
     get_static_path = graph.route(loco_location.line, candidate.source_line)
     source_location = route_end_location(get_path, candidate.source_line) if get_path else LocoLocation(
@@ -2584,6 +2799,9 @@ def validate_candidate(
             occupied_after_get,
             source_departure_lines=route_departure_lines_for_source(source_location.line, cars, move_nos),
             target_approach_lines=route_approach_lines_for_put(WEIGH_LINE, cars, move_nos),
+            cars=cars,
+            moving_nos=move_nos,
+            train_length_m=candidate.train_length_m,
         )
         weigh_static_path = graph.route(source_location.line, WEIGH_LINE)
         weigh_path = route_with_line_prefix(
@@ -2599,6 +2817,9 @@ def validate_candidate(
             occupied_after_get,
             source_departure_lines=route_departure_lines_for_source(weigh_location.line, cars, move_nos),
             target_approach_lines=route_approach_lines_for_put(candidate.target_line, cars, move_nos),
+            cars=cars,
+            moving_nos=move_nos,
+            train_length_m=candidate.train_length_m,
         )
         put_static_path = graph.route(weigh_location.line, candidate.target_line)
         put_path = route_with_line_prefix(
@@ -2614,6 +2835,9 @@ def validate_candidate(
             occupied_after_get,
             source_departure_lines=route_departure_lines_for_source(source_location.line, cars, move_nos),
             target_approach_lines=route_approach_lines_for_put(candidate.target_line, cars, move_nos),
+            cars=cars,
+            moving_nos=move_nos,
+            train_length_m=candidate.train_length_m,
         )
         put_static_path = graph.route(source_location.line, candidate.target_line)
         put_path = route_with_line_prefix(
@@ -2739,12 +2963,16 @@ def validate_planlet(
                 reasons.append("pull_limit_violation")
                 break
             occupied_lines = occupied_lines_for_get_route(working_cars, step_nos | carried, step.line)
+            carried_length = train_length_for_nos(working_cars, carried)
             raw_path = graph.route_avoiding_occupied(
                 current_loco.line,
                 step.line,
                 occupied_lines,
                 source_departure_lines=route_departure_lines_for_source(current_loco.line, working_cars, step_nos | carried),
                 target_approach_lines=route_approach_lines_for_get(step.line),
+                cars=working_cars,
+                moving_nos=step_nos | carried,
+                train_length_m=carried_length,
             )
             static_path = graph.route(current_loco.line, step.line)
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
@@ -2754,7 +2982,7 @@ def validate_planlet(
                     route_with_line_prefix(current_loco.line, static_path),
                     working_cars,
                     step_nos | carried,
-                    train_length_for_nos(working_cars, step_nos | carried),
+                    carried_length,
                 ))
                 break
             source_location = operation_stand_location(path, step.line)
@@ -2778,7 +3006,7 @@ def validate_planlet(
                 path,
                 working_cars,
                 step_nos | carried,
-                train_length_for_nos(working_cars, step_nos | carried),
+                carried_length,
             ))
             if reasons:
                 break
@@ -2814,6 +3042,9 @@ def validate_planlet(
                 occupied_lines,
                 source_departure_lines=route_departure_lines_for_source(current_loco.line, working_cars, carried),
                 target_approach_lines=route_approach_lines_for_put(step.line, working_cars, carried),
+                cars=working_cars,
+                moving_nos=carried,
+                train_length_m=train_length_for_nos(working_cars, carried),
             )
             static_path = graph.route(current_loco.line, step.line)
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
@@ -2874,7 +3105,7 @@ def validate_planlet(
             )
             carried.difference_update(step_nos)
             carried_order = [no for no in carried_order if no not in step_nos]
-            current_loco = operation_stand_location(path, step.line)
+            current_loco = post_put_loco_location(path, step.line)
             continue
 
         if step.action == "Weigh":
@@ -2907,6 +3138,9 @@ def validate_planlet(
                 occupied_lines,
                 source_departure_lines=route_departure_lines_for_source(current_loco.line, working_cars, carried),
                 target_approach_lines=route_approach_lines_for_put(WEIGH_LINE, working_cars, carried),
+                cars=working_cars,
+                moving_nos=carried,
+                train_length_m=train_length_for_nos(working_cars, carried),
             )
             static_path = graph.route(current_loco.line, WEIGH_LINE)
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
@@ -2956,6 +3190,7 @@ def validate_target_positions(
     target_positions = list(actual_positions.values())
     if len(target_positions) != len(set(target_positions)):
         reasons.append("target_position_collision_inside_batch")
+    reasons.extend(target_put_order_reasons(candidate.target_line, candidate.move_car_nos, actual_positions))
     occupied_positions = {
         int(car.get("Position") or 0)
         for car in projected_cars
@@ -3234,7 +3469,9 @@ def state_signature(
 
 def next_loco_location(candidate: HookCandidate, validation: PhysicalValidation) -> LocoLocation:
     final_line = candidate_final_line(candidate)
-    return operation_stand_location(validation.put_path, final_line)
+    if candidate.candidate_kind == "vnext_depot_outbound_session" and final_line == "存4线":
+        return LocoLocation(line="存4线")
+    return post_put_loco_location(validation.put_path, final_line)
 
 
 

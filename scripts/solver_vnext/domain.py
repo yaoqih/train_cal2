@@ -28,6 +28,7 @@ class IntentKind(str, Enum):
     CUN4_OUTBOUND_HOLD = "CUN4_OUTBOUND_HOLD"
     CUN4_RELEASE_ACCEPT = "CUN4_RELEASE_ACCEPT"
     REMOTE_DEPOT = "REMOTE_DEPOT"
+    DEPOT_INBOUND_ASSEMBLY = "DEPOT_INBOUND_ASSEMBLY"
     TAIL_CLOSEOUT = "TAIL_CLOSEOUT"
     DEPOT_SLOT_SWAP = "DEPOT_SLOT_SWAP"
     BLOCKER_STAGING = "BLOCKER_STAGING"
@@ -115,6 +116,10 @@ class PhaseState:
     cun4_release_count: int = 0
     cun4_prefix_hold_count: int = 0
     active_variant: str = ""
+    front_topology_clear_for_remote: bool = True
+    depot_inbound_assembly_complete: bool = True
+    depot_outbound_assembly_complete: bool = True
+    strategic_plan_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -202,6 +207,7 @@ class SolverState:
     accepted_candidate_ids: set[str] = field(default_factory=set)
     visited_signatures: set[tuple[str, str, tuple[tuple[str, str, int], ...]]] = field(default_factory=set)
     remote_session: RemoteSessionState = field(default_factory=RemoteSessionState)
+    depot_inbound_assembly_accepted: bool = False
     last_business_remote: bool | None = None
     serial_gate_leases: dict[str, SerialGateLease] = field(default_factory=dict)
 

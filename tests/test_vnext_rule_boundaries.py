@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,7 +15,31 @@ if str(SCRIPTS) not in sys.path:
 
 from solver_vnext import physical
 from solver_vnext import serial
+from solver_vnext.depot_inbound_plan import build_depot_inbound_assembly_plan
+from solver_vnext.depot_outbound_plan import build_depot_outbound_assembly_plan
+from solver_vnext.delta import build_contract_delta, simulate_candidate
+from solver_vnext.episodes import (
+    Cun4OutboundAssemblyReleaseEpisode,
+    Cun4UnwheelReleaseEpisode,
+    DepotInboundAssemblyReleaseEpisode,
+    DepotInboundAssemblyRebalanceEpisode,
+    DepotInboundDirtyCleanoutEpisode,
+    DepotInboundRouteBlockerDigestEpisode,
+    DepotInboundDirtyExchangeSessionEpisode,
+    DepotInboundMixedExtractionSessionEpisode,
+    DepotInboundPrefixAssemblySessionEpisode,
+    DepotInboundAssemblySessionEpisode,
+    SourcePrefixReleaseEpisode,
+    SpottingRepackEpisode,
+    DepotCun4SourceRepackExchangeEpisode,
+    DepotCun4InboundOutboundExchangeEpisode,
+    DepotOutboundSessionEpisode,
+    EPISODES,
+)
+from solver_vnext.frontier import AccessFrontier
+from solver_vnext.gate import AcceptRejectGate
 from solver_vnext.placement import planned_positions_for_batch
+from solver_vnext.strategic_plan import build_strategic_plan
 from solver_vnext.contracts import classify_family
 from solver_vnext.domain import (
     CandidateEnvelope,
@@ -28,6 +56,7 @@ from solver_vnext.domain import (
     SerialGateLease,
 )
 from solver_vnext.phase import HumanPhaseGate
+from solver_vnext.policy import BaselinePolicy
 from solver_vnext.resources import StationResourceGraph
 
 
@@ -354,6 +383,156 @@ def test_reversal_triplet_rule_does_not_fire_on_unlisted_path() -> None:
     assert reasons == []
 
 
+def test_route_search_skips_reversal_length_violating_short_path() -> None:
+    graph = physical.TrackGraph()
+    cars = [car("B1", line="机北1", position=1)]
+    path = graph.route_avoiding_occupied(
+        "存1线",
+        "机走北",
+        physical.occupied_lines_for_route(cars, set()),
+        cars=cars,
+        moving_nos=set(),
+        train_length_m=90.0,
+    )
+    windows = set(zip(path, path[1:], path[2:]))
+    assert path
+    assert ("渡6", "渡5", "机走北") not in windows
+    assert physical.pre_repair_reversal_reasons(path, cars, set(), 90.0) == []
+
+
+def test_reversal_middle_blocker_can_be_used_when_length_fits() -> None:
+    graph = physical.TrackGraph()
+    cars = [car("P1", line="预修线", position=1, length=20.0)]
+    path = graph.route_avoiding_occupied(
+        "存2线",
+        "渡7",
+        physical.occupied_lines_for_route(cars, set()),
+        cars=cars,
+        moving_nos=set(),
+        train_length_m=30.0,
+    )
+    assert path == ["存2线", "预修线", "渡7"]
+
+
+def test_reversal_middle_blocker_uses_other_path_when_length_overflows() -> None:
+    graph = physical.TrackGraph()
+    cars = [car("P1", line="预修线", position=1, length=20.0)]
+    path = graph.route_avoiding_occupied(
+        "存2线",
+        "渡7",
+        physical.occupied_lines_for_route(cars, set()),
+        cars=cars,
+        moving_nos=set(),
+        train_length_m=190.0,
+    )
+    assert path
+    assert path != ["存2线", "预修线", "渡7"]
+    assert physical.pre_repair_reversal_reasons(path, cars, set(), 190.0) == []
+
+
+def test_planlet_get_route_uses_current_carry_length_not_future_pickup() -> None:
+    cars = [
+        car("B1", line="机北1", position=1, target_lines=["机北1"]),
+        car("M1", line="机走北", position=1, length=90.0, target_lines=["机走棚"]),
+    ]
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=8,
+        source_line="机走北",
+        target_line="机走棚",
+        batch=[cars[1]],
+        steps=(
+            physical.plan_step("Get", "机走北", ("M1",)),
+            physical.plan_step("Put", "机走棚", ("M1",), {"M1": 1}),
+        ),
+        reason="test",
+        candidate_kind="test_planlet_get_length",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert validation.accepted
+
+
+def test_loco_stands_on_put_approach_node_after_put_to_jinan() -> None:
+    cars = [
+        car("A", line="抛丸线", position=1, target_lines=["修1库内"]),
+        car("X", line="机走棚", position=1, target_lines=["调梁棚"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="抛丸线",
+        target_line="机南",
+        batch=[cars[0]],
+        planned_positions={"A": 1},
+        generation_reason="test",
+        candidate_kind="vnext_depot_inbound_assembly_session",
+    )
+    graph = physical.TrackGraph()
+    validation = physical.validate_candidate(
+        graph,
+        candidate,
+        cars,
+        physical.LocoLocation("机库线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    next_loco = physical.next_loco_location(candidate, validation)
+    assert next_loco == physical.LocoLocation("渡10")
+
+    physical.apply_candidate(candidate, cars, validation)
+    occupied = physical.occupied_lines_for_get_route(cars, {"X"}, "机走棚")
+    path = graph.route_avoiding_occupied(
+        next_loco.line,
+        "机走棚",
+        occupied,
+        source_departure_lines=physical.route_departure_lines_for_source(next_loco.line, cars, {"X"}),
+        target_approach_lines=physical.route_approach_lines_for_get("机走棚"),
+        cars=cars,
+        moving_nos={"X"},
+        train_length_m=0.0,
+    )
+    assert path
+    assert path[-2:] == ["机走北", "机走棚"]
+
+
+def test_depot_outbound_session_to_cun4_leaves_loco_at_north_end() -> None:
+    cars = [
+        car("A", line="修1库内", position=1, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    candidate = physical.build_direct_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="修1库内",
+        target_line="存4线",
+        batch=cars,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        reason="test",
+        candidate_kind="vnext_depot_outbound_session",
+        planned_positions={"A": 1},
+    )
+    assert candidate is not None
+    graph = physical.TrackGraph()
+    validation = physical.validate_candidate(
+        graph,
+        candidate,
+        cars,
+        physical.LocoLocation("修1库内"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    assert validation.put_path[-2:] == ("存4南", "存4线")
+    assert physical.next_loco_location(candidate, validation) == physical.LocoLocation("存4线")
+
+
 def test_line_graph_covers_known_lines_and_is_connected() -> None:
     graph = physical.TrackGraph()
     known_lines = set(physical.TRACK_SPECS) | physical.RUNNING_LINES
@@ -434,6 +613,193 @@ def test_spotting_placement_uses_relaxed_business_window_with_fixed_capacity() -
         depot_assignment=depot_assignment,
         batch_nos={physical.car_no(item) for item in overflow},
     ) == {}
+
+
+def test_spotting_repack_empty_target_uses_contiguous_source_put_order() -> None:
+    cars = [
+        car("B1", line="存1线", position=1, target_lines=["存1线"]),
+        car("B2", line="存1线", position=2, target_lines=["存1线"]),
+        car("B3", line="存1线", position=3, target_lines=["存1线"]),
+        car("T1", line="存1线", position=4, target_lines=["抛丸线"]),
+        car("T2", line="存1线", position=5, target_lines=["抛丸线"]),
+        car("E1", line="存1线", position=6, target_lines=["存1线"]),
+    ]
+    cars[4]["_ForcePositions"] = (2, 3)
+    cars[4]["ForceTargetPosition"] = [2, 3]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="FUNCTION_LINE_SERVICE:存1线->抛丸线:T1,T2",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        subject_nos=("T1", "T2"),
+        source_lines=("存1线",),
+        target_lines=("抛丸线",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SpottingRepackEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    put = next(
+        step
+        for step in envelopes[0].candidate.plan_steps
+        if step.action == "Put" and step.line == "抛丸线"
+    )
+    assert put.planned_positions == {"T1": 1, "T2": 2}
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+
+
+def test_source_prefix_release_returns_satisfied_source_blocker() -> None:
+    cars = [
+        car("B1", line="存5线北", position=1, target_lines=["存5线北"]),
+        car("T1", line="存5线北", position=2, target_lines=["存5线南"]),
+        car("T2", line="存5线北", position=3, target_lines=["存5线南"]),
+        car("E1", line="存5线南", position=1, target_lines=["存5线南"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="YARD_REBALANCE:存5线北->存5线南:T1,T2",
+        family=ContractFamily.YARD_REBALANCE,
+        subject_nos=("T1", "T2"),
+        source_lines=("存5线北",),
+        target_lines=("存5线南",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SourcePrefixReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存5线北"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    steps = envelopes[0].candidate.plan_steps
+    assert [(step.action, step.line, step.move_car_nos) for step in steps] == [
+        ("Get", "存5线北", ("B1", "T1", "T2")),
+        ("Put", "存5线南", ("T1", "T2")),
+        ("Put", "存5线北", ("B1",)),
+    ]
+    assert envelopes[0].resource_request.same_plan_source_return_nos == ("B1",)
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存5线北"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+
+
+def test_source_prefix_release_marks_cun4_to_unwheel_as_release_accept() -> None:
+    cars = [
+        car("B1", line="存4线", position=1, target_lines=["存4线"]),
+        car("T1", line="存4线", position=2, target_lines=["卸轮线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="FUNCTION_LINE_SERVICE:存4线->卸轮线:T1",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        subject_nos=("T1",),
+        source_lines=("存4线",),
+        target_lines=("卸轮线",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SourcePrefixReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    assert envelopes[0].intent == IntentKind.CUN4_RELEASE_ACCEPT
+    assert envelopes[0].resource_request.intent == IntentKind.CUN4_RELEASE_ACCEPT
+
+
+def test_spotting_repack_restores_existing_target_in_contiguous_chunks() -> None:
+    cars = [
+        car("S1", line="存5线北", position=1, target_lines=["调梁棚"]),
+        car("S2", line="存5线北", position=2, target_lines=["调梁棚"]),
+        car("S3", line="存5线北", position=3, target_lines=["调梁棚"]),
+        car("S4", line="存5线北", position=4, target_lines=["调梁棚"]),
+        car("F1", line="调梁棚", position=5, target_lines=["调梁棚"]),
+        car("F2", line="调梁棚", position=6, target_lines=["调梁棚"]),
+        car("F3", line="调梁棚", position=7, target_lines=["调梁棚"]),
+        car("F4", line="调梁棚", position=8, target_lines=["调梁棚"]),
+        car("E1", line="调梁棚", position=9, target_lines=["调梁棚"]),
+    ]
+    for item in cars[4:8]:
+        item["_ForcePositions"] = (6, 7, 8, 9)
+        item["ForceTargetPosition"] = [6, 7, 8, 9]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="DISPATCH_SHED_QUEUE:存5线北->调梁棚:S1,S2,S3,S4",
+        family=ContractFamily.DISPATCH_SHED_QUEUE,
+        subject_nos=("S1", "S2", "S3", "S4"),
+        source_lines=("存5线北",),
+        target_lines=("调梁棚",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        SpottingRepackEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存5线北"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    repair_puts = [
+        step
+        for step in envelopes[0].candidate.plan_steps
+        if step.action == "Put" and step.line == "调梁棚"
+    ]
+    assert [step.move_car_nos for step in repair_puts] == [
+        ("S1", "S2", "S3", "S4"),
+        ("E1",),
+        ("F1", "F2", "F3", "F4"),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存5线北"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
 
 
 def test_plain_line_source_positions_compact_after_north_end_remove() -> None:
@@ -574,6 +940,85 @@ def test_depot_put_uses_business_planned_positions_not_north_end_shift() -> None
         "E1": ("修1库内", 1),
         "E2": ("修1库内", 3),
     }
+
+
+def test_business_planned_positions_must_preserve_put_order() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
+        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=7,
+        source_line="存1线",
+        target_line="修1库内",
+        batch=cars,
+        planned_positions={"M1": 2, "M2": 1},
+        generation_reason="test",
+        candidate_kind="target_move",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert not validation.accepted
+    assert any(reason.startswith("target_put_order_violation:修1库内:") for reason in validation.reasons)
+
+
+def test_business_planned_positions_must_be_contiguous_translation() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
+        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=8,
+        source_line="存1线",
+        target_line="修1库内",
+        batch=cars,
+        planned_positions={"M1": 2, "M2": 4},
+        generation_reason="test",
+        candidate_kind="target_move",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert not validation.accepted
+    assert any(reason.startswith("target_put_order_violation:修1库内:") for reason in validation.reasons)
+
+
+def test_business_planned_positions_allow_contiguous_offset_translation() -> None:
+    cars = [
+        car("M1", line="存1线", position=1, target_lines=["修1库内"]),
+        car("M2", line="存1线", position=2, target_lines=["修1库内"]),
+        car("E1", line="修1库内", position=1, target_lines=["修1库内"]),
+        car("E2", line="修1库内", position=3, target_lines=["修1库内"]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=9,
+        source_line="存1线",
+        target_line="修1库内",
+        batch=cars[:2],
+        planned_positions={"M1": 4, "M2": 5},
+        generation_reason="test",
+        candidate_kind="target_move",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert validation.accepted
 
 
 def test_forced_position_put_uses_business_position_on_plain_line() -> None:
@@ -762,6 +1207,51 @@ def test_serial_gate_resource_uses_put_step_nos_not_whole_candidate_batch() -> N
         depot_assignment=depot_assignment,
         serial_gate_leases={"机走棚": lease},
     )[0].startswith("serial_blocker_storage_before_downstream_clear")
+
+
+def test_cun4_same_plan_source_return_does_not_require_buffer_owner() -> None:
+    graph = StationResourceGraph()
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    cars = [
+        car("R1", line="存4线", position=1, target_lines=["存4线"]),
+        car("T1", line="存4线", position=2, target_lines=["油漆线"]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存4线",
+        target_line="存4线",
+        batch=cars,
+        planned_positions={},
+        generation_reason="test",
+        candidate_kind="vnext_spotting_repack",
+        plan_steps=(
+            physical.plan_step("Get", "存4线", ("R1", "T1")),
+            physical.plan_step("Put", "油漆线", ("T1",), {"T1": 1}),
+            physical.plan_step("Put", "存4线", ("R1",), {"R1": 1}),
+        ),
+    )
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(ResourceKind.CUN4_NORTH_BUFFER,),
+        source_line="油漆线",
+        target_line="油漆线",
+        move_nos=("R1", "T1"),
+        touched_lines=("存4线", "油漆线"),
+        put_lines=("油漆线", "存4线"),
+        intent=IntentKind.FRONT_PREP,
+        same_plan_source_return_nos=("R1",),
+    )
+    delta = graph.acquire(
+        request,
+        candidate=candidate,
+        validation=SimpleNamespace(reasons=()),
+        cars=cars,
+        depot_assignment=depot_assignment,
+    )
+    assert "cun4_buffer_requires_owner" not in delta.violations
 
 
 def test_h4_blocks_front_work_even_when_it_touches_remote_line() -> None:
@@ -1035,6 +1525,2576 @@ def test_planlet_partial_return_to_source_does_not_count_carried_cars_on_line() 
         "B": ("存1线", 1),
         "S": ("存1线", 2),
     }
+
+
+def test_access_frontier_requires_real_depot_assignment() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["存2线"]),
+    ]
+    with pytest.raises(TypeError):
+        AccessFrontier().direct_move_is_reachable(
+            source_line="存1线",
+            target_line="存2线",
+            batch=cars,
+            cars=cars,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            planned_positions={"A": 1},
+        )
+
+
+def test_depot_inbound_assembly_plan_keeps_cun4_clear_for_unwheel_and_reports_purity() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"], length=30.0),
+        car("B", line="存1线", position=2, target_lines=["修2库内"], length=30.0),
+        car("C", line="存1线", position=3, target_lines=["卸轮线"], length=30.0),
+        car("G", line="机南", position=1, target_lines=["修2库内"], length=10.0),
+        car("X", line="机走棚", position=1, target_lines=["存1线"], length=10.0),
+    ]
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos=set(),
+        depot_outbound_nos=set(),
+    )
+    assert plan.purity_violation_nos == ("X",)
+    assert plan.purity_violation_lines == ("机走棚",)
+    assert plan.temporary_line_by_no["G"] == "机南"
+    assert plan.temporary_line_by_no["C"] == "存4线"
+    assert plan.temporary_line_by_no["A"] != "存4线"
+    assert plan.temporary_line_by_no["B"] != "存4线"
+    assert "机走棚" not in {plan.temporary_line_by_no[no] for no in ("A", "B", "C")}
+    assert not plan.unassigned_nos
+    assert plan.status == "fail"
+
+
+def test_depot_inbound_assembly_plan_reports_capacity_without_cun4_repair_overflow() -> None:
+    cars = [
+        car(f"I{index}", line="存1线", position=index, target_lines=["修1库内"], length=20.0)
+        for index in range(1, 17)
+    ]
+    cars.append(car("O", line="修1库内", position=1, target_lines=["存4线"], length=20.0))
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos=set(),
+        depot_outbound_nos={"O"},
+    )
+    line_counts = Counter(plan.temporary_line_by_no.values())
+    assert line_counts["存4线"] == 0
+    assert sum(line_counts[line] for line in ("机南", "机走棚", "机走北", "洗油北")) == 15
+    assert plan.unassigned_nos == ("I16",)
+    assert plan.status == "fail"
+
+
+def test_depot_inbound_assembly_session_forms_strategic_group() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"]),
+        car("B", line="存1线", position=2, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.temporary_line_by_no == {"A": "机南", "B": "机南"}
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("存1线",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundAssemblySessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert envelope.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "存1线", ("A", "B")),
+        ("Put", "机南", ("A", "B")),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+        strategic_plan=strategic_plan,
+    )
+    assert "depot_inbound_temporary_group_formed" in delta.reduced
+    assert delta.support_gain == 2
+
+
+def test_depot_inbound_assembly_session_prefers_larger_source_window() -> None:
+    cars = [
+        car("A", line="调梁棚", position=1, target_lines=["修1库内"]),
+        car("B", line="预修线", position=1, target_lines=["修2库内"]),
+        car("C", line="预修线", position=2, target_lines=["修3库内"]),
+        car("D", line="预修线", position=3, target_lines=["修4库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=4,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B,C,D",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B", "C", "D"),
+        source_lines=("调梁棚", "预修线"),
+        target_lines=("修1库内", "修2库内", "修3库内", "修4库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundAssemblySessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机库线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 2
+    assert [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps] == [
+        ("Get", "预修线", ("B", "C", "D")),
+        ("Put", "机南", ("B", "C", "D")),
+    ]
+
+
+def test_depot_inbound_assembly_rebalance_moves_route_blocking_group_to_cun4() -> None:
+    cars = [
+        car("B1", line="机走棚", position=1, target_lines=["卸轮线"]),
+        car("B2", line="机走棚", position=2, target_lines=["卸轮线"]),
+        car("A", line="油漆线", position=1, target_lines=["修3库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=3,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B1,B2",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B1", "B2"),
+        source_lines=("油漆线", "机走棚"),
+        target_lines=("卸轮线", "修3库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundAssemblyRebalanceEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机南"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "机走棚", ("B1", "B2")),
+        ("Put", "存4线", ("B1", "B2")),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机南"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+
+
+def test_depot_inbound_assembly_rebalance_skips_stable_grouped_line() -> None:
+    cars = [
+        car("A", line="洗油北", position=1, target_lines=["修1库内"]),
+        car("B", line="洗油北", position=2, target_lines=["修2库内"]),
+        car("X", line="洗罐线北", position=1, target_lines=["存1线"]),
+        car("C", line="存1线", position=1, target_lines=["修3库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=4,
+    )
+    assert "C" in strategic_plan.depot_inbound.ungrouped_nos
+    assert "A" not in strategic_plan.depot_inbound.ungrouped_nos
+    assert "B" not in strategic_plan.depot_inbound.ungrouped_nos
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B,C",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B", "C"),
+        source_lines=("洗油北", "洗罐线北", "存1线"),
+        target_lines=("修1库内", "修2库内", "修3库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundAssemblyRebalanceEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("洗油北"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_depot_inbound_prefix_assembly_session_restores_source_blocker() -> None:
+    cars = [
+        car("X", line="存1线", position=1, target_lines=["存2线"]),
+        car("A", line="存1线", position=2, target_lines=["修1库内"]),
+        car("B", line="存1线", position=3, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("存1线",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundPrefixAssemblySessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "存1线", ("X", "A", "B")),
+        ("Put", "机南", ("A", "B")),
+        ("Put", "存1线", ("X",)),
+    ]
+    assert envelope.resource_request.same_plan_source_return_nos == ("X",)
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+        strategic_plan=strategic_plan,
+    )
+    assert delta.support_gain == 2
+
+
+def test_depot_inbound_route_blocker_digest_clears_serial_blocker_line() -> None:
+    cars = [
+        car("X", line="调梁线北", position=1, target_lines=["洗罐站"]),
+        car("A", line="调梁棚", position=1, target_lines=["修1库内"]),
+        car("B", line="调梁棚", position=2, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("调梁棚",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundRouteBlockerDigestEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机库线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "调梁线北", ("X",)),
+        ("Put", "洗罐站", ("X",)),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机库线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+        strategic_plan=strategic_plan,
+    )
+    assert delta.support_gain == 1
+    assert "serial_line_gate_released" in delta.reduced
+
+
+def test_side_target_completion_lightly_rewards_inner_target_segment_growth() -> None:
+    cars = [
+        car("T", line="存2线", position=1, target_lines=["存2线"]),
+        car("X", line="存2线", position=2, target_lines=["存3线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存2线",
+        target_line="存2线",
+        batch=cars,
+        steps=(
+            physical.plan_step("Get", "存2线", ("T", "X")),
+            physical.plan_step("Put", "存3线", ("X",), {"X": 1}),
+            physical.plan_step("Put", "存2线", ("T",), {"T": 1}),
+        ),
+        reason="test",
+        candidate_kind="test_inner_target_segment",
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:T",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("T",),
+        source_lines=("存2线",),
+        target_lines=("存2线",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelope = CandidateEnvelope(
+        candidate=candidate,
+        contract=contract,
+        intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+        resource_request=ResourceRequest(
+            contract_id=contract.contract_id,
+            family=contract.family,
+            candidate_id=candidate.candidate_id,
+            resources=(),
+            source_line="存2线",
+            target_line="存2线",
+            move_nos=tuple(candidate.move_car_nos),
+            intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+        ),
+        template_name="test_inner_target_segment",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存2线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+    )
+    assert "side_target_completion" in delta.reduced
+    assert "inner_target_segment_extended" in delta.reduced
+    assert delta.support_gain == 1
+
+
+def test_inner_target_segment_allows_north_temporary_prefix_on_non_temporary_line() -> None:
+    cars = [
+        car("N", line="存2线", position=1, target_lines=["存3线"]),
+        car("T", line="存2线", position=2, target_lines=["存2线"]),
+        car("X", line="存2线", position=3, target_lines=["存3线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存2线",
+        target_line="存2线",
+        batch=cars,
+        steps=(
+            physical.plan_step("Get", "存2线", ("N", "T", "X")),
+            physical.plan_step("Put", "存3线", ("X",), {"X": 1}),
+            physical.plan_step("Put", "存2线", ("N", "T"), {"N": 1, "T": 2}),
+        ),
+        reason="test",
+        candidate_kind="test_inner_target_segment",
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:T",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("T",),
+        source_lines=("存2线",),
+        target_lines=("存2线",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelope = CandidateEnvelope(
+        candidate=candidate,
+        contract=contract,
+        intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+        resource_request=ResourceRequest(
+            contract_id=contract.contract_id,
+            family=contract.family,
+            candidate_id=candidate.candidate_id,
+            resources=(),
+            source_line="存2线",
+            target_line="存2线",
+            move_nos=tuple(candidate.move_car_nos),
+            intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+        ),
+        template_name="test_inner_target_segment",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("存2线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(candidate, cars, validation)
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in prospective
+    } == {
+        "N": ("存2线", 1),
+        "T": ("存2线", 2),
+        "X": ("存3线", 1),
+    }
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+    )
+    assert "inner_target_segment_extended" in delta.reduced
+    assert delta.support_gain == 1
+
+
+def test_inner_target_segment_reward_ignores_temporary_lines() -> None:
+    cars = [
+        car("N", line="机南", position=1, target_lines=["机北1"]),
+        car("T", line="机南", position=2, target_lines=["机南"]),
+        car("X", line="机南", position=3, target_lines=["机北1"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="机南",
+        target_line="机南",
+        batch=cars,
+        steps=(
+            physical.plan_step("Get", "机南", ("N", "T", "X")),
+            physical.plan_step("Put", "机北1", ("X",), {"X": 1}),
+            physical.plan_step("Put", "机南", ("N", "T"), {"N": 1, "T": 2}),
+        ),
+        reason="test",
+        candidate_kind="vnext_depot_inbound_assembly_session",
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:T",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("T",),
+        source_lines=("机南",),
+        target_lines=("机南",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelope = CandidateEnvelope(
+        candidate=candidate,
+        contract=contract,
+        intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+        resource_request=ResourceRequest(
+            contract_id=contract.contract_id,
+            family=contract.family,
+            candidate_id=candidate.candidate_id,
+            resources=(),
+            source_line="机南",
+            target_line="机南",
+            move_nos=tuple(candidate.move_car_nos),
+            intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+        ),
+        template_name="test_inner_target_segment",
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        candidate,
+        cars,
+        physical.LocoLocation("机南"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+    )
+    assert "inner_target_segment_extended" not in delta.reduced
+
+
+def test_depot_inbound_mixed_extraction_returns_prefix_to_source() -> None:
+    cars = [
+        car("X", line="存1线", position=1, target_lines=["存2线"]),
+        car("A", line="存1线", position=2, target_lines=["修1库内"]),
+        car("B", line="存1线", position=3, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("存1线",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundMixedExtractionSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 2
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "存1线", ("X", "A", "B")),
+        ("Put", "机南", ("A", "B")),
+        ("Put", "存2线", ("X",)),
+    ]
+    assert envelope.resource_request.same_plan_source_return_nos == ()
+    assert any(item.resource_request.same_plan_source_return_nos == ("X",) for item in envelopes)
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    assert {physical.car_no(car): car["Line"] for car in prospective} == {
+        "X": "存2线",
+        "A": "机南",
+        "B": "机南",
+    }
+
+
+def test_depot_inbound_mixed_extraction_allows_valid_repeated_destinations() -> None:
+    cars = [
+        car("X", line="存1线", position=1, target_lines=["存2线"]),
+        car("Y", line="存1线", position=2, target_lines=["存3线"]),
+        car("Z", line="存1线", position=3, target_lines=["存2线"]),
+        car("A", line="存1线", position=4, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A",),
+        source_lines=("存1线",),
+        target_lines=("修1库内",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundMixedExtractionSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 2
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "存1线", ("X", "Y", "Z", "A")),
+        ("Put", "机南", ("A",)),
+        ("Put", "存2线", ("Z",)),
+        ("Put", "存3线", ("Y",)),
+        ("Put", "存2线", ("X",)),
+    ]
+    assert envelope.resource_request.same_plan_source_return_nos == ()
+    assert any(item.resource_request.same_plan_source_return_nos == ("X", "Y", "Z") for item in envelopes)
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    assert {physical.car_no(car): car["Line"] for car in prospective} == {
+        "X": "存2线",
+        "Y": "存3线",
+        "Z": "存2线",
+        "A": "机南",
+    }
+
+
+def test_depot_inbound_mixed_extraction_keeps_valid_larger_repeated_window() -> None:
+    cars = [
+        car("X", line="存1线", position=1, target_lines=["存2线"]),
+        car("A", line="存1线", position=2, target_lines=["修1库内"]),
+        car("B", line="存1线", position=3, target_lines=["修2库内"]),
+        car("Y", line="存1线", position=4, target_lines=["存2线"]),
+        car("C", line="存1线", position=5, target_lines=["修3库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=3,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B,C",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B", "C"),
+        source_lines=("存1线",),
+        target_lines=("修1库内", "修2库内", "修3库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundMixedExtractionSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存1线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 4
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "存1线", ("X", "A", "B", "Y", "C")),
+        ("Put", "机南", ("C",)),
+        ("Put", "存2线", ("Y",)),
+        ("Put", "机南", ("A", "B")),
+        ("Put", "存2线", ("X",)),
+    ]
+    assert envelope.resource_request.same_plan_source_return_nos == ()
+    assert any(item.resource_request.same_plan_source_return_nos == ("Y", "X") for item in envelopes)
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("存1线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    assert {physical.car_no(car): car["Line"] for car in prospective} == {
+        "X": "存2线",
+        "A": "机南",
+        "B": "机南",
+        "Y": "存2线",
+        "C": "机南",
+    }
+
+
+def test_depot_inbound_mixed_extraction_owner_can_stage_on_jinan() -> None:
+    cars = [
+        car("S", line="存4线", position=1, target_lines=["修3库内"], length=310.0),
+        car("X", line="预修线", position=1, target_lines=["存2线"]),
+        car("A", line="预修线", position=2, target_lines=["修1库内"]),
+        car("B", line="预修线", position=3, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.temporary_line_by_no["A"] == "机南"
+    assert strategic_plan.depot_inbound.temporary_line_by_no["B"] == "机南"
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("预修线",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundMixedExtractionSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("预修线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 2
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "预修线", ("X", "A", "B")),
+        ("Put", "机南", ("A", "B")),
+        ("Put", "存2线", ("X",)),
+    ]
+    assert envelope.resource_request.same_plan_source_return_nos == ()
+    assert any(item.resource_request.same_plan_source_return_nos == ("X",) for item in envelopes)
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("预修线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+
+
+def test_depot_inbound_dirty_cleanout_counts_as_support_gain() -> None:
+    cars = [
+        car("X", line="机走棚", position=1, target_lines=["油漆线"]),
+        car("A", line="预修线", position=1, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.purity_violation_nos == ("X",)
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:X,A",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("X", "A"),
+        source_lines=("机走棚", "预修线"),
+        target_lines=("存4线", "修1库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundDirtyCleanoutEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走棚"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes
+    envelope = envelopes[0]
+    assert envelope.candidate.source_line == "机走棚"
+    assert envelope.candidate.target_line not in physical.DEPOT_INBOUND_ASSEMBLY_LINES
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机走棚"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+        strategic_plan=strategic_plan,
+    )
+    assert delta.support_gain == 1
+
+
+def test_depot_inbound_dirty_cleanout_is_global_support_action() -> None:
+    cars = [
+        car("X", line="机走棚", position=1, target_lines=["油漆线"]),
+        car("A", line="预修线", position=1, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    assert strategic_plan.depot_inbound.purity_violation_nos == ("X",)
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A",),
+        source_lines=("预修线",),
+        target_lines=("修1库内",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundDirtyCleanoutEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走棚"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes
+    assert set(envelopes[0].candidate.move_car_nos) == {"X"}
+
+
+def test_depot_inbound_dirty_cleanout_can_hold_non_depot_origin_cun4_pollution() -> None:
+    cars = [
+        car("X", line="机走棚", position=1, target_lines=["存4线"]),
+        car("A", line="预修线", position=1, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    assert strategic_plan.depot_inbound.purity_violation_nos == ("X",)
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A",),
+        source_lines=("预修线",),
+        target_lines=("修1库内",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundDirtyCleanoutEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走棚"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes
+    envelope = envelopes[0]
+    assert envelope.candidate.source_line == "机走棚"
+    assert envelope.candidate.target_line not in physical.DEPOT_INBOUND_ASSEMBLY_LINES
+    assert envelope.candidate.target_line != "存4线"
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机走棚"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+        strategic_plan=strategic_plan,
+    )
+    assert delta.support_gain == 1
+
+
+def test_depot_inbound_dirty_cleanout_does_not_hold_depot_origin_cun4_outbound() -> None:
+    cars = [
+        car("X", line="机走棚", position=1, target_lines=["存4线"]),
+        car("A", line="预修线", position=1, target_lines=["修1库内"]),
+    ]
+    cars[0]["_InitialLine"] = "修1库内"
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = SimpleNamespace(
+        depot_inbound=SimpleNamespace(
+            purity_violation_nos=("X",),
+            purity_violation_lines=("机走棚",),
+        )
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A",),
+        source_lines=("预修线",),
+        target_lines=("修1库内",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundDirtyCleanoutEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走棚"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_depot_inbound_dirty_exchange_moves_blocker_after_target_line_inbound() -> None:
+    cars = [
+        car("X", line="机走棚", position=1, target_lines=["油漆线"]),
+        car("Y", line="油漆线", position=1, target_lines=["机库线"]),
+        car("Z", line="油漆线", position=2, target_lines=["抛丸线"]),
+        car("A", line="油漆线", position=3, target_lines=["修1库内"]),
+        car("B", line="油漆线", position=4, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("油漆线",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundDirtyExchangeSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走棚"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "机走棚", ("X",)),
+        ("Get", "油漆线", ("Y", "Z", "A", "B")),
+        ("Put", "机南", ("A", "B")),
+        ("Put", "抛丸线", ("Z",)),
+        ("Put", "机库线", ("Y",)),
+        ("Put", "油漆线", ("X",)),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机走棚"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    assert {physical.car_no(car): car["Line"] for car in prospective} == {
+        "X": "油漆线",
+        "Y": "机库线",
+        "Z": "抛丸线",
+        "A": "机南",
+        "B": "机南",
+    }
+
+
+def test_policy_prioritizes_dirty_exchange_that_also_places_inbound_cars() -> None:
+    cars = [
+        car("X", line="机走棚", position=1, target_lines=["油漆线"]),
+        car("A", line="油漆线", position=1, target_lines=["修1库内"]),
+        car("B", line="油漆线", position=2, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("油漆线",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelope = next(
+        iter(
+            DepotInboundDirtyExchangeSessionEpisode().generate(
+                case_id="T",
+                hook_index=1,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                graph=physical.TrackGraph(),
+                loco_location=physical.LocoLocation("机走棚"),
+                serial_gate_leases={},
+                contract=contract,
+                strategic_plan=strategic_plan,
+            )
+        )
+    )
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机走棚"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    candidate = SimpleNamespace(
+        envelope=envelope,
+        prospective_cars=prospective,
+        resource_delta=SimpleNamespace(request=envelope.resource_request),
+    )
+    context = SimpleNamespace(strategic_plan=strategic_plan)
+
+    assert BaselinePolicy().clears_depot_inbound_assembly_line(candidate, context)
+
+
+def test_policy_detects_depot_inbound_put_that_closes_remaining_source_route() -> None:
+    cars = [
+        car("A", line="存3线", position=1, target_lines=["修1库内"]),
+        car("B", line="洗罐线北", position=1, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H1_FRONT_SERVICE,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    prospective = [
+        {**cars[0], "Line": "机走棚", "Position": 1},
+        cars[1],
+    ]
+    candidate = SimpleNamespace(
+        envelope=SimpleNamespace(
+            intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+            candidate=SimpleNamespace(move_car_nos=("A",)),
+        ),
+        prospective_cars=prospective,
+        resource_delta=SimpleNamespace(
+            request=SimpleNamespace(put_lines=("机走棚",)),
+        ),
+    )
+    context = SimpleNamespace(strategic_plan=strategic_plan)
+
+    assert BaselinePolicy().closes_depot_inbound_route_before_complete(candidate, context)
+
+
+def test_depot_inbound_rebalance_can_move_grouped_blocker_for_downstream_contract() -> None:
+    cars = [
+        car("A", line="机走棚", position=1, target_lines=["修1库内"]),
+        car("B", line="洗罐线北", position=1, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H1_FRONT_SERVICE,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert "A" in strategic_plan.depot_inbound.grouped_nos
+    assert "B" in strategic_plan.depot_inbound.ungrouped_nos
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("B",),
+        source_lines=("洗罐线北",),
+        target_lines=("修2库内",),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+
+    envelopes = list(
+        DepotInboundAssemblyRebalanceEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走棚"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+
+    assert envelopes
+    assert envelopes[0].candidate.source_line == "机走棚"
+    assert envelopes[0].candidate.move_car_nos == ("A",)
+
+
+def test_depot_inbound_gate_rejects_direct_depot_put_before_assembly() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    candidate = physical.build_direct_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存1线",
+        target_line="修1库内",
+        batch=cars,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        reason="test",
+        candidate_kind="target_move",
+        planned_positions={"A": 1},
+    )
+    assert candidate is not None
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.REPAIR_INBOUND,
+        candidate_id=candidate.candidate_id,
+        resources=(),
+        source_line="存1线",
+        target_line="修1库内",
+        move_nos=("A",),
+        touched_lines=("存1线", "修1库内"),
+        put_lines=("修1库内",),
+        intent=IntentKind.REMOTE_DEPOT,
+    )
+    decision = AcceptRejectGate().decide(
+        ContractDelta(
+            contract_id="C",
+            family=ContractFamily.REPAIR_INBOUND,
+            before_unsatisfied=1,
+            after_unsatisfied=0,
+            before_contract_debt=1,
+            after_contract_debt=0,
+        ),
+        ResourceDelta(request=request, acquired=(), released_lines=()),
+        strategic_plan=strategic_plan,
+        candidate=candidate,
+    )
+    assert not decision.accepted
+    assert "depot_inbound_release_without_assembly:A:存1线->修1库内" in decision.reason
+
+
+def test_depot_inbound_gate_allows_temporary_non_depot_car_on_assembly_line() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"]),
+        car("X", line="存2线", position=1, target_lines=["油漆线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H1_FRONT_SERVICE,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    candidate = physical.build_direct_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存2线",
+        target_line="机南",
+        batch=[cars[1]],
+        cars=cars,
+        depot_assignment=depot_assignment,
+        reason="temporary_cleanout",
+        candidate_kind="temporary_cleanout",
+        planned_positions={"X": 1},
+    )
+    assert candidate is not None
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(),
+        source_line="存2线",
+        target_line="机南",
+        move_nos=("X",),
+        touched_lines=("存2线", "机南"),
+        put_lines=("机南",),
+        intent=IntentKind.FRONT_PREP,
+    )
+    decision = AcceptRejectGate().decide(
+        ContractDelta(
+            contract_id="C",
+            family=ContractFamily.FUNCTION_LINE_SERVICE,
+            before_unsatisfied=2,
+            after_unsatisfied=1,
+            before_contract_debt=1,
+            after_contract_debt=0,
+        ),
+        ResourceDelta(request=request, acquired=(), released_lines=("存2线",)),
+        strategic_plan=strategic_plan,
+        candidate=candidate,
+    )
+    assert decision.accepted, decision.reason
+
+
+def test_depot_inbound_gate_allows_same_plan_temporary_cun4_staging() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    assert strategic_plan.depot_inbound.temporary_line_by_no == {"A": "机南"}
+    candidate = physical.build_planlet_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存1线",
+        target_line="机南",
+        batch=[cars[0]],
+        steps=(
+            physical.plan_step("Get", "存1线", ("A",)),
+            physical.plan_step("Put", "存4线", ("A",), {"A": 1}),
+            physical.plan_step("Get", "存4线", ("A",)),
+            physical.plan_step("Put", "机南", ("A",), {"A": 1}),
+        ),
+        reason="same_plan_temporary_cun4_staging",
+        candidate_kind="vnext_depot_inbound_assembly_session",
+    )
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.REPAIR_INBOUND,
+        candidate_id=candidate.candidate_id,
+        resources=(),
+        source_line="存1线",
+        target_line="机南",
+        move_nos=("A",),
+        touched_lines=("存1线", "存4线", "机南"),
+        put_lines=("存4线", "机南"),
+        intent=IntentKind.DEPOT_INBOUND_ASSEMBLY,
+    )
+    decision = AcceptRejectGate().decide(
+        ContractDelta(
+            contract_id="C",
+            family=ContractFamily.REPAIR_INBOUND,
+            before_unsatisfied=1,
+            after_unsatisfied=1,
+            before_contract_debt=1,
+            after_contract_debt=1,
+            support_gain=1,
+        ),
+        ResourceDelta(request=request, acquired=(), released_lines=("存1线",)),
+        strategic_plan=strategic_plan,
+        candidate=candidate,
+    )
+    assert decision.accepted, decision.reason
+
+
+@pytest.mark.parametrize(
+    "candidate_kind",
+    ["vnext_depot_outbound_session", "vnext_remote_session_digest", "vnext_front_direct"],
+)
+def test_depot_inbound_gate_rejects_remote_window_pollution_before_release(candidate_kind: str) -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"]),
+        car("X", line="修1库内", position=1, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    candidate = physical.build_direct_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="修1库内",
+        target_line="存4线",
+        batch=[cars[1]],
+        cars=cars,
+        depot_assignment=depot_assignment,
+        reason="test",
+        candidate_kind=candidate_kind,
+        planned_positions={"X": 1},
+    )
+    assert candidate is not None
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.DEPOT_OUTBOUND,
+        candidate_id=candidate.candidate_id,
+        resources=(),
+        source_line="修1库内",
+        target_line="存4线",
+        move_nos=("X",),
+        touched_lines=("修1库内", "存4线"),
+        put_lines=("存4线",),
+        intent=IntentKind.CUN4_OUTBOUND_HOLD,
+    )
+    decision = AcceptRejectGate().decide(
+        ContractDelta(
+            contract_id="C",
+            family=ContractFamily.DEPOT_OUTBOUND,
+            before_unsatisfied=2,
+            after_unsatisfied=1,
+            before_contract_debt=1,
+            after_contract_debt=0,
+        ),
+        ResourceDelta(request=request, acquired=(), released_lines=("修1库内",)),
+        strategic_plan=strategic_plan,
+        candidate=candidate,
+    )
+    assert not decision.accepted
+    assert "depot_inbound_assembly_window_conflict:X:存4线" in decision.reason
+
+
+def test_depot_inbound_gate_allows_post_acceptance_assembly_line_reuse() -> None:
+    cars = [
+        car("A", line="存4线", position=1, target_lines=["卸轮线"]),
+        car("X", line="存2线", position=1, target_lines=["油漆线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    candidate = physical.build_direct_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存2线",
+        target_line="机南",
+        batch=[cars[1]],
+        cars=cars,
+        depot_assignment=depot_assignment,
+        reason="late_pollution",
+        candidate_kind="vnext_front_direct",
+        planned_positions={"X": 1},
+    )
+    assert candidate is not None
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(),
+        source_line="存2线",
+        target_line="机南",
+        move_nos=("X",),
+        touched_lines=("存2线", "机南"),
+        put_lines=("机南",),
+        intent=IntentKind.FRONT_PREP,
+    )
+    decision = AcceptRejectGate().decide(
+        ContractDelta(
+            contract_id="C",
+            family=ContractFamily.FUNCTION_LINE_SERVICE,
+            before_unsatisfied=1,
+            after_unsatisfied=0,
+            before_contract_debt=1,
+            after_contract_debt=0,
+        ),
+        ResourceDelta(request=request, acquired=(), released_lines=("存2线",)),
+        strategic_plan=strategic_plan,
+        candidate=candidate,
+    )
+    assert decision.accepted
+
+
+def test_depot_inbound_gate_allows_cun4_release_group_as_inbound_owner() -> None:
+    cars = [
+        car("A", line="调梁棚", position=1, target_lines=["卸轮线"]),
+        car("B", line="调梁棚", position=2, target_lines=["卸轮线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.temporary_line_by_no == {"A": "存4线", "B": "存4线"}
+    candidate = physical.build_direct_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="调梁棚",
+        target_line="存4线",
+        batch=cars,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        reason="cun4_release_group",
+        candidate_kind="vnext_cun4_release_group_assembly",
+        planned_positions={"A": 1, "B": 2},
+    )
+    assert candidate is not None
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.REPAIR_INBOUND,
+        candidate_id=candidate.candidate_id,
+        resources=(),
+        source_line="调梁棚",
+        target_line="存4线",
+        move_nos=("A", "B"),
+        touched_lines=("调梁棚", "存4线"),
+        put_lines=("存4线",),
+        intent=IntentKind.CUN4_RELEASE_GROUP,
+    )
+    decision = AcceptRejectGate().decide(
+        ContractDelta(
+            contract_id="C",
+            family=ContractFamily.REPAIR_INBOUND,
+            before_unsatisfied=2,
+            after_unsatisfied=2,
+            before_contract_debt=2,
+            after_contract_debt=2,
+            support_gain=2,
+        ),
+        ResourceDelta(request=request, acquired=(), released_lines=("调梁棚",)),
+        strategic_plan=strategic_plan,
+        candidate=candidate,
+    )
+    assert decision.accepted, decision.reason
+
+
+def test_depot_inbound_assembly_plan_treats_unwheel_as_inbound_destination() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["卸轮线"]),
+        car("B", line="机南", position=1, target_lines=["卸轮线"]),
+    ]
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos=set(),
+        depot_outbound_nos=set(),
+    )
+    assert set(plan.inbound_nos) == {"A", "B"}
+    assert plan.grouped_nos == ()
+    assert plan.temporary_line_by_no == {"A": "存4线", "B": "存4线"}
+    assert plan.purity_violation_nos == ()
+
+
+def test_depot_inbound_assembly_plan_keeps_cun4_for_unwheel_only() -> None:
+    cars = [
+        car("A", line="存1线", position=1, target_lines=["修1库内"]),
+        car("B", line="存1线", position=2, target_lines=["卸轮线"]),
+    ]
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos=set(),
+        depot_outbound_nos=set(),
+    )
+    assert plan.temporary_line_by_no["A"] != "存4线"
+    assert plan.temporary_line_by_no["B"] == "存4线"
+
+
+def test_depot_inbound_assembly_plan_keeps_north_source_topology_when_outbound_exists() -> None:
+    cars = [
+        car("A", line="调梁棚", position=1, target_lines=["修4库内"], length=10.0),
+        car("B", line="调梁棚", position=2, target_lines=["修3库内"], length=10.0),
+        car("C", line="预修线", position=1, target_lines=["修1库内"], length=10.0),
+    ]
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos=set(),
+        depot_outbound_nos={"O"},
+    )
+    assert plan.temporary_line_by_no == {
+        "A": "机走棚",
+        "B": "机走棚",
+        "C": "机走棚",
+    }
+
+
+def test_depot_inbound_rebalance_does_not_move_stable_machine_north_group_inward() -> None:
+    cars = [
+        car("A", line="机走北", position=1, target_lines=["修1库内"]),
+        car("B", line="调梁棚", position=1, target_lines=["修3库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert "A" in strategic_plan.depot_inbound.grouped_nos
+    assert "B" in strategic_plan.depot_inbound.ungrouped_nos
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("机走北", "调梁棚"),
+        target_lines=("修1库内", "修3库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+
+    envelopes = list(
+        DepotInboundAssemblyRebalanceEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机走北"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+
+    assert envelopes == []
+
+
+def test_strategic_plan_opens_cun4_after_depot_inbound_acceptance() -> None:
+    cars = [
+        car("A", line="存4线", position=1, target_lines=["修1库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    before_acceptance = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+        depot_inbound_assembly_accepted=False,
+    )
+    assert not before_acceptance.depot_inbound.assembly_complete
+    assert before_acceptance.depot_inbound.temporary_line_by_no["A"] != "存4线"
+    assert not before_acceptance.depot_inbound_assembly_accepted
+
+    after_acceptance = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+        depot_inbound_assembly_accepted=True,
+    )
+    assert after_acceptance.depot_inbound.assembly_complete
+    assert after_acceptance.depot_inbound.temporary_line_by_no == {"A": "存4线"}
+    assert after_acceptance.depot_inbound_assembly_accepted
+
+
+def test_depot_inbound_assembly_plan_opens_lines_after_inbound_is_released() -> None:
+    cars = [
+        car("O", line="存4线", position=1, target_lines=["油漆线"]),
+    ]
+    cars[0]["_InitialLine"] = "修1库内"
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos={"O"},
+        depot_outbound_nos=set(),
+    )
+    assert plan.assembly_complete
+    assert plan.purity_violation_nos == ()
+    assert plan.reason == "no_depot_inbound_assembly_debt"
+
+
+def test_depot_inbound_assembly_plan_exempts_only_cun4_outbound_hold() -> None:
+    cars = [
+        car("I", line="机南", position=1, target_lines=["修1库内"]),
+        car("O", line="存4线", position=1, target_lines=["存4线"]),
+        car("X", line="存4线", position=2, target_lines=["油漆线"]),
+    ]
+    cars[1]["_InitialLine"] = "修1库内"
+    cars[2]["_InitialLine"] = "修2库内"
+    plan = build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        cun4_outbound_hold_nos={"O", "X"},
+        depot_outbound_nos=set(),
+    )
+    assert plan.grouped_nos == ("I",)
+    assert plan.purity_exempt_nos == ("O",)
+    assert plan.purity_violation_nos == ("X",)
+    assert plan.purity_violation_lines == ("存4线",)
+    assert plan.status == "fail"
+
+
+def test_strategic_plan_keeps_cun4_outbound_hold_owner_visible() -> None:
+    cars = [
+        car("I", line="机南", position=1, target_lines=["修1库内"]),
+        car("O", line="存4线", position=1, target_lines=["存4线"]),
+    ]
+    cars[1]["_InitialLine"] = "修1库内"
+    plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    assert plan.cun4_release.mode == "OUTBOUND_HOLD"
+    assert plan.cun4_release.owner == "outbound_assembly"
+    assert plan.cun4_release.outbound_hold_nos == ("O",)
+    assert plan.depot_inbound.purity_exempt_nos == ("O",)
+    assert plan.depot_inbound.purity_violation_nos == ()
+    assert plan.depot_inbound.assembly_complete
+
+
+def test_unlocked_depot_slot_uses_alternate_valid_position_when_preferred_is_occupied() -> None:
+    cars = [
+        car("I", line="存4线", position=1, target_lines=["修1库内"]),
+        car("O", line="修1库内", position=1, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(
+        slots={"I": physical.DepotSlot("修1库内", 1, locked=False)},
+        failures={},
+    )
+    positions = physical.planned_positions_for_batch(
+        batch=[cars[0]],
+        target_line="修1库内",
+        cars=cars,
+        depot_assignment=depot_assignment,
+        batch_nos={"I"},
+    )
+    assert positions == {"I": 2}
+
+
+def test_depot_inbound_assembly_release_runs_after_grouping_complete() -> None:
+    cars = [
+        car("A", line="机南", position=1, target_lines=["修1库内"]),
+        car("B", line="机南", position=2, target_lines=["修2库内"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("机南",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundAssemblyReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机南"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert envelope.candidate.source_line == "机南"
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "机南", ("A", "B")),
+        ("Put", "修2库内", ("B",)),
+        ("Put", "修1库内", ("A",)),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("机南"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    delta = build_contract_delta(
+        envelope,
+        cars=cars,
+        prospective_cars=prospective,
+        depot_assignment=depot_assignment,
+        strategic_plan=strategic_plan,
+    )
+    assert delta.contract_reduction == 2
+
+
+def test_cun4_unwheel_release_clears_unwheel_outbound_before_put() -> None:
+    cars = [
+        car("O", line="卸轮线", position=1, target_lines=["存2线"], length=10.0),
+        car("U1", line="存4线", position=1, target_lines=["卸轮线"], length=10.0),
+        car("U2", line="存4线", position=2, target_lines=["卸轮线"], length=10.0),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=3,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:O,U1,U2",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("O", "U1", "U2"),
+        source_lines=("卸轮线", "存4线"),
+        target_lines=("存2线", "卸轮线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        Cun4UnwheelReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    steps = [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps]
+    assert steps[:2] == [
+        ("Get", "卸轮线", ("O",)),
+        ("Put", "修4库外", ("O",)),
+    ]
+    assert steps[-2:] == [
+        ("Get", "存4线", ("U1", "U2")),
+        ("Put", "卸轮线", ("U1", "U2")),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存4线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelopes[0].candidate, cars, validation)
+    assert {physical.car_no(item): item["Line"] for item in prospective} == {
+        "O": "修4库外",
+        "U1": "卸轮线",
+        "U2": "卸轮线",
+    }
+
+
+def test_depot_inbound_assembly_release_uses_rolling_depot_positions() -> None:
+    depot_targets = ["修1库内", "修2库内", "修3库内", "修4库内"]
+    cars = [
+        car("A", line="机南", position=1, target_lines=depot_targets),
+        car("B", line="机南", position=2, target_lines=depot_targets),
+        car("C", line="机南", position=3, target_lines=depot_targets),
+        car("E1", line="修1库内", position=1, target_lines=depot_targets),
+        car("E2", line="修1库内", position=2, target_lines=depot_targets),
+        car("F", line="修1库内", position=5, target_lines=depot_targets),
+    ]
+    cars[-1]["RepairProcess"] = "厂修"
+    depot_assignment = physical.DepotAssignment(
+        slots={
+            "A": physical.DepotSlot("修1库内", 1, locked=False),
+            "B": physical.DepotSlot("修2库内", 1, locked=False),
+            "C": physical.DepotSlot("修1库内", 2, locked=False),
+            "F": physical.DepotSlot("修1库内", 5, locked=True),
+        },
+        failures={},
+    )
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=3,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B,C",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B", "C"),
+        source_lines=("机南",),
+        target_lines=("修1库内", "修2库内"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotInboundAssemblyReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("机南"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    repair_puts = [
+        step
+        for step in envelopes[0].candidate.plan_steps
+        if step.action == "Put" and step.line == "修1库内"
+    ]
+    assert repair_puts[0].planned_positions == {"C": 3}
+    assert repair_puts[1].planned_positions == {"A": 4}
+
+
+def test_depot_outbound_assembly_plan_orders_non_cun4_before_cun4() -> None:
+    cars = [
+        car("A", line="修1库内", position=1, target_lines=["机走棚"], length=10.0),
+        car("B", line="修1库内", position=2, target_lines=["存4线"], length=10.0),
+    ]
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.pull_order_nos == ("A", "B")
+    assert plan.non_cun4_nos == ("A",)
+    assert plan.cun4_target_nos == ("B",)
+    assert plan.cun4_nos == ("A", "B")
+    assert plan.status == "pass"
+
+
+def test_depot_inbound_release_defers_outer_slot_until_inner_slot_is_clear() -> None:
+    cars = [
+        car("I", line="机走北", position=1, target_lines=["修3库内"]),
+        car("O", line="机南", position=1, target_lines=["修3库外"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:I,O",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("I", "O"),
+        source_lines=("机走北", "机南"),
+        target_lines=("修3库内", "修3库外"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+
+    envelopes = list(
+        DepotInboundAssemblyReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+
+    assert len(envelopes) == 1
+    assert [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps] == [
+        ("Get", "机走北", ("I",)),
+        ("Get", "机南", ("O",)),
+        ("Put", "存4线", ("O",)),
+        ("Put", "修3库内", ("I",)),
+        ("Get", "存4线", ("O",)),
+        ("Put", "修3库外", ("O",)),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelopes[0].candidate,
+        cars,
+        physical.LocoLocation("存4线"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+
+
+def test_depot_outbound_assembly_plan_reports_cun4_capacity_short_without_overflow() -> None:
+    cars = [
+        car(f"H{index}", line="存4线", position=index, target_lines=["存4线"], length=60.0)
+        for index in range(1, 6)
+    ]
+    cars.extend(
+        [
+            car("A", line="修1库内", position=1, target_lines=["机走棚"], length=14.3),
+            car("B", line="修1库内", position=2, target_lines=["存4线"], length=14.3),
+        ]
+    )
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.pull_order_nos == ("A", "B")
+    assert plan.cun4_nos == ("A", "B")
+    assert plan.overflow_nos == ()
+    assert plan.status == "fail"
+    assert plan.reason == "cun4_capacity_insufficient_for_depot_outbound"
+
+
+def test_depot_outbound_assembly_plan_reports_source_order_when_cun4_target_is_north() -> None:
+    cars = [
+        car("B", line="修1库内", position=1, target_lines=["存4线"], length=10.0),
+        car("A", line="修1库内", position=2, target_lines=["油漆线"], length=10.0),
+    ]
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.cun4_prefix_unsafe_nos == ("A",)
+    assert plan.cun4_nos == ("B", "A")
+    assert plan.overflow_nos == ()
+    assert plan.status == "warn"
+    assert plan.reason == "cun4_target_suffix_requires_source_repack"
+
+
+def test_depot_outbound_assembly_plan_uses_cun4_even_when_cun4_target_cars_are_already_south() -> None:
+    cars = [
+        car("H", line="存4线", position=1, target_lines=["存4线"], length=10.0),
+        car("A", line="修1库内", position=1, target_lines=["油漆线"], length=10.0),
+    ]
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.cun4_reserved_by_outbound_hold_nos == ()
+    assert plan.cun4_nos == ("A",)
+    assert plan.overflow_nos == ()
+    assert plan.temporary_line_by_no["A"] == "存4线"
+
+
+def test_depot_outbound_assembly_plan_ignores_cars_not_initially_in_depot() -> None:
+    inbound = car("I", line="修1库内", position=1, target_lines=["油漆线"], length=10.0)
+    inbound["_InitialLine"] = "存4线"
+    depot = car("D", line="修2库内", position=1, target_lines=["机走棚"], length=10.0)
+    plan = build_depot_outbound_assembly_plan(
+        cars=[inbound, depot],
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.outbound_nos == ("D",)
+    assert plan.temporary_line_by_no == {"D": "存4线"}
+
+
+def test_depot_outbound_assembly_plan_includes_outer_route_blocker() -> None:
+    cars = [
+        car("B", line="修1库外", position=1, target_lines=["存4线"], length=10.0),
+        car("A", line="修1库内", position=1, target_lines=["油漆线"], length=10.0),
+    ]
+    cars[0]["_InitialLine"] = "存1线"
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.outbound_nos == ("A",)
+    assert plan.route_blocker_nos == ("B",)
+    assert plan.pull_order_nos == ("B", "A")
+    assert plan.cun4_nos == ("B", "A")
+    assert plan.temporary_line_by_no == {"B": "存4线", "A": "存4线"}
+
+
+def test_depot_outbound_assembly_plan_includes_unwheel_outer_route_blocker() -> None:
+    cars = [
+        car("B", line="修1库外", position=1, target_lines=["卸轮线"], length=10.0),
+        car("A", line="修1库内", position=1, target_lines=["存4线"], length=10.0),
+    ]
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.outbound_nos == ("A",)
+    assert plan.route_blocker_nos == ("B",)
+    assert plan.pull_order_nos == ("B", "A")
+    assert plan.temporary_line_by_no == {"B": "存4线", "A": "存4线"}
+
+
+def test_depot_outbound_assembly_plan_includes_interleaved_unwheel_source_blocker() -> None:
+    cars = [
+        car("A", line="修1库内", position=1, target_lines=["存4线"], length=10.0),
+        car("B", line="修1库内", position=2, target_lines=["卸轮线"], length=10.0),
+        car("C", line="修1库内", position=3, target_lines=["存4线"], length=10.0),
+    ]
+    plan = build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+    )
+    assert plan.outbound_nos == ("A", "B", "C")
+    assert plan.route_blocker_nos == ()
+    assert plan.pull_order_nos == ("A", "B", "C")
+    assert plan.temporary_line_by_no == {"A": "存4线", "B": "存4线", "C": "存4线"}
+
+
+def test_depot_outbound_session_waits_for_cun4_inbound_release() -> None:
+    cars = [
+        car("A", line="存4线", position=1, target_lines=["卸轮线"]),
+        car("O", line="修1库内", position=1, target_lines=["油漆线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    assert strategic_plan.cun4_release.release_nos == ("A",)
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,O",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "O"),
+        source_lines=("存4线", "修1库内"),
+        target_lines=("修1库内", "油漆线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotOutboundSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_depot_outbound_session_pulls_initial_depot_outbound_to_cun4() -> None:
+    cars = [
+        car("A", line="修1库内", position=1, target_lines=["油漆线"]),
+        car("B", line="修2库内", position=1, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    assert strategic_plan.cun4_release.release_nos == ()
+    assert strategic_plan.depot_outbound.temporary_line_by_no == {"A": "存4线", "B": "存4线"}
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("修1库内", "修2库内"),
+        target_lines=("油漆线", "存4线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotOutboundSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("修1库内"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    assert [(step.action, step.line, step.move_car_nos) for step in envelope.candidate.plan_steps] == [
+        ("Get", "修1库内", ("A",)),
+        ("Get", "修2库内", ("B",)),
+        ("Put", "存4线", ("A", "B")),
+    ]
+    validation = physical.validate_candidate(
+        physical.TrackGraph(),
+        envelope.candidate,
+        cars,
+        physical.LocoLocation("修1库内"),
+        depot_assignment,
+    )
+    assert validation.accepted, validation.reasons
+    prospective = simulate_candidate(envelope.candidate, cars, validation)
+    assert {
+        physical.car_no(item): (item["Line"], item["Position"])
+        for item in prospective
+    } == {
+        "A": ("存4线", 1),
+        "B": ("存4线", 2),
+    }
+
+
+def test_depot_outbound_session_uses_full_plan_for_depot_outbound_contract() -> None:
+    cars = [
+        car("A", line="修1库内", position=1, target_lines=["存4线"]),
+        car("B", line="修2库内", position=1, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=2,
+    )
+    contract = FlowContract(
+        contract_id="DEPOT_OUTBOUND:修1库内->存4线:A",
+        family=ContractFamily.DEPOT_OUTBOUND,
+        subject_nos=("A",),
+        source_lines=("修1库内",),
+        target_lines=("存4线",),
+        priority=1,
+        obligations=("remote_depot_debt",),
+    )
+    envelopes = list(
+        DepotOutboundSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("修1库内"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert len(envelopes) == 1
+    assert [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps] == [
+        ("Get", "修1库内", ("A",)),
+        ("Get", "修2库内", ("B",)),
+        ("Put", "存4线", ("A", "B")),
+    ]
+
+
+def test_depot_outbound_session_requires_complete_cun4_plan() -> None:
+    cars = [
+        car("A", line="修1库内", position=1, target_lines=["油漆线"]),
+        car("B", line="修2库内", position=1, target_lines=["机走棚"]),
+        car("C", line="修3库内", position=1, target_lines=["存2线"]),
+        car("X", line="修4库内", position=1, target_lines=["存3线"]),
+        car("D", line="修4库内", position=2, target_lines=["油漆线"]),
+    ]
+    cars[3]["_InitialLine"] = "存1线"
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=4,
+    )
+    assert strategic_plan.cun4_release.release_nos == ()
+    assert strategic_plan.depot_outbound.pull_order_nos == ("A", "B", "C", "X", "D")
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B,C,D",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B", "C", "D"),
+        source_lines=("修1库内", "修2库内", "修3库内", "修4库内"),
+        target_lines=("油漆线", "机走棚", "存2线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotOutboundSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("修1库内"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_depot_cun4_exchange_does_not_take_unwheel_release_port() -> None:
+    cars = [
+        car("I1", line="存4线", position=1, target_lines=["卸轮线"], length=10.0),
+        car("I2", line="存4线", position=2, target_lines=["卸轮线"], length=10.0),
+        car("O1", line="修1库内", position=1, target_lines=["油漆线"], length=10.0),
+        car("O2", line="修2库内", position=1, target_lines=["存4线"], length=10.0),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=4,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    assert strategic_plan.cun4_release.release_nos == ("I1", "I2")
+    assert strategic_plan.depot_outbound.pull_order_nos == ("O1", "O2")
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:I1,I2,O1,O2",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("I1", "I2", "O1", "O2"),
+        source_lines=("存4线", "修1库内", "修2库内"),
+        target_lines=("卸轮线", "油漆线", "存4线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotCun4InboundOutboundExchangeEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("修1库内"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_depot_cun4_source_repack_exchange_does_not_take_unwheel_release_port() -> None:
+    cars = [
+        car("I1", line="存4线", position=1, target_lines=["卸轮线"], length=10.0),
+        car("I2", line="存4线", position=2, target_lines=["卸轮线"], length=10.0),
+        car("C", line="修1库内", position=1, target_lines=["存4线"], length=10.0),
+        car("A", line="修2库内", position=1, target_lines=["存4线"], length=10.0),
+        car("B", line="修2库内", position=2, target_lines=["油漆线"], length=10.0),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(active=True),
+        remote_debt=5,
+    )
+    assert strategic_plan.depot_inbound.assembly_complete
+    assert strategic_plan.cun4_release.release_nos == ("I1", "I2")
+    assert strategic_plan.depot_outbound.pull_order_nos == ("C", "A", "B")
+    assert strategic_plan.depot_outbound.cun4_prefix_unsafe_nos == ("B",)
+    assert strategic_plan.depot_outbound.status == "warn"
+    assert strategic_plan.depot_outbound.reason == "cun4_target_suffix_requires_source_repack"
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:I1,I2,A,B,C",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("I1", "I2", "A", "B", "C"),
+        source_lines=("存4线", "修1库内", "修2库内"),
+        target_lines=("卸轮线", "油漆线", "存4线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotCun4SourceRepackExchangeEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("修1库内"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_front_topology_plan_vetoes_remote_candidate_inside_h1() -> None:
+    cars = [
+        car("F", line="油漆线", position=1, target_lines=["存1线"]),
+        car("R", line="修1库内", position=1, target_lines=["存4线"]),
+    ]
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H1_FRONT_SERVICE,
+        cars=cars,
+        depot_assignment=physical.DepotAssignment(slots={}, failures={}),
+        remote_session=RemoteSessionState(),
+        remote_debt=1,
+    )
+    assert strategic_plan.front_topology.must_finish_before_remote
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.DEPOT_OUTBOUND,
+        candidate_id="candidate",
+        resources=(),
+        source_line="修1库内",
+        target_line="存4线",
+        move_nos=("R",),
+        touched_lines=("修1库内", "存4线"),
+        put_lines=("存4线",),
+        intent=IntentKind.CUN4_OUTBOUND_HOLD,
+    )
+    contract = FlowContract(
+        contract_id="C",
+        family=ContractFamily.DEPOT_OUTBOUND,
+        subject_nos=("R",),
+        source_lines=("修1库内",),
+        target_lines=("存4线",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    permission = HumanPhaseGate().permission(
+        phase_state=PhaseState(
+            phase=PhaseKind.H1_FRONT_SERVICE,
+            front_debt=1,
+            cun4_port_debt=0,
+            remote_debt=1,
+            closeout_debt=0,
+            reason="test",
+            front_topology_clear_for_remote=False,
+        ),
+        envelope=CandidateEnvelope(
+            candidate=object(),
+            contract=contract,
+            intent=IntentKind.CUN4_OUTBOUND_HOLD,
+            resource_request=request,
+            template_name="depot_outbound_session",
+        ),
+        contract_delta=ContractDelta(
+            contract_id="C",
+            family=ContractFamily.DEPOT_OUTBOUND,
+            before_unsatisfied=1,
+            after_unsatisfied=0,
+            before_contract_debt=1,
+            after_contract_debt=0,
+        ),
+        resource_delta=ResourceDelta(request=request, acquired=(), released_lines=()),
+        remote_session=RemoteSessionState(),
+    )
+    assert not permission.allowed
+    assert permission.reason == "h1_front_topology_requires_service_before_remote"
+
+
+def test_depot_outbound_session_does_not_split_to_overflow_when_cun4_is_short() -> None:
+    cars = [
+        *[
+            car(f"H{index}", line="存4线", position=index, target_lines=["存4线"], length=60.0)
+            for index in range(1, 6)
+        ],
+        car("A", line="修1库内", position=1, target_lines=["机走棚"], length=14.3),
+        car("B", line="修1库内", position=2, target_lines=["存4线"], length=14.3),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    strategic_plan = build_strategic_plan(
+        phase=PhaseKind.H4_REMOTE_DEPOT,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        remote_session=RemoteSessionState(),
+        remote_debt=2,
+    )
+    assert strategic_plan.depot_outbound.status == "fail"
+    assert strategic_plan.depot_outbound.reason == "cun4_capacity_insufficient_for_depot_outbound"
+    assert strategic_plan.depot_outbound.temporary_line_by_no["A"] == "存4线"
+    assert strategic_plan.depot_outbound.temporary_line_by_no["B"] == "存4线"
+    contract = FlowContract(
+        contract_id="REMOTE_SESSION:A,B",
+        family=ContractFamily.REMOTE_SESSION,
+        subject_nos=("A", "B"),
+        source_lines=("修1库内",),
+        target_lines=("机走棚", "存4线"),
+        priority=1,
+        obligations=("remote_session_debt",),
+    )
+    envelopes = list(
+        DepotOutboundSessionEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("修1库内"),
+            serial_gate_leases={},
+            contract=contract,
+            strategic_plan=strategic_plan,
+        )
+    )
+    assert envelopes == []
+
+
+def test_cun4_outbound_assembly_release_moves_only_non_cun4_prefix() -> None:
+    cars = [
+        car("A", line="存4线", position=1, target_lines=["机走棚"]),
+        car("B", line="存4线", position=2, target_lines=["存4线"]),
+    ]
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    contract = FlowContract(
+        contract_id="LOCO_AREA_STAGING:存4线->机走棚:A",
+        family=ContractFamily.LOCO_AREA_STAGING,
+        subject_nos=("A",),
+        source_lines=("存4线",),
+        target_lines=("机走棚",),
+        priority=1,
+        obligations=("move_to_target",),
+    )
+    envelopes = list(
+        Cun4OutboundAssemblyReleaseEpisode().generate(
+            case_id="T",
+            hook_index=1,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=physical.TrackGraph(),
+            loco_location=physical.LocoLocation("存4线"),
+            serial_gate_leases={},
+            contract=contract,
+        )
+    )
+    assert len(envelopes) == 1
+    assert envelopes[0].candidate.source_line == "存4线"
+    assert envelopes[0].candidate.target_line == "机走棚"
+    assert envelopes[0].candidate.move_car_nos == ("A",)
+
+
+def test_depot_outbound_overflow_release_is_not_in_default_episode_order() -> None:
+    assert "depot_outbound_overflow_release" not in {episode.template_name for episode in EPISODES}
 
 
 if __name__ == "__main__":

@@ -5,7 +5,10 @@ from inspect import signature
 from pathlib import Path
 from typing import Any
 
+from . import depot_inbound_plan
+from . import depot_outbound_plan
 from . import physical
+from . import release
 from .connection import ConnectionMetricRecord
 from .connection import records_for_selected as connection_records_for_selected
 from .contracts import build_contracts
@@ -17,7 +20,7 @@ from .diagnostics import (
     build_structure_node_record,
 )
 from .delta import build_contract_delta, simulate_candidate
-from .domain import CaseResult, CandidateEnvelope, RemoteSessionState, ResourceDelta, SolverState, StepTrace
+from .domain import CaseResult, CandidateEnvelope, IntentKind, RemoteSessionState, ResourceDelta, SolverState, StepTrace
 from .episodes import EPISODES
 from .flow import FlowEdgeRecord, build_flow_edge_records
 from .frontier import AccessFrontier, AccessFrontierRecord
@@ -45,6 +48,7 @@ def _generate_episode_candidates(
     loco_location: Any,
     serial_gate_leases: dict[str, Any],
     contract: Any,
+    strategic_plan: Any,
 ) -> Any:
     kwargs = {
         "case_id": case_id,
@@ -56,6 +60,8 @@ def _generate_episode_candidates(
         "serial_gate_leases": serial_gate_leases,
         "contract": contract,
     }
+    if "strategic_plan" in signature(episode.generate).parameters:
+        kwargs["strategic_plan"] = strategic_plan
     return episode.generate(**kwargs)
 
 
@@ -67,6 +73,28 @@ def _remote_unsatisfied_count(cars: list[dict[str, Any]], depot_assignment: Any)
         if car["Line"] in physical.REMOTE_INTERACTION_LINES or target_line in physical.REMOTE_INTERACTION_LINES:
             count += 1
     return count
+
+
+def _strict_depot_inbound_assembly_complete(cars: list[dict[str, Any]], depot_assignment: Any) -> bool:
+    cun4_state = release.cun4_port_state(cars=cars, depot_assignment=depot_assignment)
+    depot_outbound = depot_outbound_plan.build_depot_outbound_assembly_plan(
+        cars=cars,
+        depot_assignment=depot_assignment,
+        cun4_released_nos=set(cun4_state.release_nos),
+    )
+    cun4_outbound_hold_nos = set(cun4_state.outbound_hold_nos) | {
+        no
+        for no, line in depot_outbound.temporary_line_by_no.items()
+        if line == "存4线"
+    }
+    plan = depot_inbound_plan.build_depot_inbound_assembly_plan(
+        cars=cars,
+        depot_assignment=depot_assignment,
+        cun4_outbound_hold_nos=cun4_outbound_hold_nos,
+        depot_outbound_nos=set(depot_outbound.outbound_nos),
+        strict_cun4_unwheel_only=True,
+    )
+    return plan.assembly_complete
 
 
 def _trace_row(
@@ -173,6 +201,10 @@ class VNextSolver:
     ]:
         case_id, _payload, cars, depot_assignment, loco_location = physical.read_case(truth_path)
         state = SolverState(case_id=case_id, cars=cars, depot_assignment=depot_assignment, loco_location=loco_location)
+        state.depot_inbound_assembly_accepted = _strict_depot_inbound_assembly_complete(
+            state.cars,
+            state.depot_assignment,
+        )
         state.visited_signatures.add(physical.state_signature(state.cars, state.loco_location))
         initial_unsatisfied = len(physical.unsatisfied_cars(state.cars, state.depot_assignment))
         traces: list[StepTrace] = []
@@ -214,6 +246,7 @@ class VNextSolver:
                     remote_session=raw_policy_context.remote_session,
                     remote_open=phase_code == "H4",
                     last_business_remote=raw_policy_context.last_business_remote,
+                    strategic_plan=replace(raw_policy_context.strategic_plan, phase=phase_state.phase),
                 )
 
             policy_context = context_for_phase(current_phase)
@@ -233,6 +266,7 @@ class VNextSolver:
                     cars=state.cars,
                     depot_assignment=state.depot_assignment,
                     serial_gate_leases=state.serial_gate_leases,
+                    strategic_plan=policy_context.strategic_plan,
                 )
             )
             if self.trace_frontier:
@@ -275,6 +309,7 @@ class VNextSolver:
                             loco_location=state.loco_location,
                             serial_gate_leases=state.serial_gate_leases,
                             contract=contract,
+                            strategic_plan=policy_context.strategic_plan,
                         ):
                             generated_count += 1
                             stats.generated()
@@ -341,8 +376,14 @@ class VNextSolver:
                                 cars=state.cars,
                                 prospective_cars=prospective,
                                 depot_assignment=state.depot_assignment,
+                                strategic_plan=policy_context.strategic_plan,
                             )
-                            decision = self.gate.decide(contract_delta, resource_delta)
+                            decision = self.gate.decide(
+                                contract_delta,
+                                resource_delta,
+                                strategic_plan=policy_context.strategic_plan,
+                                candidate=envelope.candidate,
+                            )
                             if decision.accepted and prospective_signature in state.visited_signatures:
                                 decision = self.gate.loop_reject(contract_delta, resource_delta)
                             gate_accepted = decision.accepted
@@ -606,6 +647,11 @@ class VNextSolver:
             )
             state.cars = prospective
             state.loco_location = next_loco_location
+            if not state.depot_inbound_assembly_accepted:
+                state.depot_inbound_assembly_accepted = _strict_depot_inbound_assembly_complete(
+                    state.cars,
+                    state.depot_assignment,
+                )
             state.visited_signatures.add(prospective_signature)
             touched_remote = any(
                 line in physical.REMOTE_INTERACTION_LINES
@@ -724,7 +770,11 @@ class VNextSolver:
             and (
                 current_state.active
                 or touched_remote
-                or (phase_permission.allowed and phase_permission.target_phase in {"H3", "H4"})
+                or (
+                    phase_permission.allowed
+                    and phase_permission.target_phase in {"H3", "H4"}
+                    and selected.envelope.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY
+                )
                 or self.policy.opens_remote_session(selected)
             )
         )
@@ -895,11 +945,16 @@ def _structure_acceptance_rows(
         )
     )
     for structure in (
+        "FRONT_TOPOLOGY_PLAN",
         "CUN4_NORTH_BUFFER",
         "CUN4_NORTH_BUFFER_DELTA",
+        "CUN4_RELEASE_PORT_PLAN",
         "DEPOT_SLOT_GRAPH",
         "DEPOT_SLOT_DELTA",
         "DEPOT_SWAP_DELTA",
+        "DEPOT_OUTBOUND_ASSEMBLY_PLAN",
+        "REMOTE_SESSION_CONTINUITY_PLAN",
+        "PHASE_COMPLETION_PLAN",
         "SERIAL_GATE_LEASE",
         "SERIAL_GATE_LEASE_LIFECYCLE",
         "LOCO_CARRY_STATE",
@@ -936,6 +991,7 @@ def _candidate_structure_acceptance_rows(
     phase_records: list[PhaseGateRecord],
 ) -> list[dict[str, Any]]:
     expected_templates = {
+        "depot_cun4_inbound_outbound_exchange",
         "depot_outbound_session",
         "depot_slot_swap",
         "direct_accessible_prefix",
