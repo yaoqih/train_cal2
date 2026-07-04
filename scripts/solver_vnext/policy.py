@@ -62,14 +62,18 @@ class BaselinePolicy:
             cun4_prefix_hold_count=flow_facts.cun4_prefix_hold_count,
             active_variant=flow_facts.active_variant,
         )
-        plan = strategic.build_strategic_plan(
-            phase=phase_state.phase,
-            cars=state.cars,
-            depot_assignment=state.depot_assignment,
-            remote_session=state.remote_session,
-            remote_debt=flow_facts.remote_debt,
-            depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
-        )
+
+        def build_plan(phase: PhaseKind) -> strategic.StrategicPlan:
+            return strategic.build_strategic_plan(
+                phase=phase,
+                cars=state.cars,
+                depot_assignment=state.depot_assignment,
+                remote_session=state.remote_session,
+                remote_debt=flow_facts.remote_debt,
+                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
+            )
+
+        plan = build_plan(phase_state.phase)
         if (
             not state.remote_session.active
             and plan.depot_inbound_assembly_accepted
@@ -81,14 +85,7 @@ class BaselinePolicy:
                 phase=PhaseKind.H4_REMOTE_DEPOT,
                 reason="depot_outbound_after_inbound_assembly_accepted",
             )
-            plan = strategic.build_strategic_plan(
-                phase=phase_state.phase,
-                cars=state.cars,
-                depot_assignment=state.depot_assignment,
-                remote_session=state.remote_session,
-                remote_debt=flow_facts.remote_debt,
-                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
-            )
+            plan = build_plan(phase_state.phase)
         elif (
             not state.remote_session.active
             and plan.depot_inbound_assembly_accepted
@@ -100,14 +97,7 @@ class BaselinePolicy:
                 phase=PhaseKind.H4_REMOTE_DEPOT,
                 reason="depot_inbound_release_after_assembly_accepted",
             )
-            plan = strategic.build_strategic_plan(
-                phase=phase_state.phase,
-                cars=state.cars,
-                depot_assignment=state.depot_assignment,
-                remote_session=state.remote_session,
-                remote_debt=flow_facts.remote_debt,
-                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
-            )
+            plan = build_plan(phase_state.phase)
         elif (
             not state.remote_session.active
             and not plan.depot_inbound_assembly_accepted
@@ -119,14 +109,7 @@ class BaselinePolicy:
                 phase=PhaseKind.H1_FRONT_SERVICE,
                 reason=f"front_topology_priority_before_remote:{','.join(plan.front_topology.priority_lines)}",
             )
-            plan = strategic.build_strategic_plan(
-                phase=phase_state.phase,
-                cars=state.cars,
-                depot_assignment=state.depot_assignment,
-                remote_session=state.remote_session,
-                remote_debt=flow_facts.remote_debt,
-                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
-            )
+            plan = build_plan(phase_state.phase)
         elif (
             not state.remote_session.active
             and flow_facts.remote_debt
@@ -140,14 +123,7 @@ class BaselinePolicy:
                 phase=PhaseKind.H4_REMOTE_DEPOT,
                 reason="front_topology_clear_depot_inbound_priority",
             )
-            plan = strategic.build_strategic_plan(
-                phase=phase_state.phase,
-                cars=state.cars,
-                depot_assignment=state.depot_assignment,
-                remote_session=state.remote_session,
-                remote_debt=flow_facts.remote_debt,
-                depot_inbound_assembly_accepted=state.depot_inbound_assembly_accepted,
-            )
+            plan = build_plan(phase_state.phase)
         phase_state = replace(
             phase_state,
             front_topology_clear_for_remote=plan.front_topology.clear_for_remote,

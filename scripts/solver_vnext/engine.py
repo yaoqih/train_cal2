@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from inspect import signature
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,17 @@ from .diagnostics import (
     build_structure_node_record,
 )
 from .delta import build_contract_delta, simulate_candidate
-from .domain import CaseResult, CandidateEnvelope, IntentKind, RemoteSessionState, ResourceDelta, SolverState, StepTrace
+from .domain import (
+    CaseResult,
+    CandidateEnvelope,
+    FlowContract,
+    IntentKind,
+    PhaseState,
+    RemoteSessionState,
+    ResourceDelta,
+    SolverState,
+    StepTrace,
+)
 from .episodes import EPISODES
 from .flow import FlowEdgeRecord, build_flow_edge_records
 from .frontier import AccessFrontier, AccessFrontierRecord
@@ -35,34 +44,6 @@ from .resource_structures import (
 )
 from .resources import StationResourceGraph
 from .staging import StagingIntentBuilder, StagingIntentRecord
-
-
-def _generate_episode_candidates(
-    *,
-    episode: Any,
-    case_id: str,
-    hook_index: int,
-    cars: list[dict[str, Any]],
-    depot_assignment: Any,
-    graph: Any,
-    loco_location: Any,
-    serial_gate_leases: dict[str, Any],
-    contract: Any,
-    strategic_plan: Any,
-) -> Any:
-    kwargs = {
-        "case_id": case_id,
-        "hook_index": hook_index,
-        "cars": cars,
-        "depot_assignment": depot_assignment,
-        "graph": graph,
-        "loco_location": loco_location,
-        "serial_gate_leases": serial_gate_leases,
-        "contract": contract,
-    }
-    if "strategic_plan" in signature(episode.generate).parameters:
-        kwargs["strategic_plan"] = strategic_plan
-    return episode.generate(**kwargs)
 
 
 def _remote_unsatisfied_count(cars: list[dict[str, Any]], depot_assignment: Any) -> int:
@@ -182,6 +163,173 @@ class VNextSolver:
         self.staging = StagingIntentBuilder()
         self.policy = BaselinePolicy()
 
+    def _context_for_phase_code(self, raw_policy_context: PolicyContext, phase_code: str) -> PolicyContext:
+        phase_state = replace(
+            raw_policy_context.phase_state,
+            phase=self.phase_gate.phase_kind(phase_code),
+        )
+        return PolicyContext(
+            phase_state=phase_state,
+            remote_session=raw_policy_context.remote_session,
+            remote_open=phase_code == "H4",
+            last_business_remote=raw_policy_context.last_business_remote,
+            strategic_plan=replace(raw_policy_context.strategic_plan, phase=phase_state.phase),
+        )
+
+    def _evaluate_episode_round(
+        self,
+        *,
+        episodes: tuple[Any, ...],
+        contracts: list[FlowContract],
+        state: SolverState,
+        policy_context: PolicyContext,
+        active_phase_state: PhaseState,
+        traces: list[StepTrace],
+    ) -> tuple[EvaluatedCandidate | None, int, int, CandidateRoundStats]:
+        selected_candidate: EvaluatedCandidate | None = None
+        rejected_count = 0
+        generated_count = 0
+        stats = CandidateRoundStats()
+        validation_cache: dict[str, Any] = {}
+        prospective_cache: dict[
+            str,
+            tuple[list[dict[str, Any]], Any, tuple[str, str, tuple[tuple[str, str, int], ...]]],
+        ] = {}
+        for contract in contracts:
+            for episode in episodes:
+                if not episode.applies(contract):
+                    continue
+                for envelope in episode.generate(
+                    case_id=state.case_id,
+                    hook_index=state.hook_index,
+                    cars=state.cars,
+                    depot_assignment=state.depot_assignment,
+                    graph=self.graph,
+                    loco_location=state.loco_location,
+                    serial_gate_leases=state.serial_gate_leases,
+                    contract=contract,
+                    strategic_plan=policy_context.strategic_plan,
+                ):
+                    generated_count += 1
+                    stats.generated()
+                    resource_request = self.resources.request_for(envelope)
+                    envelope = CandidateEnvelope(
+                        candidate=envelope.candidate,
+                        contract=envelope.contract,
+                        intent=envelope.intent,
+                        resource_request=resource_request,
+                        template_name=envelope.template_name,
+                    )
+                    validation = validation_cache.get(envelope.candidate.candidate_id)
+                    if validation is None:
+                        validation = physical.validate_candidate(
+                            self.graph,
+                            envelope.candidate,
+                            state.cars,
+                            state.loco_location,
+                            state.depot_assignment,
+                        )
+                        validation_cache[envelope.candidate.candidate_id] = validation
+                    if validation.reasons:
+                        resource_delta = ResourceDelta(
+                            request=resource_request,
+                            acquired=(),
+                            released_lines=(),
+                            violations=tuple(f"physical:{reason}" for reason in validation.reasons),
+                        )
+                        if self.trace_all_candidates:
+                            traces.append(
+                                _trace_row(
+                                    state=state,
+                                    policy_context=policy_context,
+                                    envelope=envelope,
+                                    gate_accepted=False,
+                                    selected=False,
+                                    gate_reason="physical_reject",
+                                    physical_reasons=tuple(validation.reasons),
+                                    contract_delta=None,
+                                    resource_delta=resource_delta,
+                                )
+                            )
+                        rejected_count += 1
+                        stats.rejected("physical_reject")
+                        continue
+                    resource_delta = self.resources.acquire(
+                        resource_request,
+                        candidate=envelope.candidate,
+                        validation=validation,
+                        cars=state.cars,
+                        depot_assignment=state.depot_assignment,
+                        serial_gate_leases=state.serial_gate_leases,
+                    )
+                    cached_prospective = prospective_cache.get(envelope.candidate.candidate_id)
+                    if cached_prospective is None:
+                        prospective = simulate_candidate(envelope.candidate, state.cars, validation)
+                        next_loco_location = physical.next_loco_location(envelope.candidate, validation)
+                        prospective_signature = physical.state_signature(prospective, next_loco_location)
+                        cached_prospective = (prospective, next_loco_location, prospective_signature)
+                        prospective_cache[envelope.candidate.candidate_id] = cached_prospective
+                    prospective, next_loco_location, prospective_signature = cached_prospective
+                    contract_delta = build_contract_delta(
+                        envelope,
+                        cars=state.cars,
+                        prospective_cars=prospective,
+                        depot_assignment=state.depot_assignment,
+                        strategic_plan=policy_context.strategic_plan,
+                    )
+                    decision = self.gate.decide(
+                        contract_delta,
+                        resource_delta,
+                        strategic_plan=policy_context.strategic_plan,
+                        candidate=envelope.candidate,
+                    )
+                    if decision.accepted and prospective_signature in state.visited_signatures:
+                        decision = self.gate.loop_reject(contract_delta, resource_delta)
+                    gate_accepted = decision.accepted
+                    gate_reason = decision.reason
+                    if gate_accepted:
+                        phase_permission = self.phase_gate.permission(
+                            phase_state=active_phase_state,
+                            envelope=envelope,
+                            contract_delta=contract_delta,
+                            resource_delta=resource_delta,
+                            remote_session=policy_context.remote_session,
+                        )
+                        if not phase_permission.allowed:
+                            gate_accepted = False
+                            gate_reason = f"phase_veto:{phase_permission.reason}"
+                    if self.trace_all_candidates:
+                        traces.append(
+                            _trace_row(
+                                state=state,
+                                policy_context=policy_context,
+                                envelope=envelope,
+                                gate_accepted=gate_accepted,
+                                selected=False,
+                                gate_reason=gate_reason,
+                                physical_reasons=(),
+                                contract_delta=contract_delta,
+                                resource_delta=resource_delta,
+                            )
+                        )
+                    if not gate_accepted:
+                        rejected_count += 1
+                        stats.rejected(gate_reason)
+                        continue
+                    stats.accepted()
+                    evaluated = EvaluatedCandidate(
+                        envelope=envelope,
+                        validation=validation,
+                        prospective_cars=prospective,
+                        contract_delta=contract_delta,
+                        resource_delta=resource_delta,
+                        next_loco_location=next_loco_location,
+                        prospective_signature=prospective_signature,
+                    )
+                    if self.policy.better(evaluated, selected_candidate, policy_context):
+                        selected_candidate = evaluated
+        return selected_candidate, generated_count, rejected_count, stats
+
     def solve_case(
         self,
         truth_path: Path,
@@ -229,27 +377,12 @@ class VNextSolver:
             if not physical.unsatisfied_cars(state.cars, state.depot_assignment):
                 break
             physical.clear_access_order_cache()
-            selected: EvaluatedCandidate | None = None
             raw_policy_context = self.policy.context(state)
             current_phase = self.phase_gate.active_phase(
                 previous_phase=previous_phase,
                 proposed=raw_policy_context.phase_state,
             )
-
-            def context_for_phase(phase_code: str) -> PolicyContext:
-                phase_state = replace(
-                    raw_policy_context.phase_state,
-                    phase=self.phase_gate.phase_kind(phase_code),
-                )
-                return PolicyContext(
-                    phase_state=phase_state,
-                    remote_session=raw_policy_context.remote_session,
-                    remote_open=phase_code == "H4",
-                    last_business_remote=raw_policy_context.last_business_remote,
-                    strategic_plan=replace(raw_policy_context.strategic_plan, phase=phase_state.phase),
-                )
-
-            policy_context = context_for_phase(current_phase)
+            policy_context = self._context_for_phase_code(raw_policy_context, current_phase)
             active_phase_state = policy_context.phase_state
             last_policy_context = policy_context
             hook_flow_edges = build_flow_edge_records(
@@ -285,153 +418,14 @@ class VNextSolver:
             if not contracts:
                 blocked_reason = "no_active_contract"
                 break
-            rejected_this_round = 0
-            generated_this_round = 0
-
-            def evaluate_episodes(episodes: tuple[Any, ...]) -> tuple[EvaluatedCandidate | None, int, int, CandidateRoundStats]:
-                selected_candidate: EvaluatedCandidate | None = None
-                rejected_count = 0
-                generated_count = 0
-                stats = CandidateRoundStats()
-                validation_cache: dict[str, Any] = {}
-                prospective_cache: dict[str, tuple[list[dict[str, Any]], Any, tuple[str, str, tuple[tuple[str, str, int], ...]]]] = {}
-                for contract in contracts:
-                    for episode in episodes:
-                        if not episode.applies(contract):
-                            continue
-                        for envelope in _generate_episode_candidates(
-                            episode=episode,
-                            case_id=state.case_id,
-                            hook_index=state.hook_index,
-                            cars=state.cars,
-                            depot_assignment=state.depot_assignment,
-                            graph=self.graph,
-                            loco_location=state.loco_location,
-                            serial_gate_leases=state.serial_gate_leases,
-                            contract=contract,
-                            strategic_plan=policy_context.strategic_plan,
-                        ):
-                            generated_count += 1
-                            stats.generated()
-                            resource_request = self.resources.request_for(envelope)
-                            envelope = CandidateEnvelope(
-                                candidate=envelope.candidate,
-                                contract=envelope.contract,
-                                intent=envelope.intent,
-                                resource_request=resource_request,
-                                template_name=envelope.template_name,
-                            )
-                            validation = validation_cache.get(envelope.candidate.candidate_id)
-                            if validation is None:
-                                validation = physical.validate_candidate(
-                                    self.graph,
-                                    envelope.candidate,
-                                    state.cars,
-                                    state.loco_location,
-                                    state.depot_assignment,
-                                )
-                                validation_cache[envelope.candidate.candidate_id] = validation
-                            if validation.reasons:
-                                resource_delta = ResourceDelta(
-                                    request=resource_request,
-                                    acquired=(),
-                                    released_lines=(),
-                                    violations=tuple(f"physical:{reason}" for reason in validation.reasons),
-                                )
-                                if self.trace_all_candidates:
-                                    traces.append(
-                                        _trace_row(
-                                            state=state,
-                                            policy_context=policy_context,
-                                            envelope=envelope,
-                                            gate_accepted=False,
-                                            selected=False,
-                                            gate_reason="physical_reject",
-                                            physical_reasons=tuple(validation.reasons),
-                                            contract_delta=None,
-                                            resource_delta=resource_delta,
-                                        )
-                                    )
-                                rejected_count += 1
-                                stats.rejected("physical_reject")
-                                continue
-                            resource_delta = self.resources.acquire(
-                                resource_request,
-                                candidate=envelope.candidate,
-                                validation=validation,
-                                cars=state.cars,
-                                depot_assignment=state.depot_assignment,
-                                serial_gate_leases=state.serial_gate_leases,
-                            )
-                            cached_prospective = prospective_cache.get(envelope.candidate.candidate_id)
-                            if cached_prospective is None:
-                                prospective = simulate_candidate(envelope.candidate, state.cars, validation)
-                                next_loco_location = physical.next_loco_location(envelope.candidate, validation)
-                                prospective_signature = physical.state_signature(prospective, next_loco_location)
-                                cached_prospective = (prospective, next_loco_location, prospective_signature)
-                                prospective_cache[envelope.candidate.candidate_id] = cached_prospective
-                            prospective, next_loco_location, prospective_signature = cached_prospective
-                            contract_delta = build_contract_delta(
-                                envelope,
-                                cars=state.cars,
-                                prospective_cars=prospective,
-                                depot_assignment=state.depot_assignment,
-                                strategic_plan=policy_context.strategic_plan,
-                            )
-                            decision = self.gate.decide(
-                                contract_delta,
-                                resource_delta,
-                                strategic_plan=policy_context.strategic_plan,
-                                candidate=envelope.candidate,
-                            )
-                            if decision.accepted and prospective_signature in state.visited_signatures:
-                                decision = self.gate.loop_reject(contract_delta, resource_delta)
-                            gate_accepted = decision.accepted
-                            gate_reason = decision.reason
-                            if gate_accepted:
-                                phase_permission = self.phase_gate.permission(
-                                    phase_state=active_phase_state,
-                                    envelope=envelope,
-                                    contract_delta=contract_delta,
-                                    resource_delta=resource_delta,
-                                    remote_session=policy_context.remote_session,
-                                )
-                                if not phase_permission.allowed:
-                                    gate_accepted = False
-                                    gate_reason = f"phase_veto:{phase_permission.reason}"
-                            if self.trace_all_candidates:
-                                traces.append(
-                                    _trace_row(
-                                        state=state,
-                                        policy_context=policy_context,
-                                        envelope=envelope,
-                                        gate_accepted=gate_accepted,
-                                        selected=False,
-                                        gate_reason=gate_reason,
-                                        physical_reasons=(),
-                                        contract_delta=contract_delta,
-                                        resource_delta=resource_delta,
-                                    )
-                                )
-                            if not gate_accepted:
-                                rejected_count += 1
-                                stats.rejected(gate_reason)
-                                continue
-                            stats.accepted()
-                            evaluated = EvaluatedCandidate(
-                                envelope=envelope,
-                                validation=validation,
-                                prospective_cars=prospective,
-                                contract_delta=contract_delta,
-                                resource_delta=resource_delta,
-                                next_loco_location=next_loco_location,
-                                prospective_signature=prospective_signature,
-                            )
-                            if self.policy.better(evaluated, selected_candidate, policy_context):
-                                selected_candidate = evaluated
-                return selected_candidate, generated_count, rejected_count, stats
-
-            selected, generated_this_round, rejected_this_round, round_stats = evaluate_episodes(EPISODES)
+            selected, generated_this_round, rejected_this_round, round_stats = self._evaluate_episode_round(
+                episodes=EPISODES,
+                contracts=contracts,
+                state=state,
+                policy_context=policy_context,
+                active_phase_state=active_phase_state,
+                traces=traces,
+            )
             while selected is None and generated_this_round > 0:
                 next_phase = self.phase_gate.next_phase_after_exhaustion(
                     phase_state=active_phase_state,
@@ -470,11 +464,18 @@ class VNextSolver:
                 )
                 current_phase = next_phase
                 previous_phase = current_phase
-                policy_context = context_for_phase(current_phase)
+                policy_context = self._context_for_phase_code(raw_policy_context, current_phase)
                 active_phase_state = policy_context.phase_state
                 last_policy_context = policy_context
                 contracts = self.policy.order_contracts(all_contracts, policy_context)
-                selected, generated_this_round, rejected_this_round, round_stats = evaluate_episodes(EPISODES)
+                selected, generated_this_round, rejected_this_round, round_stats = self._evaluate_episode_round(
+                    episodes=EPISODES,
+                    contracts=contracts,
+                    state=state,
+                    policy_context=policy_context,
+                    active_phase_state=active_phase_state,
+                    traces=traces,
+                )
             if selected is None:
                 blocked_reason = (
                     "no_episode_candidate_generated"

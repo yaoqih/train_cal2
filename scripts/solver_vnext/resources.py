@@ -8,6 +8,17 @@ from .domain import ContractFamily, IntentKind
 from .domain import CandidateEnvelope, ResourceDelta, ResourceKind, ResourceRequest
 
 
+SAME_PLAN_STAGING_OWNER_KINDS = {
+    "vnext_spotting_repack",
+    "vnext_tail_blocker_peel_digest",
+    "vnext_stage4_linear_sweep",
+    "vnext_remote_session_prefix_batch_digest_restore",
+    "vnext_depot_cun4_source_repack_exchange",
+    "vnext_depot_cun4_inbound_outbound_exchange",
+    "vnext_depot_inbound_cun4_open_release",
+}
+
+
 class StationResourceGraph:
     """Hard resource arbiter for vNext candidates.
 
@@ -161,7 +172,7 @@ class StationResourceGraph:
                 depot_assignment=depot_assignment,
             ):
                 continue
-            if self._same_plan_repack_staging_cleared(
+            if self._same_plan_staging_cleared(
                 candidate=candidate,
                 line=put_line,
                 put_nos=put_nos_by_line.get(put_line, ()),
@@ -186,16 +197,16 @@ class StationResourceGraph:
                 )
         return violations
 
-    def _same_plan_repack_staging_cleared(
+    def _same_plan_staging_cleared(
         self,
         *,
         candidate: Any,
         line: str,
         put_nos: tuple[str, ...],
     ) -> bool:
-        if getattr(candidate, "candidate_kind", "") != "vnext_depot_cun4_source_repack_exchange":
-            return False
         if not put_nos:
+            return False
+        if getattr(candidate, "candidate_kind", "") not in SAME_PLAN_STAGING_OWNER_KINDS:
             return False
         pending: set[str] = set()
         cleared: set[str] = set()

@@ -16,6 +16,9 @@ from .domain import ContractFamily
 LOCO_LENGTH_M = 15.0
 PULL_LIMIT_EQUIVALENT = 20
 LINE_LENGTH_TOLERANCE_M = 0.5
+ROUTE_LINE_LENGTH_LIMITS_M = {
+    "联6": 192.0,
+}
 DEPOT_LINES = {"修1库内", "修2库内", "修3库内", "修4库内"}
 DEPOT_OUTSIDE_LINES = {"修1库外", "修2库外", "修3库外", "修4库外"}
 DEPOT_TARGET_LINES = DEPOT_LINES | DEPOT_OUTSIDE_LINES
@@ -577,6 +580,8 @@ class TrackGraph:
                     continue
                 if node == source and source_departure_lines and next_node not in source_departure_lines:
                     continue
+                if route_line_length_blocked(next_node, train_length_m):
+                    continue
                 if self._route_step_blocked(
                     previous_node,
                     node,
@@ -684,6 +689,34 @@ def operation_approach_lines(line: str) -> set[str]:
     return {normalize_line(node) for node in OCCUPIED_LINE_APPROACH_LINES.get(normalized, ())}
 
 
+def route_line_length_required_m(train_length_m: float) -> float:
+    return train_length_m + LOCO_LENGTH_M
+
+
+def route_line_length_blocked(line: str, train_length_m: float) -> bool:
+    limit = ROUTE_LINE_LENGTH_LIMITS_M.get(normalize_line(line))
+    if limit is None:
+        return False
+    return route_line_length_required_m(train_length_m) > limit + LINE_LENGTH_TOLERANCE_M
+
+
+def route_line_length_reasons(path: tuple[str, ...] | list[str], train_length_m: float) -> list[str]:
+    required = route_line_length_required_m(train_length_m)
+    reasons: list[str] = []
+    seen: set[str] = set()
+    for line in route_for_output(path):
+        if line in seen:
+            continue
+        seen.add(line)
+        limit = ROUTE_LINE_LENGTH_LIMITS_M.get(line)
+        if limit is None:
+            continue
+        if required <= limit + LINE_LENGTH_TOLERANCE_M:
+            continue
+        reasons.append(f"route_line_length_violation:{line}:{required:.1f}>{limit:.1f}")
+    return reasons
+
+
 def line_has_stationary_cars(
     line: str,
     cars: list[dict[str, Any]],
@@ -735,6 +768,10 @@ def post_put_loco_location(path: tuple[str, ...] | list[str], operation_line: st
     normalized_path = [normalize_line(node) for node in path if normalize_line(node)]
     if len(normalized_path) >= 2 and normalized_path[-1] == line:
         return LocoLocation(line=normalized_path[-2])
+    if normalized_path == [line]:
+        approach_lines = sorted(operation_approach_lines(line))
+        if len(approach_lines) == 1:
+            return LocoLocation(line=approach_lines[0])
     return LocoLocation(line=line)
 
 
@@ -2887,6 +2924,7 @@ def validate_candidate(
     if not get_path:
         reasons.append("get_route_blocked_by_occupied_line" if get_static_path else "get_route_missing")
     else:
+        reasons.extend(route_line_length_reasons(get_path, 0.0))
         get_order_reason = inaccessible_get_reason(
             cars=cars,
             line=candidate.source_line,
@@ -2898,7 +2936,12 @@ def validate_candidate(
             reasons.append(get_order_reason)
     if candidate.has_weigh and not weigh_path:
         reasons.append("weigh_route_blocked_by_occupied_line" if weigh_static_path else "weigh_route_missing")
+        reasons.extend(route_line_length_reasons(
+            route_with_line_prefix(source_location.line, weigh_static_path),
+            candidate.train_length_m,
+        ))
     elif candidate.has_weigh:
+        reasons.extend(route_line_length_reasons(weigh_path, candidate.train_length_m))
         reasons.extend(pre_repair_reversal_reasons(
             weigh_path,
             cars,
@@ -2907,7 +2950,12 @@ def validate_candidate(
         ))
     if not put_path:
         reasons.append("put_route_blocked_by_occupied_line" if put_static_path else "put_route_missing")
+        reasons.extend(route_line_length_reasons(
+            route_with_line_prefix(source_location.line, put_static_path),
+            candidate.train_length_m,
+        ))
     else:
+        reasons.extend(route_line_length_reasons(put_path, candidate.train_length_m))
         reasons.extend(pre_repair_reversal_reasons(
             put_path,
             cars,
@@ -3017,6 +3065,10 @@ def validate_planlet(
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
             if not path:
                 reasons.append("get_route_blocked_by_occupied_line" if static_path else "get_route_missing")
+                reasons.extend(route_line_length_reasons(
+                    route_with_line_prefix(current_loco.line, static_path),
+                    carried_length,
+                ))
                 reasons.extend(pre_repair_reversal_reasons(
                     route_with_line_prefix(current_loco.line, static_path),
                     working_cars,
@@ -3047,6 +3099,7 @@ def validate_planlet(
                 step_nos | carried,
                 carried_length,
             ))
+            reasons.extend(route_line_length_reasons(path, carried_length))
             if reasons:
                 break
             operation_paths.append(path)
@@ -3089,6 +3142,10 @@ def validate_planlet(
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
             if not path:
                 reasons.append("put_route_blocked_by_occupied_line" if static_path else "put_route_missing")
+                reasons.extend(route_line_length_reasons(
+                    route_with_line_prefix(current_loco.line, static_path),
+                    train_length_for_nos(working_cars, carried),
+                ))
                 reasons.extend(pre_repair_reversal_reasons(
                     route_with_line_prefix(current_loco.line, static_path),
                     working_cars,
@@ -3106,6 +3163,10 @@ def validate_planlet(
                 path,
                 working_cars,
                 carried,
+                train_length_for_nos(working_cars, carried),
+            ))
+            reasons.extend(route_line_length_reasons(
+                path,
                 train_length_for_nos(working_cars, carried),
             ))
             if reasons:
@@ -3185,9 +3246,14 @@ def validate_planlet(
             path = tuple(route_with_line_prefix(current_loco.line, raw_path))
             if not path:
                 reasons.append("weigh_route_blocked_by_occupied_line" if static_path else "weigh_route_missing")
+                reasons.extend(route_line_length_reasons(
+                    route_with_line_prefix(current_loco.line, static_path),
+                    train_length_for_nos(working_cars, carried),
+                ))
                 break
             train_length = train_length_for_nos(working_cars, carried)
             reasons.extend(pre_repair_reversal_reasons(path, working_cars, carried, train_length))
+            reasons.extend(route_line_length_reasons(path, train_length))
             if reasons:
                 break
             operation_paths.append(path)

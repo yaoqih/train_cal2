@@ -513,7 +513,7 @@ def _origin_lines_by_no(candidate: Any) -> dict[str, str]:
         if step.action != "Get":
             continue
         for no in step.move_car_nos:
-            origins[no] = step.line
+            origins.setdefault(no, step.line)
     return origins
 
 

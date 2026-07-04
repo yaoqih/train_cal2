@@ -407,6 +407,36 @@ def test_route_search_skips_reversal_length_violating_short_path() -> None:
     assert physical.pre_repair_reversal_reasons(path, cars, set(), 90.0) == []
 
 
+def test_singleton_put_to_machine_south_leaves_loco_at_access_end() -> None:
+    assert physical.post_put_loco_location(["机南"], "机南") == physical.LocoLocation("机走棚")
+
+
+def test_route_rejects_long_train_through_link6_cache() -> None:
+    graph = physical.TrackGraph()
+    cars = [
+        car("ALT1", line="机走棚", position=1, target_lines=["机走棚"]),
+        car("ALT2", line="预修线", position=1, target_lines=["预修线"]),
+    ]
+    train_length = 262.9
+    static_path = graph.route("机走北", "存5线北")
+
+    path = graph.route_avoiding_occupied(
+        "机走北",
+        "存5线北",
+        physical.occupied_lines_for_route(cars, set()),
+        cars=cars,
+        moving_nos=set(),
+        train_length_m=train_length,
+    )
+
+    assert "联6" in static_path
+    assert path
+    assert "联6" not in path
+    assert physical.route_line_length_reasons(static_path, train_length) == [
+        "route_line_length_violation:联6:277.9>192.0"
+    ]
+
+
 def test_reversal_middle_blocker_can_be_used_when_length_fits() -> None:
     graph = physical.TrackGraph()
     cars = [car("P1", line="预修线", position=1, length=20.0)]
@@ -1424,6 +1454,96 @@ def test_serial_gate_resource_uses_put_step_nos_not_whole_candidate_batch() -> N
         depot_assignment=depot_assignment,
         serial_gate_leases={"机走棚": lease},
     )[0].startswith("serial_blocker_storage_before_downstream_clear")
+
+
+def test_serial_gate_allows_same_plan_temporary_staging_clear() -> None:
+    graph = StationResourceGraph()
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    cars = [
+        car("S", line="存1线", position=1, target_lines=["调梁棚"]),
+        car("D", line="存5线南", position=1, target_lines=["预修线"]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存1线",
+        target_line="调梁棚",
+        batch=[cars[0]],
+        planned_positions={},
+        generation_reason="test",
+        candidate_kind="vnext_spotting_repack",
+        plan_steps=(
+            physical.plan_step("Get", "存1线", ("S",)),
+            physical.plan_step("Put", "存5线北", ("S",), {"S": 1}),
+            physical.plan_step("Get", "存5线北", ("S",)),
+            physical.plan_step("Put", "调梁棚", ("S",), {"S": 1}),
+        ),
+    )
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(ResourceKind.SERIAL_LINE_GATE,),
+        source_line="存1线",
+        target_line="调梁棚",
+        move_nos=("S",),
+        touched_lines=("存1线", "存5线北", "调梁棚"),
+        put_lines=("存5线北", "调梁棚"),
+        intent=IntentKind.FRONT_PREP,
+    )
+
+    assert graph._serial_blocker_storage_violations(
+        request,
+        candidate=candidate,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        serial_gate_leases={},
+    ) == []
+
+
+def test_serial_gate_rejects_undeclared_same_plan_temporary_staging_clear() -> None:
+    graph = StationResourceGraph()
+    depot_assignment = physical.DepotAssignment(slots={}, failures={})
+    cars = [
+        car("S", line="存1线", position=1, target_lines=["调梁棚"]),
+        car("D", line="存5线南", position=1, target_lines=["调梁棚"]),
+    ]
+    candidate = physical.hook_candidate(
+        case_id="T",
+        hook_index=1,
+        source_line="存1线",
+        target_line="调梁棚",
+        batch=[cars[0]],
+        planned_positions={},
+        generation_reason="test",
+        candidate_kind="test_same_plan_temporary_staging",
+        plan_steps=(
+            physical.plan_step("Get", "存1线", ("S",)),
+            physical.plan_step("Put", "存5线北", ("S",), {"S": 1}),
+            physical.plan_step("Get", "存5线北", ("S",)),
+            physical.plan_step("Put", "调梁棚", ("S",), {"S": 1}),
+        ),
+    )
+    request = ResourceRequest(
+        contract_id="C",
+        family=ContractFamily.FUNCTION_LINE_SERVICE,
+        candidate_id=candidate.candidate_id,
+        resources=(ResourceKind.SERIAL_LINE_GATE,),
+        source_line="存1线",
+        target_line="调梁棚",
+        move_nos=("S",),
+        touched_lines=("存1线", "存5线北", "调梁棚"),
+        put_lines=("存5线北", "调梁棚"),
+        intent=IntentKind.FRONT_PREP,
+    )
+
+    assert graph._serial_blocker_storage_violations(
+        request,
+        candidate=candidate,
+        cars=cars,
+        depot_assignment=depot_assignment,
+        serial_gate_leases={},
+    ) == ["serial_blocker_storage_before_downstream_clear:存5线北:存5线南:D"]
 
 
 def test_cun4_same_plan_source_return_does_not_require_buffer_owner() -> None:
@@ -3899,7 +4019,7 @@ def test_depot_inbound_assembly_release_attaches_to_repair_inbound_contract() ->
     assert delta.contract_reduction == 2
 
 
-def test_depot_inbound_assembly_release_splits_tail_when_assigned_slots_reverse_order() -> None:
+def test_depot_inbound_assembly_release_rejects_reverse_slot_reorder_without_preassembly() -> None:
     cars = [
         car("A", line="洗油北", position=1, target_lines=["修2库内"]),
         car("B", line="洗油北", position=2, target_lines=["修2库内"]),
@@ -3945,26 +4065,7 @@ def test_depot_inbound_assembly_release_splits_tail_when_assigned_slots_reverse_
         )
     )
 
-    assert len(envelopes) == 1
-    steps = [(step.action, step.line, step.move_car_nos, step.planned_positions) for step in envelopes[0].candidate.plan_steps]
-    assert steps == [
-        ("Get", "洗油北", ("A", "B", "C"), {}),
-        ("Put", "存4线", ("C",), {"C": 1}),
-        ("Put", "存4线", ("B",), {"B": 2}),
-        ("Put", "修2库内", ("A",), {"A": 3}),
-        ("Get", "存4线", ("B",), {}),
-        ("Put", "修2库内", ("B",), {"B": 2}),
-        ("Get", "存4线", ("C",), {}),
-        ("Put", "修2库内", ("C",), {"C": 1}),
-    ]
-    validation = physical.validate_candidate(
-        physical.TrackGraph(),
-        envelopes[0].candidate,
-        cars,
-        physical.LocoLocation("洗油北"),
-        depot_assignment,
-    )
-    assert validation.accepted, validation.reasons
+    assert envelopes == []
 
 
 def test_depot_inbound_assembly_release_allows_locked_section_stayer_behind_factory_slot() -> None:
@@ -4558,7 +4659,7 @@ def test_cun4_unwheel_release_pulls_unwheel_outbound_behind_satisfied_prefix() -
     }
 
 
-def test_depot_inbound_assembly_release_uses_rolling_depot_positions() -> None:
+def test_depot_inbound_assembly_release_rejects_rolling_depot_rebuild() -> None:
     depot_targets = ["修1库内", "修2库内", "修3库内", "修4库内"]
     cars = [
         car("A", line="机南", position=1, target_lines=depot_targets),
@@ -4607,25 +4708,7 @@ def test_depot_inbound_assembly_release_uses_rolling_depot_positions() -> None:
             strategic_plan=strategic_plan,
         )
     )
-    assert len(envelopes) == 1
-    repair_puts = [
-        step
-        for step in envelopes[0].candidate.plan_steps
-        if step.action == "Put" and step.line == "修1库内"
-    ]
-    assert [step.planned_positions for step in repair_puts] == [
-        {"C": 4},
-        {"A": 3},
-        {"E1": 1, "E2": 2},
-    ]
-    validation = physical.validate_candidate(
-        physical.TrackGraph(),
-        envelopes[0].candidate,
-        cars,
-        physical.LocoLocation("机南"),
-        depot_assignment,
-    )
-    assert validation.accepted, validation.reasons
+    assert envelopes == []
 
 
 def test_depot_outbound_assembly_plan_orders_non_cun4_before_cun4() -> None:
@@ -4684,11 +4767,7 @@ def test_depot_inbound_release_defers_outer_slot_until_inner_slot_is_clear() -> 
     assert len(envelopes) == 1
     assert [(step.action, step.line, step.move_car_nos) for step in envelopes[0].candidate.plan_steps] == [
         ("Get", "机走北", ("I",)),
-        ("Get", "机南", ("O",)),
-        ("Put", "存4线", ("O",)),
         ("Put", "修3库内", ("I",)),
-        ("Get", "存4线", ("O",)),
-        ("Put", "修3库外", ("O",)),
     ]
     validation = physical.validate_candidate(
         physical.TrackGraph(),
