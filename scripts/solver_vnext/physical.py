@@ -989,8 +989,11 @@ def depot_section_repair_position_allowed(
     line: str,
     position: int,
     cars: list[dict[str, Any]],
+    depot_assignment: DepotAssignment | None = None,
 ) -> bool:
     if line not in DEPOT_LINES or not repair_process(car).startswith("段"):
+        return True
+    if depot_assignment is not None and is_locked_depot_stayer(car, depot_assignment):
         return True
     factory_positions = [
         int(item.get("Position") or 0)
@@ -1543,7 +1546,7 @@ def planned_positions_for_batch(
                         projected.append(projected_car)
                     projected_car["Line"] = target_line
                     projected_car["Position"] = position
-                    if not depot_section_repair_position_allowed(projected_car, target_line, position, projected):
+                    if not depot_section_repair_position_allowed(projected_car, target_line, position, projected, depot_assignment):
                         continue
                 planned[no] = position
                 occupied.add(position)
@@ -1589,7 +1592,7 @@ def planned_positions_for_batch(
                     projected.append(projected_car)
                 projected_car["Line"] = target_line
                 projected_car["Position"] = position
-                if not depot_section_repair_position_allowed(projected_car, target_line, position, projected):
+                if not depot_section_repair_position_allowed(projected_car, target_line, position, projected, depot_assignment):
                     continue
                 planned[no] = position
                 occupied.add(position)
@@ -1625,7 +1628,7 @@ def car_is_satisfied(
             return False
         capacity = depot_line_capacity(depot_assignment, car["Line"], minimum_position=position)
         return depot_actual_position_allowed(car, car["Line"], position, capacity) and (
-            cars is None or depot_section_repair_position_allowed(car, car["Line"], position, cars)
+            cars is None or depot_section_repair_position_allowed(car, car["Line"], position, cars, depot_assignment)
         )
     targets = car.get("_TargetLineSet") or set(target_lines(car))
     if car["Line"] not in targets:

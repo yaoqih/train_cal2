@@ -6,7 +6,7 @@ from . import depot_outbound_plan
 from . import physical
 from . import release
 from . import serial
-from .domain import CandidateEnvelope, ContractFamily, FlowContract, IntentKind, ResourceRequest
+from .domain import CandidateEnvelope, ContractFamily, FlowContract, IntentKind, PhaseKind, ResourceRequest
 from .frontier import AccessFrontier
 from .placement import planned_positions_for_batch
 from .spotting import (
@@ -1497,6 +1497,19 @@ class Cun4UnwheelReleaseEpisode(Episode):
             subject_nos=subject_nos,
         )
         if not unwheel_batch:
+            release_candidate = self._unwheel_outbound_source_prefix_candidate(
+                case_id=case_id,
+                hook_index=hook_index,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                graph=graph,
+                loco_location=loco_location,
+                serial_gate_leases=serial_gate_leases or {},
+                loads=loads,
+                subject_nos=subject_nos,
+            )
+            if release_candidate is not None:
+                yield self._unwheel_outbound_envelope(release_candidate, contract)
             return
         blocker_batch = self._unwheel_outbound_prefix(
             cars=cars,
@@ -1554,6 +1567,116 @@ class Cun4UnwheelReleaseEpisode(Episode):
                 break
             batch.append(car)
         return batch
+
+    def _unwheel_outbound_source_prefix_candidate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any],
+        loads: Any,
+        subject_nos: set[str],
+    ) -> Any | None:
+        blockers: list[dict[str, Any]] = []
+        targets: list[dict[str, Any]] = []
+        for car in physical.line_cars_in_access_order(
+            cars=cars,
+            line="卸轮线",
+            graph=graph,
+            loco_location=loco_location,
+        ):
+            no = physical.car_no(car)
+            target_line, _position, _reason = physical.planned_target_for_car(
+                car,
+                cars,
+                depot_assignment,
+                loads,
+            )
+            if target_line == "卸轮线" and physical.car_is_satisfied(car, depot_assignment, cars) and not targets:
+                if physical.pull_equivalent([*blockers, car]) > physical.PULL_LIMIT_EQUIVALENT:
+                    return None
+                blockers.append(car)
+                continue
+            if target_line == "存4线" and no in subject_nos:
+                if physical.pull_equivalent([*blockers, *targets, car]) > physical.PULL_LIMIT_EQUIVALENT:
+                    break
+                targets.append(car)
+                continue
+            break
+        if not targets:
+            return None
+        planning_cars = [dict(car) for car in cars]
+        blocker_nos = tuple(physical.car_no(car) for car in blockers)
+        target_nos = tuple(physical.car_no(car) for car in targets)
+        pull_nos = (*blocker_nos, *target_nos)
+        physical.apply_physical_get_order(planning_cars, "卸轮线", pull_nos)
+        target_positions = planned_positions_for_batch(
+            batch=targets,
+            target_line="存4线",
+            cars=planning_cars,
+            depot_assignment=depot_assignment,
+            batch_nos=set(pull_nos),
+        )
+        if len(target_positions) != len(targets):
+            return None
+        steps = [
+            physical.plan_step("Get", "卸轮线", pull_nos),
+            physical.plan_step("Put", "存4线", target_nos, target_positions),
+        ]
+        if blockers:
+            blocker_positions = {
+                no: int(car.get("Position") or index)
+                for index, (no, car) in enumerate(zip(blocker_nos, blockers), start=1)
+            }
+            steps.append(physical.plan_step("Put", "卸轮线", blocker_nos, blocker_positions))
+        plan_steps = tuple(steps)
+        if not self.frontier.plan_steps_are_reachable(
+            steps=plan_steps,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases,
+            candidate_kind="vnext_unwheel_outbound_source_prefix",
+        ):
+            return None
+        return physical.build_planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line="卸轮线",
+            target_line="存4线",
+            batch=[*blockers, *targets],
+            steps=plan_steps,
+            reason=(
+                f"vnext:{self.template_name};"
+                f"unwheel_outbound_prefix={len(targets)};blockers={len(blockers)}"
+            ),
+            candidate_kind="vnext_unwheel_outbound_source_prefix",
+        )
+
+    def _unwheel_outbound_envelope(self, candidate: Any, contract: FlowContract) -> CandidateEnvelope:
+        intent = IntentKind.CUN4_OUTBOUND_HOLD
+        request = ResourceRequest(
+            contract_id=contract.contract_id,
+            family=contract.family,
+            candidate_id=candidate.candidate_id,
+            resources=(),
+            source_line=candidate.source_line,
+            target_line=candidate.target_line,
+            move_nos=tuple(candidate.move_car_nos),
+            intent=intent,
+        )
+        return CandidateEnvelope(
+            candidate=candidate,
+            contract=contract,
+            intent=intent,
+            resource_request=request,
+            template_name=self.template_name,
+        )
 
     def _unwheel_outbound_prefix(
         self,
@@ -2664,6 +2787,57 @@ def _depot_inbound_multisource_stepwise_put_plan(
     put_lines: list[str] = []
     deferred: list[tuple[str, tuple[str, ...], str]] = []
     while remaining:
+        target_line = target_by_no[remaining[-1]]
+        blocked_staging_lines = _depot_inbound_blocked_clearance_staging_lines(
+            remaining=remaining,
+            target_by_no=target_by_no,
+        )
+        if target_line in physical.DEPOT_LINES:
+            clearance = _depot_inbound_target_clearance_plan(
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                target_line=target_line,
+                carried_cars=[no_to_car[no] for no in remaining],
+                blocked_staging_lines=blocked_staging_lines,
+            )
+            if clearance is not None:
+                clearance_steps, clearance_put_lines, clearance_cars, planning_cars = clearance
+                steps.extend(clearance_steps)
+                put_lines.extend(clearance_put_lines)
+                carry.extend(clearance_cars)
+                continue
+        same_target_start = len(remaining) - 1
+        while same_target_start > 0 and target_by_no.get(remaining[same_target_start - 1]) == target_line:
+            same_target_start -= 1
+        full_same_target_drop = tuple(remaining[same_target_start:])
+        full_same_target_group = [no_to_car[no] for no in full_same_target_drop]
+        if (
+            target_line in physical.DEPOT_LINES
+            and full_same_target_group
+            and len(
+                _depot_inbound_release_positions_for_batch(
+                    batch=full_same_target_group,
+                    target_line=target_line,
+                    cars=planning_cars,
+                    depot_assignment=depot_assignment,
+                    batch_nos=set(full_same_target_drop),
+                )
+            )
+            != len(full_same_target_group)
+        ):
+            clearance = _depot_inbound_target_clearance_plan(
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                target_line=target_line,
+                carried_cars=[no_to_car[no] for no in remaining],
+                blocked_staging_lines=blocked_staging_lines,
+            )
+            if clearance is not None:
+                clearance_steps, clearance_put_lines, clearance_cars, planning_cars = clearance
+                steps.extend(clearance_steps)
+                put_lines.extend(clearance_put_lines)
+                carry.extend(clearance_cars)
+                continue
         release_drop = _depot_inbound_next_release_drop(
             remaining=remaining,
             target_by_no=target_by_no,
@@ -2672,7 +2846,20 @@ def _depot_inbound_multisource_stepwise_put_plan(
             depot_assignment=depot_assignment,
         )
         if release_drop is None:
-            return None
+            clearance = _depot_inbound_target_clearance_plan(
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                target_line=target_by_no.get(remaining[-1], ""),
+                carried_cars=[no_to_car[no] for no in remaining],
+                blocked_staging_lines=blocked_staging_lines,
+            )
+            if clearance is None:
+                return None
+            clearance_steps, clearance_put_lines, clearance_cars, planning_cars = clearance
+            steps.extend(clearance_steps)
+            put_lines.extend(clearance_put_lines)
+            carry.extend(clearance_cars)
+            continue
         start, target_line, drop, positions = release_drop
         group = [no_to_car[no] for no in drop]
         blocking_inner = _depot_inner_blocked_by_outer_target(target_line)
@@ -2703,7 +2890,7 @@ def _depot_inbound_multisource_stepwise_put_plan(
             blocking_inner = _depot_inner_blocked_by_outer_target(deferred_target)
             if not blocking_inner or not any(target_by_no.get(no) == blocking_inner for no in remaining):
                 ready_deferred.append(item)
-        for item in ready_deferred:
+        for item in reversed(ready_deferred):
             deferred.remove(item)
             deferred_target, deferred_drop, staging_line = item
             deferred_group = [no_to_car[no] for no in deferred_drop]
@@ -2743,6 +2930,8 @@ def _depot_inbound_next_release_drop(
     for start in range(same_target_start, len(remaining)):
         drop = tuple(remaining[start:])
         group = [no_to_car[no] for no in drop]
+        if _drop_has_untailable_pending_weigh(group):
+            continue
         positions = _depot_inbound_release_positions_for_batch(
             batch=group,
             target_line=target_line,
@@ -2755,6 +2944,141 @@ def _depot_inbound_next_release_drop(
     return None
 
 
+def _drop_has_untailable_pending_weigh(group: list[dict[str, Any]]) -> bool:
+    return any(
+        car.get("IsWeigh") and not car.get("_Weighed")
+        for car in group[:-1]
+    )
+
+
+def _depot_inbound_target_clearance_plan(
+    *,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    target_line: str,
+    carried_cars: list[dict[str, Any]],
+    blocked_staging_lines: set[str] | None = None,
+) -> tuple[tuple[Any, ...], tuple[str, ...], tuple[dict[str, Any], ...], list[dict[str, Any]]] | None:
+    if target_line not in physical.DEPOT_LINES:
+        return None
+    loads = physical.line_loads(cars)
+    blockers: list[dict[str, Any]] = []
+    blocker_target_by_no: dict[str, str] = {}
+    for car in physical.line_cars_in_access_order(cars=cars, line=target_line):
+        if physical.car_is_satisfied(car, depot_assignment, cars):
+            break
+        blocker_target, _position, _reason = physical.planned_target_for_car(
+            car,
+            cars,
+            depot_assignment,
+            loads,
+        )
+        if (
+            not blocker_target
+            or blocker_target == target_line
+            or blocker_target in physical.DEPOT_LINES
+            or blocker_target in physical.RUNNING_LINES
+        ):
+            break
+        if physical.pull_equivalent([*carried_cars, *blockers, car]) > physical.PULL_LIMIT_EQUIVALENT:
+            break
+        blockers.append(car)
+        blocker_target_by_no[physical.car_no(car)] = blocker_target
+    if not blockers:
+        return None
+
+    planning_cars = [dict(car) for car in cars]
+    blocker_nos = tuple(physical.car_no(car) for car in blockers)
+    physical.apply_physical_get_order(planning_cars, target_line, blocker_nos)
+    steps: list[Any] = [physical.plan_step("Get", target_line, blocker_nos)]
+    put_lines: list[str] = []
+    no_to_blocker = {physical.car_no(car): car for car in blockers}
+    remaining_blockers = list(blocker_nos)
+    while remaining_blockers:
+        blocker_target = blocker_target_by_no[remaining_blockers[-1]]
+        start = len(remaining_blockers) - 1
+        while start > 0 and blocker_target_by_no.get(remaining_blockers[start - 1]) == blocker_target:
+            start -= 1
+        clearance_put = _depot_inbound_clearance_put(
+            remaining_blockers=remaining_blockers,
+            same_target_start=start,
+            preferred_target=blocker_target,
+            no_to_blocker=no_to_blocker,
+            cars=planning_cars,
+            depot_assignment=depot_assignment,
+            blocked_staging_lines=blocked_staging_lines or set(),
+        )
+        if clearance_put is None:
+            return None
+        clearance_target, drop, positions = clearance_put
+        steps.append(physical.plan_step("Put", clearance_target, drop, positions))
+        put_lines.append(clearance_target)
+        physical.apply_physical_put_order(planning_cars, clearance_target, list(drop), positions)
+        del remaining_blockers[-len(drop):]
+    return tuple(steps), tuple(put_lines), tuple(blockers), planning_cars
+
+
+DEPOT_INBOUND_CLEARANCE_STAGING_LINES = ("修1库外", "修2库外", "修3库外", "修4库外", "存4线")
+
+
+def _depot_inbound_blocked_clearance_staging_lines(
+    *,
+    remaining: list[str],
+    target_by_no: dict[str, str],
+) -> set[str]:
+    return {
+        target_by_no[no].replace("库内", "库外")
+        for no in remaining
+        if target_by_no.get(no, "") in physical.DEPOT_LINES
+    }
+
+
+def _depot_inbound_clearance_put(
+    *,
+    remaining_blockers: list[str],
+    same_target_start: int,
+    preferred_target: str,
+    no_to_blocker: dict[str, dict[str, Any]],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    blocked_staging_lines: set[str],
+) -> tuple[str, tuple[str, ...], dict[str, int]] | None:
+    candidate_lines = [
+        line
+        for line in dict.fromkeys((preferred_target, *DEPOT_INBOUND_CLEARANCE_STAGING_LINES))
+        if line
+        and line not in blocked_staging_lines
+        and line not in physical.DEPOT_LINES
+        and line not in physical.RUNNING_LINES
+        and line in physical.TRACK_SPECS
+    ]
+    local_lines = tuple(line for line in candidate_lines if line != "存4线")
+    remote_lines = tuple(line for line in candidate_lines if line == "存4线")
+    same_target_size = len(remaining_blockers) - same_target_start
+    for line_group in (local_lines, remote_lines):
+        for size in range(same_target_size, 0, -1):
+            drop = tuple(remaining_blockers[-size:])
+            group = [no_to_blocker[no] for no in drop]
+            for target_line in line_group:
+                if not physical.line_has_length_capacity(
+                    target_line,
+                    cars,
+                    group,
+                    set(drop),
+                ):
+                    continue
+                positions = planned_positions_for_batch(
+                    batch=group,
+                    target_line=target_line,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    batch_nos=set(drop),
+                )
+                if len(positions) == len(group):
+                    return target_line, drop, positions
+    return None
+
+
 def _depot_inbound_release_positions_for_batch(
     *,
     batch: list[dict[str, Any]],
@@ -2764,6 +3088,7 @@ def _depot_inbound_release_positions_for_batch(
     batch_nos: set[str],
 ) -> dict[str, int]:
     if target_line in physical.DEPOT_LINES:
+        batch_nos_ordered = tuple(physical.car_no(car) for car in batch)
         occupied = {
             int(car.get("Position") or 0)
             for car in cars
@@ -2785,6 +3110,37 @@ def _depot_inbound_release_positions_for_batch(
             target_line,
             minimum_position=minimum_position,
         )
+        assigned_positions = {
+            physical.car_no(car): int(slot.position)
+            for car in batch
+            for slot in [depot_assignment.slots.get(physical.car_no(car))]
+            if slot is not None and slot.line == target_line
+        }
+        if len(assigned_positions) == len(batch):
+            positions = set(assigned_positions.values())
+            assigned_capacity = physical.depot_line_capacity(
+                depot_assignment,
+                target_line,
+                minimum_position=max(positions or {0}),
+            )
+            assigned_positions_available = (
+                len(positions) == len(batch)
+                and not positions & occupied
+                and not positions & locked_tail
+                and max(positions, default=0) <= assigned_capacity
+                and _depot_inbound_release_positions_allowed(
+                    batch=batch,
+                    target_line=target_line,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    planned=assigned_positions,
+                    capacity=assigned_capacity,
+                )
+            )
+            if assigned_positions_available:
+                if not physical.target_put_order_reasons(target_line, batch_nos_ordered, assigned_positions):
+                    return assigned_positions
+                return {}
         best: tuple[tuple[int, int], dict[str, int]] | None = None
         for start in range(1, max(capacity - len(batch) + 2, 1)):
             planned = {
@@ -2795,6 +3151,8 @@ def _depot_inbound_release_positions_for_batch(
             if positions & occupied or positions & locked_tail:
                 continue
             if len(positions) != len(batch):
+                continue
+            if physical.target_put_order_reasons(target_line, batch_nos_ordered, planned):
                 continue
             if not _depot_inbound_release_positions_allowed(
                 batch=batch,
@@ -2856,7 +3214,7 @@ def _depot_inbound_release_positions_allowed(
         if car["Line"] != target_line:
             continue
         position = int(car.get("Position") or 0)
-        if not physical.depot_section_repair_position_allowed(car, target_line, position, projected):
+        if not physical.depot_section_repair_position_allowed(car, target_line, position, projected, depot_assignment):
             return False
     return True
 
@@ -2966,8 +3324,6 @@ class DepotInboundMultiSourceAssemblySessionEpisode(Episode):
             if no not in pending_nos or not target_line:
                 break
             if target_line in dirty_lines:
-                break
-            if car.get("IsWeigh"):
                 break
             batch.append(car)
         return tuple(batch)
@@ -3110,8 +3466,6 @@ class DepotInboundAssemblySessionEpisode(Episode):
                 break
             if target_line in dirty_lines:
                 break
-            if car.get("IsWeigh"):
-                break
             if target_line in seen_targets and target_line != last_target:
                 break
             if physical.pull_equivalent([*batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
@@ -3149,33 +3503,20 @@ class DepotInboundAssemblySessionEpisode(Episode):
         batch: list[dict[str, Any]],
         planned_lines: dict[str, str],
     ) -> Any | None:
-        moving_nos = {physical.car_no(car) for car in batch}
-        no_to_car = {physical.car_no(car): car for car in batch}
-        remaining = [physical.car_no(car) for car in batch]
-        steps = [physical.plan_step("Get", source_line, tuple(remaining))]
-        put_lines: list[str] = []
-        while remaining:
-            target_line = planned_lines[remaining[-1]]
-            if target_line in put_lines:
-                return None
-            start = len(remaining) - 1
-            while start > 0 and planned_lines.get(remaining[start - 1]) == target_line:
-                start -= 1
-            drop = tuple(remaining[start:])
-            group = [no_to_car[no] for no in drop]
-            positions = planned_positions_for_batch(
-                batch=group,
-                target_line=target_line,
-                cars=cars,
-                depot_assignment=depot_assignment,
-                batch_nos=moving_nos,
-            )
-            if len(positions) != len(group):
-                return None
-            put_lines.append(target_line)
-            steps.append(physical.plan_step("Put", target_line, drop, positions))
-            del remaining[start:]
-        plan_steps = tuple(steps)
+        target_by_no = {
+            physical.car_no(car): planned_lines[physical.car_no(car)]
+            for car in batch
+        }
+        plan = _depot_inbound_stepwise_put_plan(
+            cars=cars,
+            depot_assignment=depot_assignment,
+            source_line=source_line,
+            batch=tuple(batch),
+            target_by_no=target_by_no,
+        )
+        if plan is None:
+            return None
+        plan_steps, put_lines = plan
         if not self.frontier.plan_steps_are_reachable(
             steps=plan_steps,
             cars=cars,
@@ -3254,6 +3595,9 @@ class DepotInboundAssemblyRebalanceEpisode(Episode):
             if not ((line_nos & contract_nos) or contract_downstream_debt):
                 continue
             line_has_ungrouped = bool(line_nos & ungrouped_nos)
+            pending_downstream_debt = contract_downstream_debt & ungrouped_nos
+            if not line_has_ungrouped and not pending_downstream_debt:
+                continue
             planned_targets = {
                 planned_lines.get(no, "")
                 for no in line_nos
@@ -3311,7 +3655,9 @@ class DepotInboundAssemblyRebalanceEpisode(Episode):
 
     def _stable_route_clear_target_allowed(self, *, source_line: str, target_line: str) -> bool:
         inward_targets = {
-            "机走棚": {"机南", "洗油北"},
+            "机走棚": {"机南", "洗油北", "机走北"},
+            "洗油北": {"机走北"},
+            "机南": {"机走北"},
         }
         return target_line in inward_targets.get(source_line, set())
 
@@ -3524,6 +3870,22 @@ class DepotInboundRouteBlockerDigestEpisode(Episode):
         dirty_lines: set[str],
         loads: Any,
     ) -> Any | None:
+        combined = self._combined_blocker_source_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases,
+            blocker_line=blocker_line,
+            pending_nos=pending_nos,
+            active_source_lines=active_source_lines,
+            planned_lines=planned_lines,
+            dirty_lines=dirty_lines,
+        )
+        if combined is not None:
+            return combined
         line_cars = tuple(
             physical.line_cars_in_access_order(
                 cars=cars,
@@ -3585,6 +3947,145 @@ class DepotInboundRouteBlockerDigestEpisode(Episode):
             candidate_kind="vnext_depot_inbound_route_blocker_digest",
         )
 
+    def _combined_blocker_source_candidate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any],
+        blocker_line: str,
+        pending_nos: set[str],
+        active_source_lines: set[str],
+        planned_lines: dict[str, str],
+        dirty_lines: set[str],
+    ) -> Any | None:
+        blocker_batch = self._planned_blocker_batch(
+            cars=cars,
+            graph=graph,
+            loco_location=loco_location,
+            blocker_line=blocker_line,
+            planned_lines=planned_lines,
+        )
+        if not blocker_batch:
+            return None
+        for source_line in _depot_inbound_source_lines(tuple(active_source_lines), tuple(active_source_lines)):
+            if source_line not in serial.downstream_lines(blocker_line):
+                continue
+            source_batch = self._pending_source_batch(
+                cars=cars,
+                graph=graph,
+                loco_location=loco_location,
+                source_line=source_line,
+                pending_nos=pending_nos,
+                planned_lines=planned_lines,
+                dirty_lines=dirty_lines,
+                carry=list(blocker_batch),
+            )
+            if not source_batch:
+                continue
+            for source_size in range(len(source_batch), 0, -1):
+                active_source_batch = source_batch[:source_size]
+                target_by_no = {
+                    physical.car_no(car): planned_lines[physical.car_no(car)]
+                    for car in (*blocker_batch, *active_source_batch)
+                }
+                plan = _depot_inbound_multisource_stepwise_put_plan(
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    source_batches=((blocker_line, blocker_batch), (source_line, active_source_batch)),
+                    target_by_no=target_by_no,
+                )
+                if plan is None:
+                    continue
+                plan_steps, put_lines, batch = plan
+                if set(put_lines) == {"存4线"}:
+                    continue
+                if not self.frontier.plan_steps_are_reachable(
+                    steps=plan_steps,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    graph=graph,
+                    loco_location=loco_location,
+                    serial_gate_leases=serial_gate_leases,
+                    candidate_kind="vnext_depot_inbound_route_blocker_digest",
+                ):
+                    continue
+                return physical.build_planlet_candidate(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    source_line=blocker_line,
+                    target_line=plan_steps[-1].line,
+                    batch=list(batch),
+                    steps=plan_steps,
+                    reason=(
+                        f"vnext:{self.template_name};mode=combined_blocker_source;"
+                        f"blocker={blocker_line};source={source_line};"
+                        f"put_lines={','.join(put_lines)};batch={len(batch)}"
+                    ),
+                    candidate_kind="vnext_depot_inbound_route_blocker_digest",
+                )
+        return None
+
+    def _planned_blocker_batch(
+        self,
+        *,
+        cars: list[dict[str, Any]],
+        graph: Any,
+        loco_location: Any,
+        blocker_line: str,
+        planned_lines: dict[str, str],
+    ) -> tuple[dict[str, Any], ...]:
+        batch: list[dict[str, Any]] = []
+        for car in physical.line_cars_in_access_order(
+            cars=cars,
+            line=blocker_line,
+            graph=graph,
+            loco_location=loco_location,
+        ):
+            no = physical.car_no(car)
+            if no not in planned_lines:
+                return ()
+            if car.get("IsWeigh"):
+                return ()
+            if physical.pull_equivalent([*batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
+                return ()
+            batch.append(car)
+        return tuple(batch)
+
+    def _pending_source_batch(
+        self,
+        *,
+        cars: list[dict[str, Any]],
+        graph: Any,
+        loco_location: Any,
+        source_line: str,
+        pending_nos: set[str],
+        planned_lines: dict[str, str],
+        dirty_lines: set[str],
+        carry: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        batch: list[dict[str, Any]] = []
+        for car in physical.line_cars_in_access_order(
+            cars=cars,
+            line=source_line,
+            graph=graph,
+            loco_location=loco_location,
+        ):
+            no = physical.car_no(car)
+            target_line = planned_lines.get(no, "")
+            if no not in pending_nos or not target_line:
+                break
+            if target_line in dirty_lines:
+                break
+            if physical.pull_equivalent([*carry, *batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            batch.append(car)
+        return tuple(_depot_inbound_lifo_safe_prefix(batch, planned_lines))
+
     def _target_by_no(
         self,
         *,
@@ -3639,7 +4140,7 @@ class DepotInboundPrefixAssemblySessionEpisode(Episode):
     template_name = "depot_inbound_prefix_assembly_session"
     frontier = AccessFrontier()
     min_target_batch = 1
-    max_blocker_target_ratio = 2
+    max_blocker_target_ratio = 6
 
     def applies(self, contract: FlowContract) -> bool:
         return contract.family == ContractFamily.REMOTE_SESSION
@@ -3730,8 +4231,6 @@ class DepotInboundPrefixAssemblySessionEpisode(Episode):
             if no not in pending_nos or not target_line:
                 break
             if target_line in dirty_lines:
-                break
-            if car.get("IsWeigh"):
                 break
             if target_line in seen_targets and target_line != last_target:
                 break
@@ -3964,15 +4463,57 @@ class DepotInboundDirtyCleanoutEpisode(Episode):
             )
             planned_targets.append(target_line)
         targets: list[str] = []
-        if len(set(planned_targets)) == 1 and self._final_target_allowed(planned_targets[0], dirty_line=dirty_line):
-            targets.append(planned_targets[0])
-        elif set(planned_targets) == {"存4线"} and self._cun4_holding_allowed(batch):
-            targets.extend(
-                line
-                for line in self.cun4_holding_lines
-                if line != dirty_line
+        if len(set(planned_targets)) == 1:
+            final_target = planned_targets[0]
+            if final_target == "存4线" and not self._cun4_holding_allowed(batch):
+                return tuple(targets)
+            if self._final_target_allowed(final_target, dirty_line=dirty_line):
+                targets.append(final_target)
+                if self._line_accepts_batch(
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    target_line=final_target,
+                    batch=batch,
+                ):
+                    return tuple(targets)
+        elif set(planned_targets) == {"存4线"}:
+            if not self._cun4_holding_allowed(batch):
+                return tuple(targets)
+            targets.extend(line for line in self.cun4_holding_lines if line != dirty_line)
+            return tuple(targets)
+        targets.extend(
+            line
+            for line in self.cun4_holding_lines
+            if line != dirty_line
+            and line not in physical.DEPOT_INBOUND_ASSEMBLY_LINES
+            and self._line_accepts_batch(
+                cars=cars,
+                depot_assignment=depot_assignment,
+                target_line=line,
+                batch=batch,
             )
+        )
         return tuple(targets)
+
+    def _line_accepts_batch(
+        self,
+        *,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        target_line: str,
+        batch: list[dict[str, Any]],
+    ) -> bool:
+        move_nos = {physical.car_no(car) for car in batch}
+        if not physical.line_has_length_capacity(target_line, cars, batch, move_nos):
+            return False
+        positions = planned_positions_for_batch(
+            batch=batch,
+            target_line=target_line,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            batch_nos=move_nos,
+        )
+        return len(positions) == len(batch)
 
     def _cun4_holding_allowed(self, batch: list[dict[str, Any]]) -> bool:
         return all(
@@ -4522,7 +5063,8 @@ class DepotInboundMixedExtractionSessionEpisode(Episode):
         )
         pull_window: list[dict[str, Any]] = []
         for car in line_cars:
-            if car.get("IsWeigh"):
+            no = physical.car_no(car)
+            if car.get("IsWeigh") and not (no in pending_nos and planned_lines.get(no)):
                 break
             if physical.pull_equivalent([*pull_window, car]) > physical.PULL_LIMIT_EQUIVALENT:
                 break
@@ -5218,7 +5760,11 @@ class DepotInboundAssemblyReleaseEpisode(Episode):
     release_source_order = ("机走北", "机走棚", "机南", "洗油北")
 
     def applies(self, contract: FlowContract) -> bool:
-        return contract.family == ContractFamily.REMOTE_SESSION
+        return contract.family in {
+            ContractFamily.REMOTE_SESSION,
+            ContractFamily.REPAIR_INBOUND,
+            ContractFamily.DEPOT_SLOT,
+        }
 
     def generate(
         self,
@@ -5271,8 +5817,6 @@ class DepotInboundAssemblyReleaseEpisode(Episode):
                     loads,
                 )
                 if no not in subject_nos or target_line not in physical.DEPOT_INBOUND_DESTINATION_LINES:
-                    break
-                if car.get("IsWeigh"):
                     break
                 if physical.pull_equivalent([*batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
                     break
@@ -5399,8 +5943,6 @@ class DepotInboundAssemblyReleaseEpisode(Episode):
                 loads,
             )
             if no not in subject_nos or target_line not in physical.DEPOT_INBOUND_DESTINATION_LINES:
-                break
-            if car.get("IsWeigh"):
                 break
             if physical.pull_equivalent([*carry, *batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
                 break
@@ -5698,6 +6240,110 @@ class DepotInboundGatherSessionEpisode(Episode):
                 candidate_kind="vnext_depot_inbound_gather_session",
             )
             yield self._envelope(candidate, contract)
+
+
+class RemoteDirectCloseoutEpisode(Episode):
+    intent = IntentKind.REMOTE_DEPOT
+    template_name = "remote_direct_closeout"
+    frontier = AccessFrontier()
+
+    def applies(self, contract: FlowContract) -> bool:
+        return contract.family in {
+            ContractFamily.REMOTE_SESSION,
+            ContractFamily.DEPOT_SLOT,
+            ContractFamily.CUN4_PORT_STAGING,
+        }
+
+    def generate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any] | None = None,
+        contract: FlowContract,
+        strategic_plan: Any | None = None,
+    ) -> Iterable[CandidateEnvelope]:
+        if strategic_plan is not None and not strategic_plan.depot_inbound.assembly_complete:
+            return
+        loads = physical.line_loads(cars)
+        subject_nos = set(contract.subject_nos)
+        for source_line in contract.source_lines:
+            line_cars = physical.line_cars_in_access_order(
+                cars=cars,
+                line=source_line,
+                graph=graph,
+                loco_location=loco_location,
+            )
+            batch: list[dict[str, Any]] = []
+            target_line = ""
+            for car in line_cars:
+                no = physical.car_no(car)
+                if no not in subject_nos:
+                    break
+                planned_target, _position, _reason = physical.planned_target_for_car(
+                    car,
+                    cars,
+                    depot_assignment,
+                    loads,
+                )
+                if not (
+                    source_line in physical.REMOTE_INTERACTION_LINES
+                    or planned_target in physical.REMOTE_INTERACTION_LINES
+                    or planned_target in physical.DEPOT_TARGET_LINES
+                ):
+                    break
+                if not target_line:
+                    target_line = planned_target
+                if planned_target != target_line:
+                    break
+                if physical.pull_equivalent([*batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
+                    break
+                batch.append(car)
+            if not batch or not target_line or target_line == source_line:
+                continue
+            batch_nos = {physical.car_no(car) for car in batch}
+            positions = planned_positions_for_batch(
+                batch=batch,
+                target_line=target_line,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                batch_nos=batch_nos,
+            )
+            if len(positions) != len(batch):
+                continue
+            if not self.frontier.direct_move_is_reachable(
+                source_line=source_line,
+                target_line=target_line,
+                batch=batch,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                graph=graph,
+                loco_location=loco_location,
+                serial_gate_leases=serial_gate_leases or {},
+                planned_positions=positions,
+            ):
+                continue
+            candidate = physical.build_direct_candidate(
+                case_id=case_id,
+                hook_index=hook_index,
+                source_line=source_line,
+                target_line=target_line,
+                batch=batch,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                reason=(
+                    f"vnext:{self.template_name};contract={contract.contract_id};"
+                    f"source={source_line};target={target_line};batch={len(batch)}"
+                ),
+                candidate_kind="vnext_remote_direct_closeout",
+                planned_positions=positions,
+            )
+            if candidate is not None:
+                yield self._envelope(candidate, contract)
 
 
 class DepotSlotSwapEpisode(Episode):
@@ -6181,6 +6827,411 @@ class SourcePrefixReleaseEpisode(Episode):
                 continue
             break
         return blockers, targets
+
+
+class Stage4LinearSweepEpisode(Episode):
+    intent = IntentKind.FRONT_PREP
+    template_name = "stage4_linear_sweep"
+    frontier = AccessFrontier()
+    source_lines = ("存5线北", "存5线南", "存3线", "调梁棚")
+    allowed_families = {
+        ContractFamily.FUNCTION_LINE_SERVICE,
+        ContractFamily.DISPATCH_SHED_QUEUE,
+        ContractFamily.PRE_REPAIR_STAGING,
+        ContractFamily.YARD_REBALANCE,
+        ContractFamily.LOCO_AREA_STAGING,
+    }
+
+    def applies(self, contract: FlowContract) -> bool:
+        return contract.family in self.allowed_families
+
+    def generate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any] | None = None,
+        contract: FlowContract,
+        strategic_plan: Any | None = None,
+    ) -> Iterable[CandidateEnvelope]:
+        if strategic_plan is not None and strategic_plan.phase != PhaseKind.H5_CLOSEOUT:
+            return
+        source_line = contract.source_lines[0]
+        if source_line not in self.source_lines:
+            return
+        line_cars = physical.line_cars_in_access_order(
+            cars=cars,
+            line=source_line,
+            graph=graph,
+            loco_location=loco_location,
+        )
+        if not line_cars or physical.pull_equivalent(line_cars) > physical.PULL_LIMIT_EQUIVALENT:
+            return
+        contract_nos = set(contract.subject_nos)
+        if not contract_nos & {physical.car_no(car) for car in line_cars}:
+            return
+        target_by_no = self._target_by_no(
+            source_line=source_line,
+            line_cars=line_cars,
+            cars=cars,
+            depot_assignment=depot_assignment,
+        )
+        if not target_by_no:
+            return
+        sweep_batch = self._sweep_batch(
+            source_line=source_line,
+            line_cars=line_cars,
+            target_by_no=target_by_no,
+            cars=cars,
+            depot_assignment=depot_assignment,
+        )
+        if not sweep_batch:
+            return
+        if not any(
+            no in contract_nos and target_by_no.get(no, source_line) != source_line
+            for no in target_by_no
+        ):
+            return
+        candidate = self._candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=source_line,
+            line_cars=sweep_batch,
+            target_by_no=target_by_no,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases or {},
+        )
+        if candidate is None:
+            return
+        source_return_nos = tuple(
+            no
+            for step in physical.candidate_plan_steps(candidate)
+            if step.action == "Put" and step.line == source_line
+            for no in step.move_car_nos
+        )
+        request = ResourceRequest(
+            contract_id=contract.contract_id,
+            family=contract.family,
+            candidate_id=candidate.candidate_id,
+            resources=(),
+            source_line=source_line,
+            target_line=candidate.target_line,
+            move_nos=tuple(candidate.move_car_nos),
+            intent=self.intent,
+            same_plan_source_return_nos=source_return_nos,
+        )
+        yield CandidateEnvelope(
+            candidate=candidate,
+            contract=contract,
+            intent=self.intent,
+            resource_request=request,
+            template_name=self.template_name,
+        )
+
+    def _target_by_no(
+        self,
+        *,
+        source_line: str,
+        line_cars: list[dict[str, Any]],
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+    ) -> dict[str, str]:
+        loads = physical.line_loads(cars)
+        output: dict[str, str] = {}
+        for car in line_cars:
+            if car.get("IsWeigh") and not car.get("_Weighed"):
+                return {}
+            no = physical.car_no(car)
+            target_line, _position, _reason = physical.planned_target_for_car(
+                car,
+                cars,
+                depot_assignment,
+                loads,
+            )
+            if not target_line:
+                return {}
+            if target_line in physical.RUNNING_LINES or target_line in physical.DEPOT_TARGET_LINES:
+                return {}
+            output[no] = target_line
+        return output
+
+    def _sweep_batch(
+        self,
+        *,
+        source_line: str,
+        line_cars: list[dict[str, Any]],
+        target_by_no: dict[str, str],
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+    ) -> list[dict[str, Any]]:
+        batch: list[dict[str, Any]] = []
+        for car in line_cars:
+            if physical.pull_equivalent([*batch, car]) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            batch.append(car)
+        while batch:
+            tail = batch[-1]
+            tail_no = physical.car_no(tail)
+            if target_by_no.get(tail_no) != source_line:
+                break
+            if not physical.car_is_satisfied(tail, depot_assignment, cars):
+                break
+            batch.pop()
+        if not batch:
+            return []
+        if not any(
+            target_by_no.get(physical.car_no(car), source_line) != source_line
+            for car in batch
+        ):
+            return []
+        return batch
+
+    def _candidate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        source_line: str,
+        line_cars: list[dict[str, Any]],
+        target_by_no: dict[str, str],
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any],
+    ) -> Any | None:
+        planning_cars = [dict(car) for car in cars]
+        all_nos = tuple(physical.car_no(car) for car in line_cars)
+        no_to_car = {physical.car_no(car): car for car in line_cars}
+        physical.apply_physical_get_order(planning_cars, source_line, all_nos)
+        steps: list[Any] = [physical.plan_step("Get", source_line, all_nos)]
+        remaining = list(all_nos)
+        progressed: list[str] = []
+        while remaining:
+            target_line = target_by_no[remaining[-1]]
+            if target_line == source_line:
+                if any(target_by_no[no] != source_line for no in remaining[:-1]):
+                    return None
+                restore_positions = {
+                    no: int(no_to_car[no].get("Position") or index)
+                    for index, no in enumerate(remaining, start=1)
+                }
+                steps.append(physical.plan_step("Put", source_line, tuple(remaining), restore_positions))
+                physical.apply_physical_put_order(planning_cars, source_line, list(remaining), restore_positions)
+                remaining.clear()
+                break
+            start = len(remaining) - 1
+            while start > 0 and target_by_no.get(remaining[start - 1]) == target_line:
+                start -= 1
+            full_drop = tuple(remaining[start:])
+            full_group = [no_to_car[no] for no in full_drop]
+            full_positions = planned_positions_for_batch(
+                batch=full_group,
+                target_line=target_line,
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                batch_nos=set(remaining),
+            )
+            segment_start = self._tail_ordered_segment_start(
+                drop=full_drop,
+                positions=full_positions,
+            )
+            start += segment_start
+            drop = tuple(remaining[start:])
+            group = [no_to_car[no] for no in drop]
+            positions = planned_positions_for_batch(
+                batch=group,
+                target_line=target_line,
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                batch_nos=set(remaining),
+            )
+            if len(positions) != len(group):
+                return self._partial_candidate(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    source_line=source_line,
+                    line_cars=line_cars,
+                    steps=steps,
+                    remaining=remaining,
+                    progressed=progressed,
+                    no_to_car=no_to_car,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    graph=graph,
+                    loco_location=loco_location,
+                    serial_gate_leases=serial_gate_leases,
+                )
+            put_step = physical.plan_step("Put", target_line, drop, positions)
+            remaining_after_put = remaining[:start]
+            if not self._step_keeps_remainder_reachable(
+                steps=steps,
+                put_step=put_step,
+                source_line=source_line,
+                remaining_after_put=remaining_after_put,
+                no_to_car=no_to_car,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                graph=graph,
+                loco_location=loco_location,
+                serial_gate_leases=serial_gate_leases,
+            ):
+                return self._partial_candidate(
+                    case_id=case_id,
+                    hook_index=hook_index,
+                    source_line=source_line,
+                    line_cars=line_cars,
+                    steps=steps,
+                    remaining=remaining,
+                    progressed=progressed,
+                    no_to_car=no_to_car,
+                    cars=cars,
+                    depot_assignment=depot_assignment,
+                    graph=graph,
+                    loco_location=loco_location,
+                    serial_gate_leases=serial_gate_leases,
+                )
+            steps.append(put_step)
+            physical.apply_physical_put_order(planning_cars, target_line, list(drop), positions)
+            progressed.extend(drop)
+            del remaining[start:]
+        if not progressed:
+            return None
+        plan_steps = tuple(steps)
+        if not self.frontier.plan_steps_are_reachable(
+            steps=plan_steps,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases,
+            candidate_kind="vnext_stage4_linear_sweep",
+        ):
+            return None
+        return physical.build_planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=source_line,
+            target_line=steps[-1].line,
+            batch=line_cars,
+            steps=plan_steps,
+            reason=(
+                f"vnext:{self.template_name};source={source_line};"
+                f"put_lines={','.join(step.line for step in steps if step.action == 'Put')};"
+                f"progressed={','.join(progressed)}"
+            ),
+            candidate_kind="vnext_stage4_linear_sweep",
+        )
+
+    def _partial_candidate(
+        self,
+        *,
+        case_id: str,
+        hook_index: int,
+        source_line: str,
+        line_cars: list[dict[str, Any]],
+        steps: list[Any],
+        remaining: list[str],
+        progressed: list[str],
+        no_to_car: dict[str, dict[str, Any]],
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any],
+    ) -> Any | None:
+        if not progressed:
+            return None
+        final_steps = [*steps]
+        if remaining:
+            final_steps.append(self._source_restore_step(source_line, remaining, no_to_car))
+        plan_steps = tuple(final_steps)
+        if not self.frontier.plan_steps_are_reachable(
+            steps=plan_steps,
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases,
+            candidate_kind="vnext_stage4_linear_sweep",
+        ):
+            return None
+        return physical.build_planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=source_line,
+            target_line=final_steps[-1].line,
+            batch=line_cars,
+            steps=plan_steps,
+            reason=(
+                f"vnext:{self.template_name};source={source_line};"
+                f"partial=1;progressed={','.join(progressed)}"
+            ),
+            candidate_kind="vnext_stage4_linear_sweep",
+        )
+
+    def _step_keeps_remainder_reachable(
+        self,
+        *,
+        steps: list[Any],
+        put_step: Any,
+        source_line: str,
+        remaining_after_put: list[str],
+        no_to_car: dict[str, dict[str, Any]],
+        cars: list[dict[str, Any]],
+        depot_assignment: Any,
+        graph: Any,
+        loco_location: Any,
+        serial_gate_leases: dict[str, Any],
+    ) -> bool:
+        probe_steps = [*steps, put_step]
+        if remaining_after_put:
+            probe_steps.append(self._source_restore_step(source_line, remaining_after_put, no_to_car))
+        return self.frontier.plan_steps_are_reachable(
+            steps=tuple(probe_steps),
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases,
+            candidate_kind="vnext_stage4_linear_sweep",
+        )
+
+    def _source_restore_step(
+        self,
+        source_line: str,
+        remaining: list[str],
+        no_to_car: dict[str, dict[str, Any]],
+    ) -> Any:
+        positions = {
+            no: int(no_to_car[no].get("Position") or index)
+            for index, no in enumerate(remaining, start=1)
+        }
+        return physical.plan_step("Put", source_line, tuple(remaining), positions)
+
+    def _tail_ordered_segment_start(
+        self,
+        *,
+        drop: tuple[str, ...],
+        positions: dict[str, int],
+    ) -> int:
+        if len(positions) != len(drop):
+            return max(0, len(drop) - 1)
+        start = len(drop) - 1
+        while start > 0:
+            left = drop[start - 1]
+            right = drop[start]
+            if positions.get(right) != positions.get(left, 0) + 1:
+                break
+            start -= 1
+        return start
 
 
 class TailBlockerPeelDigestEpisode(Episode):
@@ -6826,8 +7877,10 @@ EPISODES: tuple[Episode, ...] = (
     Cun4ReleaseAcceptEpisode(),
     Cun4ReleaseGroupAssemblyEpisode(),
     DepotInboundGatherSessionEpisode(),
+    RemoteDirectCloseoutEpisode(),
     RemoteSessionPrefixDigestEpisode(),
     RemoteSessionEpisode(),
+    Stage4LinearSweepEpisode(),
     SourcePrefixReleaseEpisode(),
     DirectMoveEpisode(),
     SpottingRepackEpisode(),

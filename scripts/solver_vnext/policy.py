@@ -72,7 +72,7 @@ class BaselinePolicy:
         )
         if (
             not state.remote_session.active
-            and state.depot_inbound_assembly_accepted
+            and plan.depot_inbound_assembly_accepted
             and plan.depot_outbound.outbound_nos
             and phase_state.phase != PhaseKind.H4_REMOTE_DEPOT
         ):
@@ -91,7 +91,7 @@ class BaselinePolicy:
             )
         elif (
             not state.remote_session.active
-            and state.depot_inbound_assembly_accepted
+            and plan.depot_inbound_assembly_accepted
             and self._depot_inbound_release_pending(state.cars, state.depot_assignment)
             and phase_state.phase != PhaseKind.H4_REMOTE_DEPOT
         ):
@@ -110,6 +110,7 @@ class BaselinePolicy:
             )
         elif (
             not state.remote_session.active
+            and not plan.depot_inbound_assembly_accepted
             and plan.front_topology.must_finish_before_remote
             and phase_state.phase != PhaseKind.H1_FRONT_SERVICE
         ):
@@ -131,6 +132,7 @@ class BaselinePolicy:
             and flow_facts.remote_debt
             and phase_state.phase == PhaseKind.H1_FRONT_SERVICE
             and plan.front_topology.clear_for_remote
+            and not plan.depot_inbound_assembly_accepted
             and plan.depot_inbound.ungrouped_nos
         ):
             phase_state = replace(
@@ -223,6 +225,8 @@ class BaselinePolicy:
         )
 
     def _special_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        if self.releases_depot_inbound_assembly(candidate, context):
+            return 0
         if self.clears_depot_inbound_assembly_line(candidate, context):
             return 0
         if self.opens_cun4_for_depot_outbound(candidate, context):
@@ -255,9 +259,7 @@ class BaselinePolicy:
         if self.opens_cun4_for_depot_outbound(candidate, context):
             return 0
         if self.releases_depot_inbound_assembly(candidate, context):
-            if candidate.resource_delta.request.source_line == "存4线":
-                return 0
-            return 4
+            return 0
         if self.forms_depot_inbound_assembly(candidate, context):
             route_debt = self._depot_inbound_prospective_route_debt(candidate, context)
             if route_debt and route_debt >= self._depot_inbound_remaining_after_move_count(candidate, context):
@@ -442,11 +444,12 @@ class BaselinePolicy:
         if not remaining:
             return False
         after_by_no = {physical.car_no(car): car for car in candidate.prospective_cars}
-        remaining_lines = {
-            after_by_no[no]["Line"]
-            for no in remaining
-            if no in after_by_no
-        }
+        planned_lines = context.strategic_plan.depot_inbound.temporary_line_by_no
+        remaining_lines = self._depot_inbound_remaining_route_lines(
+            remaining=remaining,
+            after_by_no=after_by_no,
+            planned_lines=planned_lines,
+        )
         for put_line in candidate.resource_delta.request.put_lines:
             if remaining_lines & serial.downstream_lines(put_line):
                 return True
@@ -460,12 +463,17 @@ class BaselinePolicy:
             return 0
         after_by_no = {physical.car_no(car): car for car in candidate.prospective_cars}
         remaining_by_line: dict[str, int] = {}
+        planned_lines = context.strategic_plan.depot_inbound.temporary_line_by_no
         for no in remaining:
             car = after_by_no.get(no)
             if not car:
                 continue
-            line = car["Line"]
-            remaining_by_line[line] = remaining_by_line.get(line, 0) + 1
+            for line in self._depot_inbound_remaining_route_lines(
+                remaining={no},
+                after_by_no=after_by_no,
+                planned_lines=planned_lines,
+            ):
+                remaining_by_line[line] = remaining_by_line.get(line, 0) + 1
         if not remaining_by_line:
             return 0
         reachable = {
@@ -480,6 +488,23 @@ class BaselinePolicy:
         if reachable:
             return sum(count for line, count in remaining_by_line.items() if line not in reachable)
         return sum(remaining_by_line.values())
+
+    def _depot_inbound_remaining_route_lines(
+        self,
+        *,
+        remaining: set[str],
+        after_by_no: dict[str, dict[str, Any]],
+        planned_lines: dict[str, str],
+    ) -> set[str]:
+        lines: set[str] = set()
+        for no in remaining:
+            car = after_by_no.get(no)
+            if car:
+                lines.add(car["Line"])
+            planned_line = planned_lines.get(no, "")
+            if planned_line:
+                lines.add(planned_line)
+        return lines
 
     def _depot_inbound_remaining_after_move_count(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
         if candidate.envelope.intent != IntentKind.DEPOT_INBOUND_ASSEMBLY:
@@ -647,7 +672,7 @@ class BaselinePolicy:
         if self.opens_cun4_for_depot_outbound(candidate, context):
             return -30
         if self.releases_depot_inbound_assembly(candidate, context):
-            return 0 if plan.depot_inbound.assembly_complete else 30
+            return -40 if plan.depot_inbound.assembly_complete else 30
         if candidate.envelope.intent == IntentKind.CUN4_OUTBOUND_HOLD:
             moved = set(candidate.envelope.candidate.move_car_nos)
             if candidate.envelope.candidate.candidate_kind in {

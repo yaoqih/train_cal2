@@ -76,15 +76,18 @@ def classify_flow_facts(cars: list[dict[str, Any]], depot_assignment: Any) -> Fl
         for ref in refs
     )
     remote_debt = sum(
-        ref.is_remote_source
-        or ref.is_remote_target
-        or ref.contract_family
-        in {
-            ContractFamily.REPAIR_INBOUND,
-            ContractFamily.DEPOT_SLOT,
-            ContractFamily.DEPOT_OUTBOUND,
-            ContractFamily.CUN4_PORT_STAGING,
-        }
+        (
+            ref.is_remote_source
+            or ref.is_remote_target
+            or ref.contract_family
+            in {
+                ContractFamily.REPAIR_INBOUND,
+                ContractFamily.DEPOT_SLOT,
+                ContractFamily.DEPOT_OUTBOUND,
+                ContractFamily.CUN4_PORT_STAGING,
+            }
+        )
+        and not _target_capacity_blocked_by_satisfied_cars(ref, cars, depot_assignment)
         for ref in refs
     )
     front_debt = sum(ref.contract_family in FRONT_FAMILIES for ref in refs)
@@ -120,6 +123,27 @@ def classify_flow_facts(cars: list[dict[str, Any]], depot_assignment: Any) -> Fl
         cun4_port_mode=cun4_state.mode,
         cun4_release_count=cun4_state.release_count,
         cun4_prefix_hold_count=len(cun4_state.prefix_hold_nos),
+    )
+
+
+def _target_capacity_blocked_by_satisfied_cars(ref: Any, cars: list[dict[str, Any]], depot_assignment: Any) -> bool:
+    target_line = ref.target_line
+    if not target_line or target_line not in physical.TRACK_SPECS:
+        return False
+    by_no = {physical.car_no(car): car for car in cars}
+    car = by_no.get(ref.no)
+    if car is None:
+        return False
+    target_cars = [item for item in cars if item["Line"] == target_line]
+    if not target_cars:
+        return False
+    if not all(physical.car_is_satisfied(item, depot_assignment, cars) for item in target_cars):
+        return False
+    return not physical.line_has_length_capacity(
+        target_line,
+        cars,
+        [car],
+        {ref.no},
     )
 
 

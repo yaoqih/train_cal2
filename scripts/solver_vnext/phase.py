@@ -287,6 +287,8 @@ class HumanPhaseGate:
             return "H4"
         if family == ContractFamily.REMOTE_SESSION:
             return "H4"
+        if request.source_line in physical.REMOTE_INTERACTION_LINES or request.source_line == "存4线":
+            return "H4"
         if family in {
             ContractFamily.FUNCTION_LINE_SERVICE,
             ContractFamily.DISPATCH_SHED_QUEUE,

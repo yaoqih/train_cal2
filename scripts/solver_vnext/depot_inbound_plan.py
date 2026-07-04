@@ -391,19 +391,8 @@ def _preferred_lines_for_source(
 ) -> tuple[str, ...]:
     if _is_cun4_final_target(target_line):
         return ("存4线",)
-    if has_depot_outbound_debt:
-        if source_line in {"洗罐线北", "洗罐站", "油漆线", "抛丸线", "卸轮线"}:
-            return ("机南", "机走棚", "机走北", "洗油北")
-        if source_line in {"预修线", "调梁棚", "调梁线北", "机库线"}:
-            return ("机走棚", "机走北", "洗油北", "机南")
-        return ("机南", "机走棚", "机走北", "洗油北")
-    if source_line in {"洗罐线北", "洗罐站", "油漆线", "抛丸线", "卸轮线"}:
-        return ("机南", "洗油北", "机走棚", "机走北")
-    if source_line in {"预修线", "调梁棚", "调梁线北", "机库线"}:
-        return ("机南", "机走棚", "机走北", "洗油北")
-    if source_line in {"存1线", "存2线", "存3线", "存5线北", "存5线南", "存4南"}:
-        return ("机南", "机走棚", "机走北", "洗油北")
-    return ("机南", "机走棚", "机走北", "洗油北")
+    del source_line, has_depot_outbound_debt
+    return ("机南", "洗油北", "机走棚", "机走北")
 
 
 def _is_cun4_final_target(target_line: str) -> bool:
