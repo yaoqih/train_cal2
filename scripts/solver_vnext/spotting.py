@@ -1259,26 +1259,50 @@ def _target_line_rebuild_steps(
 ) -> tuple[Any, ...]:
     steps: list[Any] = []
     staged_by_group: dict[int, str] = {}
+    target_chunk_lines: dict[tuple[int, tuple[str, ...]], str] = {}
     target_access_chunks: dict[int, tuple[tuple[str, ...], ...]] = {}
+    used_target_staging_lines: set[str] = set()
     for group_index, group in enumerate(target_groups):
         staging_line = staging_assignment[group_index]
-        positions = planned_positions_for_batch(
-            batch=list(group.cars),
-            target_line=staging_line,
-            cars=cars,
-            depot_assignment=depot_assignment,
-            batch_nos=set(group.nos),
-        )
-        if len(positions) != len(group.cars):
-            return ()
         tail_chunks = _target_group_put_chunks(group.nos, final_positions)
         if not tail_chunks:
             return ()
+        desired_chunks = tuple(sorted(tail_chunks, key=lambda chunk: _deep_to_near_chunk_key(chunk, final_positions)))
         steps.append(physical.plan_step("Get", target_line, group.nos))
+        if len(tail_chunks) == 1 or tuple(reversed(tail_chunks)) == desired_chunks:
+            positions = planned_positions_for_batch(
+                batch=list(group.cars),
+                target_line=staging_line,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                batch_nos=set(group.nos),
+            )
+            if len(positions) != len(group.cars):
+                return ()
+            for put_nos in tail_chunks:
+                steps.append(physical.plan_step("Put", staging_line, put_nos, _positions_for(put_nos, positions)))
+            staged_by_group[group_index] = staging_line
+            target_access_chunks[group_index] = tuple(reversed(tail_chunks))
+            used_target_staging_lines.add(staging_line)
+            continue
+
+        chunk_assignment = _target_chunk_staging_assignment(
+            chunks=tail_chunks,
+            group_cars=group.cars,
+            preferred_line=staging_line,
+            source_line=source_line,
+            target_line=target_line,
+            excluded_lines=used_target_staging_lines,
+            cars=cars,
+            depot_assignment=depot_assignment,
+        )
+        if chunk_assignment is None:
+            return ()
         for put_nos in tail_chunks:
-            steps.append(physical.plan_step("Put", staging_line, put_nos, _positions_for(put_nos, positions)))
-        staged_by_group[group_index] = staging_line
-        target_access_chunks[group_index] = tuple(reversed(tail_chunks))
+            chunk_staging_line, positions = chunk_assignment[put_nos]
+            steps.append(physical.plan_step("Put", chunk_staging_line, put_nos, positions))
+            target_chunk_lines[(group_index, put_nos)] = chunk_staging_line
+            used_target_staging_lines.add(chunk_staging_line)
 
     source_with_blockers = (*source_blockers, *source_batch)
     if source_with_blockers:
@@ -1289,18 +1313,59 @@ def _target_line_rebuild_steps(
     for group_index, chunks in target_access_chunks.items():
         for chunk in chunks:
             rebuild_chunks.append(("target", group_index, chunk))
+    for group_index, chunk in target_chunk_lines:
+        rebuild_chunks.append(("target", group_index, chunk))
     for chunk in source_chunks:
         rebuild_chunks.append(("source", -1, chunk))
     rebuild_chunks.sort(key=lambda item: _deep_to_near_chunk_key(item[2], final_positions))
+    source_staging = _source_chunk_staging_assignment(
+        source_chunks=source_chunks,
+        rebuild_chunks=tuple(rebuild_chunks),
+        source_batch=source_batch,
+        source_line=source_line,
+        target_line=target_line,
+        excluded_lines=set(staged_by_group.values()) | set(target_chunk_lines.values()),
+        cars=cars,
+        depot_assignment=depot_assignment,
+    )
+    if source_staging is None:
+        return ()
 
     next_source_chunk = 0
+    staged_source_chunks: dict[int, str] = {}
+    source_chunk_indexes = {chunk: index for index, chunk in enumerate(source_chunks)}
     next_target_chunk = {group_index: 0 for group_index in target_access_chunks}
     for origin, group_index, chunk in rebuild_chunks:
         if origin == "source":
+            chunk_index = source_chunk_indexes.get(chunk)
+            if chunk_index is None:
+                return ()
+            if chunk_index > next_source_chunk:
+                for staged_index in range(next_source_chunk, chunk_index):
+                    staged_chunk = source_chunks[staged_index]
+                    assignment = source_staging.get(staged_index)
+                    if assignment is None:
+                        return ()
+                    staging_line, staging_positions = assignment
+                    steps.append(physical.plan_step("Put", staging_line, staged_chunk, staging_positions))
+                    staged_source_chunks[staged_index] = staging_line
+                next_source_chunk = chunk_index
+            elif chunk_index < next_source_chunk:
+                staging_line = staged_source_chunks.pop(chunk_index, "")
+                if not staging_line:
+                    return ()
+                steps.append(physical.plan_step("Get", staging_line, chunk))
+                steps.append(physical.plan_step("Put", target_line, chunk, _positions_for(chunk, final_positions)))
+                continue
             if next_source_chunk >= len(source_chunks) or source_chunks[next_source_chunk] != chunk:
                 return ()
             steps.append(physical.plan_step("Put", target_line, chunk, _positions_for(chunk, final_positions)))
             next_source_chunk += 1
+            continue
+        chunk_staging_line = target_chunk_lines.pop((group_index, chunk), "")
+        if chunk_staging_line:
+            steps.append(physical.plan_step("Get", chunk_staging_line, chunk))
+            steps.append(physical.plan_step("Put", target_line, chunk, _positions_for(chunk, final_positions)))
             continue
         chunks = target_access_chunks[group_index]
         chunk_index = next_target_chunk[group_index]
@@ -1313,6 +1378,10 @@ def _target_line_rebuild_steps(
 
     if next_source_chunk != len(source_chunks):
         return ()
+    if staged_source_chunks:
+        return ()
+    if target_chunk_lines:
+        return ()
     if any(next_target_chunk[index] != len(chunks) for index, chunks in target_access_chunks.items()):
         return ()
     if source_blockers:
@@ -1322,6 +1391,133 @@ def _target_line_rebuild_steps(
         }
         steps.append(physical.plan_step("Put", source_line, _nos(source_blockers), restore_positions))
     return tuple(steps)
+
+
+def _target_chunk_staging_assignment(
+    *,
+    chunks: tuple[tuple[str, ...], ...],
+    group_cars: tuple[dict[str, Any], ...],
+    preferred_line: str,
+    source_line: str,
+    target_line: str,
+    excluded_lines: set[str],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+) -> dict[tuple[str, ...], tuple[str, dict[str, int]]] | None:
+    by_no = {physical.car_no(car): car for car in group_cars}
+    grouped = physical.cars_by_line(cars)
+    used_lines = {source_line, target_line, *excluded_lines}
+    candidate_lines = tuple(dict.fromkeys((preferred_line, *SPOTTING_REPACK_STAGING_LINES)))
+    assignment: dict[tuple[str, ...], tuple[str, dict[str, int]]] = {}
+    for chunk in chunks:
+        batch = tuple(by_no[no] for no in chunk if no in by_no)
+        if len(batch) != len(chunk):
+            return None
+        moving_nos = set(chunk)
+        for staging_line in candidate_lines:
+            if staging_line in used_lines:
+                continue
+            positions = planned_positions_for_batch(
+                batch=list(batch),
+                target_line=staging_line,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                batch_nos=moving_nos,
+            )
+            if (
+                len(positions) == len(batch)
+                and physical.candidate_positions_available(staging_line, positions, cars, moving_nos, grouped)
+                and physical.line_has_length_capacity(staging_line, cars, list(batch), moving_nos, grouped=grouped)
+            ):
+                assignment[chunk] = (staging_line, positions)
+                used_lines.add(staging_line)
+                break
+        else:
+            return None
+    return assignment
+
+
+def _source_chunk_staging_assignment(
+    *,
+    source_chunks: tuple[tuple[str, ...], ...],
+    rebuild_chunks: tuple[tuple[str, int, tuple[str, ...]], ...],
+    source_batch: tuple[dict[str, Any], ...],
+    source_line: str,
+    target_line: str,
+    excluded_lines: set[str],
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+) -> dict[int, tuple[str, dict[str, int]]] | None:
+    required_indexes = _source_chunk_indexes_requiring_staging(source_chunks, rebuild_chunks)
+    if required_indexes is None:
+        return None
+    if not required_indexes:
+        return {}
+
+    by_no = {physical.car_no(car): car for car in source_batch}
+    grouped = physical.cars_by_line(cars)
+    used_lines = {source_line, target_line, *excluded_lines}
+    assignment: dict[int, tuple[str, dict[str, int]]] = {}
+    for chunk_index in sorted(required_indexes):
+        chunk = source_chunks[chunk_index]
+        batch = tuple(by_no[no] for no in chunk if no in by_no)
+        if len(batch) != len(chunk):
+            return None
+        moving_nos = set(chunk)
+        for staging_line in SPOTTING_REPACK_STAGING_LINES:
+            if staging_line in used_lines:
+                continue
+            positions = planned_positions_for_batch(
+                batch=list(batch),
+                target_line=staging_line,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                batch_nos=moving_nos,
+            )
+            if (
+                len(positions) == len(batch)
+                and physical.candidate_positions_available(staging_line, positions, cars, moving_nos, grouped)
+                and physical.line_has_length_capacity(staging_line, cars, list(batch), moving_nos, grouped=grouped)
+            ):
+                assignment[chunk_index] = (staging_line, positions)
+                used_lines.add(staging_line)
+                break
+        else:
+            return None
+    return assignment
+
+
+def _source_chunk_indexes_requiring_staging(
+    source_chunks: tuple[tuple[str, ...], ...],
+    rebuild_chunks: tuple[tuple[str, int, tuple[str, ...]], ...],
+) -> set[int] | None:
+    if not source_chunks:
+        return set()
+    chunk_indexes = {chunk: index for index, chunk in enumerate(source_chunks)}
+    required: set[int] = set()
+    staged: set[int] = set()
+    next_source_chunk = 0
+    for origin, _, chunk in rebuild_chunks:
+        if origin != "source":
+            continue
+        chunk_index = chunk_indexes.get(chunk)
+        if chunk_index is None:
+            return None
+        if chunk_index > next_source_chunk:
+            for staged_index in range(next_source_chunk, chunk_index):
+                required.add(staged_index)
+                staged.add(staged_index)
+            next_source_chunk = chunk_index + 1
+            continue
+        if chunk_index == next_source_chunk:
+            next_source_chunk += 1
+            continue
+        if chunk_index not in staged:
+            return None
+        staged.remove(chunk_index)
+    if next_source_chunk != len(source_chunks) or staged:
+        return None
+    return required
 
 
 def _deep_to_near_chunk_key(

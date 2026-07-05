@@ -100,18 +100,6 @@ class BaselinePolicy:
             plan = build_plan(phase_state.phase)
         elif (
             not state.remote_session.active
-            and not plan.depot_inbound_assembly_accepted
-            and plan.front_topology.must_finish_before_remote
-            and phase_state.phase != PhaseKind.H1_FRONT_SERVICE
-        ):
-            phase_state = replace(
-                phase_state,
-                phase=PhaseKind.H1_FRONT_SERVICE,
-                reason=f"front_topology_priority_before_remote:{','.join(plan.front_topology.priority_lines)}",
-            )
-            plan = build_plan(phase_state.phase)
-        elif (
-            not state.remote_session.active
             and flow_facts.remote_debt
             and phase_state.phase == PhaseKind.H1_FRONT_SERVICE
             and plan.front_topology.clear_for_remote
@@ -120,8 +108,16 @@ class BaselinePolicy:
         ):
             phase_state = replace(
                 phase_state,
-                phase=PhaseKind.H4_REMOTE_DEPOT,
-                reason="front_topology_clear_depot_inbound_priority",
+                phase=PhaseKind.H1_FRONT_SERVICE,
+                reason="stage1_depot_inbound_assembly_priority",
+            )
+            plan = build_plan(phase_state.phase)
+        stage_phase = self._four_stage_phase(plan)
+        if phase_state.phase != stage_phase:
+            phase_state = replace(
+                phase_state,
+                phase=stage_phase,
+                reason=plan.four_stage.reason,
             )
             plan = build_plan(phase_state.phase)
         phase_state = replace(
@@ -139,6 +135,13 @@ class BaselinePolicy:
             last_business_remote=state.last_business_remote,
             strategic_plan=plan,
         )
+
+    def _four_stage_phase(self, plan: strategic.StrategicPlan) -> PhaseKind:
+        if plan.four_stage.stage == 1:
+            return PhaseKind.H1_FRONT_SERVICE
+        if plan.four_stage.stage in {2, 3}:
+            return PhaseKind.H4_REMOTE_DEPOT
+        return PhaseKind.H5_CLOSEOUT
 
     def _depot_inbound_release_pending(self, cars: list[dict[str, Any]], depot_assignment: Any) -> bool:
         loads = physical.line_loads(cars)
@@ -201,6 +204,28 @@ class BaselinePolicy:
         )
 
     def _special_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        stage = context.strategic_plan.four_stage.stage
+        candidate_kind = getattr(candidate.envelope.candidate, "candidate_kind", "")
+        if stage == 2:
+            if candidate_kind == "vnext_cun4_unwheel_release":
+                return 0
+            if candidate_kind in {
+                "vnext_depot_outbound_session",
+                "vnext_depot_outbound_depot_reorder_session",
+            }:
+                return 0
+            if candidate_kind in {
+                "vnext_depot_cun4_source_repack_exchange",
+                "vnext_depot_cun4_inbound_outbound_exchange",
+            }:
+                return 1
+            return 20
+        if stage == 3:
+            if candidate_kind == "vnext_depot_inbound_assembly_release":
+                return 0
+            if candidate_kind == "vnext_depot_inbound_gather_session":
+                return 1
+            return 20
         if self.releases_depot_inbound_assembly(candidate, context):
             return 0
         if self.clears_depot_inbound_assembly_line(candidate, context):
@@ -226,6 +251,32 @@ class BaselinePolicy:
         return 3
 
     def _candidate_lane(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
+        stage = context.strategic_plan.four_stage.stage
+        candidate_kind = getattr(candidate.envelope.candidate, "candidate_kind", "")
+        if stage == 1 and context.strategic_plan.four_stage.front_priority_nos:
+            if self._stage1_front_priority_candidate(candidate, context):
+                return 0
+            if candidate.envelope.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
+                return 5
+        if stage == 2:
+            if candidate_kind in {
+                "vnext_cun4_unwheel_release",
+                "vnext_depot_outbound_session",
+                "vnext_depot_outbound_depot_reorder_session",
+            }:
+                return 0
+            if candidate_kind in {
+                "vnext_depot_cun4_source_repack_exchange",
+                "vnext_depot_cun4_inbound_outbound_exchange",
+            }:
+                return 1
+            return 30
+        if stage == 3:
+            if candidate_kind == "vnext_depot_inbound_assembly_release":
+                return 0
+            if candidate_kind == "vnext_depot_inbound_gather_session":
+                return 1
+            return 30
         if candidate.envelope.intent == IntentKind.CUN4_RELEASE_ACCEPT:
             return 0
         if self.clears_depot_inbound_assembly_line(candidate, context):
@@ -244,7 +295,7 @@ class BaselinePolicy:
                 return 35
             if (
                 context.phase_state.phase == PhaseKind.H1_FRONT_SERVICE
-                and context.strategic_plan.front_topology.must_finish_before_remote
+                and context.strategic_plan.front_topology.priority_nos
                 and candidate.resource_delta.request.source_line not in context.strategic_plan.front_topology.priority_lines
             ):
                 return 25
@@ -286,8 +337,17 @@ class BaselinePolicy:
             return 40
         return 10
 
+    def _stage1_front_priority_candidate(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
+        if candidate.envelope.intent != IntentKind.FRONT_PREP:
+            return False
+        request = candidate.resource_delta.request
+        if plan_facts.touches_remote(request):
+            return False
+        priority_nos = set(context.strategic_plan.four_stage.front_priority_nos)
+        return bool(set(candidate.envelope.candidate.move_car_nos) & priority_nos)
+
     def _front_topology_priority_move(self, candidate: EvaluatedCandidate, context: PolicyContext) -> bool:
-        if not context.strategic_plan.front_topology.must_finish_before_remote:
+        if not context.strategic_plan.front_topology.priority_nos:
             return False
         request = candidate.resource_delta.request
         priority_lines = set(context.strategic_plan.front_topology.priority_lines)
@@ -625,9 +685,27 @@ class BaselinePolicy:
     def _plan_candidate_rank(self, candidate: EvaluatedCandidate, context: PolicyContext) -> int:
         request = candidate.resource_delta.request
         plan = context.strategic_plan
+        candidate_kind = getattr(candidate.envelope.candidate, "candidate_kind", "")
+        if plan.four_stage.stage == 2:
+            if plan.four_stage.unwheel_release_nos or plan.four_stage.unwheel_dirty_nos:
+                return -100 if candidate_kind == "vnext_cun4_unwheel_release" else 50
+            if candidate_kind in {"vnext_depot_outbound_session", "vnext_depot_outbound_prefix_reorder"}:
+                return -100
+            if candidate_kind in {
+                "vnext_depot_cun4_source_repack_exchange",
+                "vnext_depot_cun4_inbound_outbound_exchange",
+            }:
+                return -80
+            return 50
+        if plan.four_stage.stage == 3:
+            if candidate_kind == "vnext_depot_inbound_assembly_release":
+                return -100
+            if candidate_kind == "vnext_depot_inbound_gather_session":
+                return -80
+            return 50
         if (
             context.phase_state.phase == PhaseKind.H1_FRONT_SERVICE
-            and plan.front_topology.must_finish_before_remote
+            and plan.front_topology.priority_nos
         ):
             if self.clears_depot_inbound_assembly_line(candidate, context):
                 return -20
@@ -712,6 +790,35 @@ class BaselinePolicy:
 
     def _strategic_contract_rank(self, contract: FlowContract, context: PolicyContext) -> int:
         plan = context.strategic_plan
+        if plan.four_stage.stage == 1:
+            subject_nos = set(contract.subject_nos)
+            if subject_nos & set(plan.four_stage.front_priority_nos):
+                return 0
+            if (
+                contract.family == ContractFamily.REMOTE_SESSION
+                and subject_nos & set(plan.four_stage.depot_inbound_ungrouped_nos)
+            ):
+                return 1
+            lines = set(contract.source_lines) | set(contract.target_lines)
+            if lines & physical.DEPOT_INBOUND_DESTINATION_LINES:
+                return 50
+            return 10
+        if plan.four_stage.stage == 2:
+            subject_nos = set(contract.subject_nos)
+            if subject_nos & set(plan.four_stage.unwheel_release_nos):
+                return 0
+            if subject_nos & set(plan.depot_outbound.cun4_nos):
+                return 1
+            if contract.family in {ContractFamily.REMOTE_SESSION, ContractFamily.DEPOT_OUTBOUND, ContractFamily.CUN4_PORT_STAGING}:
+                return 5
+            return 50
+        if plan.four_stage.stage == 3:
+            subject_nos = set(contract.subject_nos)
+            if subject_nos & set(plan.four_stage.depot_inbound_release_nos):
+                return 0
+            if contract.family in {ContractFamily.REMOTE_SESSION, ContractFamily.REPAIR_INBOUND, ContractFamily.DEPOT_SLOT}:
+                return 5
+            return 50
         if plan.depot_inbound.purity_violation_nos:
             lines = set(contract.source_lines)
             if lines & set(plan.depot_inbound.purity_violation_lines):
@@ -719,7 +826,7 @@ class BaselinePolicy:
                     return 0
         if (
             context.phase_state.phase == PhaseKind.H1_FRONT_SERVICE
-            and plan.front_topology.must_finish_before_remote
+            and plan.front_topology.priority_nos
         ):
             lines = set(contract.source_lines) | set(contract.target_lines)
             if lines & set(plan.front_topology.priority_lines):
@@ -736,6 +843,35 @@ class BaselinePolicy:
         return 10
 
     def _phase_family_rank(self, family: ContractFamily, context: PolicyContext) -> int:
+        stage = context.strategic_plan.four_stage.stage
+        if stage == 1:
+            stage1_order = {
+                ContractFamily.FUNCTION_LINE_SERVICE: 0,
+                ContractFamily.DISPATCH_SHED_QUEUE: 1,
+                ContractFamily.PRE_REPAIR_STAGING: 2,
+                ContractFamily.REMOTE_SESSION: 3,
+                ContractFamily.REPAIR_INBOUND: 4,
+                ContractFamily.LOCO_AREA_STAGING: 5,
+                ContractFamily.YARD_REBALANCE: 6,
+            }
+            return stage1_order.get(family, 50)
+        if stage == 2:
+            stage2_order = {
+                ContractFamily.REMOTE_SESSION: 0,
+                ContractFamily.CUN4_PORT_STAGING: 1,
+                ContractFamily.DEPOT_OUTBOUND: 2,
+                ContractFamily.REPAIR_INBOUND: 8,
+                ContractFamily.DEPOT_SLOT: 9,
+            }
+            return stage2_order.get(family, 50)
+        if stage == 3:
+            stage3_order = {
+                ContractFamily.REMOTE_SESSION: 0,
+                ContractFamily.REPAIR_INBOUND: 1,
+                ContractFamily.DEPOT_SLOT: 2,
+                ContractFamily.DEPOT_OUTBOUND: 8,
+            }
+            return stage3_order.get(family, 50)
         phase = context.phase_state.phase
         if phase == PhaseKind.H1_FRONT_SERVICE:
             front_order = {

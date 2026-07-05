@@ -481,11 +481,11 @@ class HumanPhaseGate:
             return "h4_depot_outbound_assembly_before_closeout"
         if phase == "H4" and not phase_state.depot_inbound_assembly_complete and target_phase == "H5":
             return "h4_depot_inbound_assembly_before_closeout"
-        if phase == "H1" and not phase_state.front_topology_clear_for_remote:
+        if phase == "H1" and not phase_state.depot_inbound_assembly_complete:
             if target_phase in {"H3", "H4"}:
                 if request.intent == IntentKind.DEPOT_INBOUND_ASSEMBLY:
                     return ""
-                return "h1_front_topology_requires_service_before_remote"
+                return "h1_depot_inbound_assembly_before_remote"
         return ""
 
     def _h2_port_can_exit_without_release(self, phase_state: PhaseState) -> bool:

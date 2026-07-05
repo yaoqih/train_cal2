@@ -16,7 +16,8 @@ FRONT_TOPOLOGY_PRIORITY_LINES = (
     "洗罐线北",
     "油漆线",
     "抛丸线",
-    "卸轮线",
+    "调梁棚",
+    "调梁线北",
 )
 DEPOT_INBOUND_ASSEMBLY_OWNER_KINDS = {
     "vnext_depot_inbound_multisource_assembly_session",
@@ -30,6 +31,19 @@ DEPOT_INBOUND_ASSEMBLY_OWNER_KINDS = {
 }
 DEPOT_INBOUND_TEMPORARY_CLEANOUT_KINDS = {
     "temporary_cleanout",
+}
+STAGE2_OWNER_KINDS = {
+    "vnext_cun4_unwheel_release",
+    "vnext_unwheel_outbound_source_prefix",
+    "vnext_depot_outbound_session",
+    "vnext_depot_outbound_plan_session",
+    "vnext_depot_outbound_depot_reorder_session",
+    "vnext_depot_cun4_source_repack_exchange",
+    "vnext_depot_cun4_inbound_outbound_exchange",
+}
+STAGE3_OWNER_KINDS = {
+    "vnext_depot_inbound_assembly_release",
+    "vnext_depot_inbound_gather_session",
 }
 
 
@@ -75,6 +89,22 @@ class PhaseCompletionPlan:
 
 
 @dataclass(frozen=True)
+class FourStagePlan:
+    stage: int
+    reason: str
+    stage1_complete: bool
+    stage2_complete: bool
+    stage3_complete: bool
+    front_priority_nos: tuple[str, ...]
+    depot_inbound_grouped_nos: tuple[str, ...]
+    depot_inbound_ungrouped_nos: tuple[str, ...]
+    unwheel_release_nos: tuple[str, ...]
+    unwheel_dirty_nos: tuple[str, ...]
+    depot_outbound_nos: tuple[str, ...]
+    depot_inbound_release_nos: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class StrategicPlan:
     phase: PhaseKind
     front_topology: FrontTopologyPlan
@@ -83,6 +113,7 @@ class StrategicPlan:
     cun4_release: Cun4ReleasePortPlan
     remote_session: RemoteSessionContinuityPlan
     completion: PhaseCompletionPlan
+    four_stage: FourStagePlan
     depot_inbound_assembly_accepted: bool
 
 
@@ -137,6 +168,14 @@ def build_strategic_plan(
         depot_outbound=depot_outbound,
         remote_debt=remote_debt,
     )
+    four_stage = build_four_stage_plan(
+        cars=cars,
+        depot_assignment=depot_assignment,
+        front_topology=front_topology,
+        depot_inbound=depot_inbound,
+        depot_outbound=depot_outbound,
+        cun4_release=cun4_release,
+    )
     return StrategicPlan(
         phase=phase,
         front_topology=front_topology,
@@ -145,6 +184,7 @@ def build_strategic_plan(
         cun4_release=cun4_release,
         remote_session=remote_continuity,
         completion=completion,
+        four_stage=four_stage,
         depot_inbound_assembly_accepted=depot_inbound_assembly_accepted,
     )
 
@@ -156,10 +196,18 @@ def build_front_topology_plan(
     remote_debt: int,
 ) -> FrontTopologyPlan:
     refs = [ref for ref in build_car_refs(cars, depot_assignment) if not ref.satisfied]
+    initial_line_by_no = {
+        physical.car_no(car): car.get("_InitialLine", car["Line"])
+        for car in cars
+    }
     priority_refs = [
         ref
         for ref in refs
         if ref.line in FRONT_TOPOLOGY_PRIORITY_LINES
+        or (
+            ref.target_line in FRONT_TOPOLOGY_PRIORITY_LINES
+            and initial_line_by_no.get(ref.no, ref.line) not in physical.DEPOT_INBOUND_DESTINATION_LINES
+        )
     ]
     ordered_refs = sorted(
         priority_refs,
@@ -175,29 +223,104 @@ def build_front_topology_plan(
             line
             for ref in ordered_refs
             for line in (ref.line, ref.target_line)
-            if line == ref.line and line in FRONT_TOPOLOGY_PRIORITY_LINES
+            if line in FRONT_TOPOLOGY_PRIORITY_LINES
         )
     )
     priority_nos = tuple(ref.no for ref in ordered_refs)
-    must_finish_before_remote = bool(priority_nos and remote_debt)
     if not priority_nos:
         status = "pass"
-        reason = "front_topology_clear"
-    elif must_finish_before_remote:
-        status = "warn"
-        reason = "front_topology_priority_before_remote"
+        reason = "front_business_clear"
     else:
         status = "pass"
-        reason = "front_topology_priority_without_remote"
+        reason = "front_business_priority_pending"
     return FrontTopologyPlan(
         status=status,
         reason=reason,
         priority_lines=priority_lines,
         priority_nos=priority_nos,
-        blocked_risk_lines=priority_lines if must_finish_before_remote else (),
-        must_finish_before_remote=must_finish_before_remote,
-        clear_for_remote=not must_finish_before_remote,
+        blocked_risk_lines=(),
+        must_finish_before_remote=False,
+        clear_for_remote=True,
     )
+
+
+def build_four_stage_plan(
+    *,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    front_topology: FrontTopologyPlan,
+    depot_inbound: depot_inbound_plan.DepotInboundAssemblyPlan,
+    depot_outbound: depot_outbound_plan.DepotOutboundAssemblyPlan,
+    cun4_release: Cun4ReleasePortPlan,
+) -> FourStagePlan:
+    release_nos = _depot_inbound_release_nos(
+        cars=cars,
+        depot_assignment=depot_assignment,
+        depot_inbound=depot_inbound,
+    )
+    unwheel_dirty_nos = cun4_release.dirty_nos if cun4_release.release_nos else ()
+    stage1_complete = depot_inbound.assembly_complete
+    stage2_complete = (
+        not cun4_release.release_nos
+        and not unwheel_dirty_nos
+        and not depot_outbound.outbound_nos
+    )
+    stage3_complete = not release_nos
+    if not stage1_complete:
+        stage = 1
+        reason = "stage1_front_service_and_depot_inbound_assembly"
+    elif not stage2_complete:
+        stage = 2
+        reason = "stage2_unwheel_release_and_depot_outbound_to_cun4"
+    elif not stage3_complete:
+        stage = 3
+        reason = "stage3_depot_inbound_release_to_depot"
+    else:
+        stage = 4
+        reason = "stage4_residual_closeout"
+    return FourStagePlan(
+        stage=stage,
+        reason=reason,
+        stage1_complete=stage1_complete,
+        stage2_complete=stage2_complete,
+        stage3_complete=stage3_complete,
+        front_priority_nos=front_topology.priority_nos,
+        depot_inbound_grouped_nos=depot_inbound.grouped_nos,
+        depot_inbound_ungrouped_nos=depot_inbound.ungrouped_nos,
+        unwheel_release_nos=cun4_release.release_nos,
+        unwheel_dirty_nos=unwheel_dirty_nos,
+        depot_outbound_nos=depot_outbound.outbound_nos,
+        depot_inbound_release_nos=release_nos,
+    )
+
+
+def _depot_inbound_release_nos(
+    *,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    depot_inbound: depot_inbound_plan.DepotInboundAssemblyPlan,
+) -> tuple[str, ...]:
+    if not depot_inbound.inbound_nos:
+        return ()
+    inbound_nos = set(depot_inbound.inbound_nos)
+    loads = physical.line_loads(cars)
+    pending: list[str] = []
+    for car in physical.unsatisfied_cars(cars, depot_assignment):
+        no = physical.car_no(car)
+        if no not in inbound_nos:
+            continue
+        target_line, _position, _reason = physical.planned_target_for_car(
+            car,
+            cars,
+            depot_assignment,
+            loads,
+        )
+        if target_line not in physical.DEPOT_INBOUND_DESTINATION_LINES:
+            continue
+        if car["Line"] in physical.DEPOT_INBOUND_DESTINATION_LINES:
+            continue
+        pending.append(no)
+    return tuple(pending)
 
 
 def build_cun4_release_port_plan(
@@ -290,7 +413,7 @@ def build_phase_completion_plan(
     depot_outbound: depot_outbound_plan.DepotOutboundAssemblyPlan,
     remote_debt: int,
 ) -> PhaseCompletionPlan:
-    h1_can_exit = front_topology.clear_for_remote
+    h1_can_exit = depot_inbound.assembly_complete
     h4_can_close = (
         remote_debt == 0
         and depot_inbound.assembly_complete
@@ -298,7 +421,7 @@ def build_phase_completion_plan(
     )
     if not h1_can_exit:
         status = "warn"
-        reason = "h1_front_topology_not_clear"
+        reason = "h1_depot_inbound_assembly_not_clear"
     elif not h4_can_close and remote_debt:
         status = "warn"
         reason = "h4_remote_debt_not_clear"
@@ -324,6 +447,92 @@ def planned_temporary_line(plan: StrategicPlan, no: str) -> str:
     if no not in mapping:
         raise KeyError(f"not_in_depot_outbound_plan:{no}")
     return mapping[no]
+
+
+def four_stage_plan_violations(
+    *,
+    plan: StrategicPlan,
+    candidate: Any,
+) -> tuple[str, ...]:
+    stage = plan.four_stage.stage
+    if stage == 4:
+        return ()
+    candidate_kind = getattr(candidate, "candidate_kind", "")
+    steps = tuple(physical.candidate_plan_steps(candidate))
+    touched_lines = {step.line for step in steps if step.action in {"Get", "Put"}}
+    put_lines = {step.line for step in steps if step.action == "Put"}
+    violations: list[str] = []
+    if stage == 1:
+        if touched_lines & physical.DEPOT_INBOUND_DESTINATION_LINES:
+            violations.append(
+                "stage1_forbids_depot_lines:"
+                + ",".join(sorted(touched_lines & physical.DEPOT_INBOUND_DESTINATION_LINES))
+            )
+        if (
+            put_lines & set(depot_inbound_plan.ASSEMBLY_LINES)
+            and candidate_kind not in DEPOT_INBOUND_ASSEMBLY_OWNER_KINDS
+            and not _all_assembly_puts_are_same_plan_temporary(candidate)
+        ):
+            violations.append(f"stage1_assembly_lines_owned_by_depot_inbound:{candidate_kind}")
+        return tuple(violations)
+    if stage == 2:
+        if plan.four_stage.unwheel_release_nos or plan.four_stage.unwheel_dirty_nos:
+            if candidate_kind not in {"vnext_cun4_unwheel_release", "vnext_unwheel_outbound_source_prefix"}:
+                violations.append(f"stage2_unwheel_release_before_depot_outbound:{candidate_kind}")
+        elif plan.four_stage.depot_outbound_nos and candidate_kind not in STAGE2_OWNER_KINDS:
+            violations.append(f"stage2_depot_outbound_requires_owner:{candidate_kind}")
+        allowed_lines = set(physical.DEPOT_INBOUND_DESTINATION_LINES) | {"存4线"}
+        external_put_lines = put_lines - allowed_lines
+        if external_put_lines:
+            violations.append(
+                "stage2_forbids_non_depot_staging:"
+                + ",".join(sorted(external_put_lines))
+            )
+        if "存4线" in put_lines and not _stage2_cun4_put_is_final_pull(plan=plan, candidate=candidate):
+            violations.append("stage2_cun4_only_final_depot_outbound_pull")
+        return tuple(violations)
+    if stage == 3:
+        if candidate_kind not in STAGE3_OWNER_KINDS:
+            violations.append(f"stage3_depot_inbound_release_requires_owner:{candidate_kind}")
+        allowed_lines = set(physical.DEPOT_INBOUND_DESTINATION_LINES) | set(physical.DEPOT_INBOUND_ASSEMBLY_LINES)
+        external_put_lines = put_lines - allowed_lines
+        if external_put_lines:
+            violations.append(
+                "stage3_forbids_non_depot_staging:"
+                + ",".join(sorted(external_put_lines))
+            )
+        return tuple(violations)
+    return ()
+
+
+def _stage2_cun4_put_is_final_pull(*, plan: StrategicPlan, candidate: Any) -> bool:
+    steps = tuple(physical.candidate_plan_steps(candidate))
+    cun4_put_steps = [step for step in steps if step.action == "Put" and step.line == "存4线"]
+    if not cun4_put_steps:
+        return True
+    if len(cun4_put_steps) != 1 or steps[-1] != cun4_put_steps[0]:
+        return False
+    required_nos = set(plan.depot_outbound.pull_order_nos or plan.four_stage.depot_outbound_nos)
+    if not required_nos:
+        return False
+    return required_nos <= set(cun4_put_steps[0].move_car_nos)
+
+
+def _all_assembly_puts_are_same_plan_temporary(candidate: Any) -> bool:
+    steps = tuple(physical.candidate_plan_steps(candidate))
+    later_get: set[tuple[str, str]] = set()
+    for step in steps:
+        if step.action != "Get":
+            continue
+        for no in step.move_car_nos:
+            later_get.add((step.line, no))
+    for step in steps:
+        if step.action != "Put" or step.line not in depot_inbound_plan.ASSEMBLY_LINES:
+            continue
+        for no in step.move_car_nos:
+            if (step.line, no) not in later_get:
+                return False
+    return True
 
 
 def depot_outbound_plan_violations(
@@ -360,6 +569,7 @@ def depot_inbound_plan_violations(
         return ()
     violations: list[str] = []
     origin_line_by_no = _origin_lines_by_no(candidate)
+    origin_return_puts = _same_plan_origin_return_put_nos_by_line(candidate)
     inbound_nos = set(inbound.inbound_nos)
     candidate_kind = getattr(candidate, "candidate_kind", "")
     is_assembly_candidate = candidate_kind in DEPOT_INBOUND_ASSEMBLY_OWNER_KINDS
@@ -399,6 +609,8 @@ def depot_inbound_plan_violations(
             continue
         if line in physical.DEPOT_INBOUND_DESTINATION_LINES:
             for no in nos:
+                if no in origin_return_puts.get(line, set()):
+                    continue
                 expected = planned_lines.get(no)
                 if expected is None:
                     if no in inbound_nos:
@@ -517,6 +729,22 @@ def _origin_lines_by_no(candidate: Any) -> dict[str, str]:
     return origins
 
 
+def _same_plan_origin_return_put_nos_by_line(candidate: Any) -> dict[str, set[str]]:
+    origins: dict[str, str] = {}
+    returned: dict[str, set[str]] = {}
+    for step in physical.candidate_plan_steps(candidate):
+        if step.action == "Get":
+            for no in step.move_car_nos:
+                origins.setdefault(no, step.line)
+            continue
+        if step.action != "Put":
+            continue
+        for no in step.move_car_nos:
+            if origins.get(no) == step.line:
+                returned.setdefault(step.line, set()).add(no)
+    return returned
+
+
 def _dirty_assembly_lines(plan: StrategicPlan) -> set[str]:
     return set(plan.depot_inbound.purity_violation_lines)
 
@@ -608,4 +836,4 @@ def _front_line_rank(source_line: str) -> int:
     for index, line in enumerate(FRONT_TOPOLOGY_PRIORITY_LINES):
         if source_line == line:
             return index
-    raise ValueError(f"line_not_in_front_topology_plan:{source_line}")
+    return len(FRONT_TOPOLOGY_PRIORITY_LINES)

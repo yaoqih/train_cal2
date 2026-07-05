@@ -103,6 +103,11 @@ STAGING_CANDIDATE_KINDS = {
     "vnext_depot_inbound_dirty_exchange_session",
     "vnext_depot_inbound_mixed_extraction_session",
     "vnext_depot_inbound_prefix_assembly_session",
+    "vnext_depot_inbound_assembly_release",
+}
+DEPOT_OUTBOUND_FINAL_CUN4_KINDS = {
+    "vnext_depot_outbound_session",
+    "vnext_depot_outbound_depot_reorder_session",
 }
 ENABLE_SPOTTING_WINDOW_VALIDATION = True
 SPOTTING_LINE_TOTAL_POSITIONS = {
@@ -3582,8 +3587,8 @@ def state_signature(
 
 def next_loco_location(candidate: HookCandidate, validation: PhysicalValidation) -> LocoLocation:
     final_line = candidate_final_line(candidate)
-    if candidate.candidate_kind == "vnext_depot_outbound_session" and final_line == "存4线":
-        return LocoLocation(line="存4线")
+    if candidate.candidate_kind in DEPOT_OUTBOUND_FINAL_CUN4_KINDS and final_line == "存4线":
+        return LocoLocation(line="渡1")
     return post_put_loco_location(validation.put_path, final_line)
 
 

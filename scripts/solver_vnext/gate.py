@@ -18,6 +18,12 @@ class AcceptRejectGate:
         if resource_delta.violations:
             return GateDecision(False, "resource_violation:" + "|".join(resource_delta.violations), contract_delta, resource_delta)
         if strategic_plan is not None and candidate is not None:
+            four_stage_violations = strategic.four_stage_plan_violations(
+                plan=strategic_plan,
+                candidate=candidate,
+            )
+            if four_stage_violations:
+                return GateDecision(False, "four_stage_violation:" + "|".join(four_stage_violations), contract_delta, resource_delta)
             plan_violations = strategic.depot_outbound_plan_violations(
                 plan=strategic_plan,
                 candidate=candidate,

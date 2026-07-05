@@ -152,10 +152,7 @@ def build_depot_outbound_assembly_plan(
         ordered_rows=ordered_rows,
         non_cun4_nos={physical.car_no(car) for car, _target_line in non_cun4_rows},
     )
-    if cun4_prefix_unsafe_nos or route_blocker_nos:
-        pull_rows = ordered_rows
-    else:
-        pull_rows = [*non_cun4_rows, *cun4_rows]
+    pull_rows = [*non_cun4_rows, *cun4_rows]
     pull_order_nos = tuple(physical.car_no(car) for car, _target_line in pull_rows)
     moving_nos = set(outbound_nos)
     total_length_m = sum(physical.car_length(car) for car, _target_line in ordered_rows)

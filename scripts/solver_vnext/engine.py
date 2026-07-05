@@ -46,6 +46,15 @@ from .resources import StationResourceGraph
 from .staging import StagingIntentBuilder, StagingIntentRecord
 
 
+def _four_stage_phase_code(policy_context: PolicyContext) -> str:
+    stage = policy_context.strategic_plan.four_stage.stage
+    if stage == 1:
+        return "H1"
+    if stage in {2, 3}:
+        return "H4"
+    return "H5"
+
+
 def _remote_unsatisfied_count(cars: list[dict[str, Any]], depot_assignment: Any) -> int:
     loads = physical.line_loads(cars)
     count = 0
@@ -432,6 +441,8 @@ class VNextSolver:
                     current_phase=current_phase,
                 )
                 if not next_phase or next_phase == current_phase:
+                    break
+                if next_phase != _four_stage_phase_code(raw_policy_context):
                     break
                 structure_node_records.append(
                     build_structure_node_record(

@@ -16,6 +16,7 @@ SAME_PLAN_STAGING_OWNER_KINDS = {
     "vnext_depot_cun4_source_repack_exchange",
     "vnext_depot_cun4_inbound_outbound_exchange",
     "vnext_depot_inbound_cun4_open_release",
+    "vnext_depot_inbound_assembly_release",
 }
 
 
@@ -125,6 +126,7 @@ class StationResourceGraph:
             violations.append("cun4_buffer_requires_owner")
         if any(line in physical.DEPOT_OUTSIDE_LINES for line in request.put_lines) and request.family not in {
             ContractFamily.REMOTE_SESSION,
+            ContractFamily.REPAIR_INBOUND,
             ContractFamily.DEPOT_SLOT,
             ContractFamily.DEPOT_OUTBOUND,
         }:
