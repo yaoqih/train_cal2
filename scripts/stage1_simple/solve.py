@@ -564,7 +564,7 @@ class Stage1Solver:
             reason_rank,
             self.candidate_target_rank(candidate),
             -moved_g,
-            moved_x,
+            -moved_x if moved_g == 0 else moved_x,
             self.route_price(candidate),
             len(candidate.move_car_nos),
             candidate.candidate_id,
@@ -681,10 +681,12 @@ class Stage1Solver:
             for car in sorted(self.cars, key=lambda item: (item["Line"], int(item.get("Position") or 0), physical.car_no(item)))
         ]
         response = {"Data": {"Operations": self.operations, "GeneratedEndStatus": final_status}}
+        business_hooks = sum(1 for row in self.operations if row.get("Action") in {"Get", "Put"})
         summary = {
             "case_id": self.case_id,
             "status": "complete" if debt["complete"] else "partial",
             "hooks": self.hook_index - 1,
+            "business_hooks": business_hooks,
             "operations": len(self.operations),
             "stage1_debt": debt,
             "blocking_reasons": self.blocking_reasons(debt),
@@ -787,7 +789,8 @@ def solve_one(path: Path, out_dir: Path, *, max_hooks: int, verbose: bool = Fals
         summary = result["summary"]
         print(
             f"{summary['case_id']} {summary['status']} "
-            f"hooks={summary['hooks']} debt={summary['stage1_debt']['debt_count']}",
+            f"business_hooks={summary['business_hooks']} "
+            f"move_batches={summary['hooks']} debt={summary['stage1_debt']['debt_count']}",
             flush=True,
         )
     return result["summary"]
@@ -823,6 +826,7 @@ def main() -> None:
         "complete": sum(1 for item in summaries if item["status"] == "complete"),
         "partial": sum(1 for item in summaries if item["status"] != "complete"),
         "avg_hooks": round(sum(item["hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
+        "avg_business_hooks": round(sum(item["business_hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
         "summaries": summaries,
     }
     write_json(args.out / "aggregate_summary.json", aggregate)

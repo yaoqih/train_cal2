@@ -1841,21 +1841,26 @@ def _render_stage1_simple_dashboard() -> None:
         st.warning("aggregate_summary.json 中没有 summaries。")
         return
 
-    hook_values = [int(row.get("hooks") or 0) for row in summaries]
-    over_40 = [row for row in summaries if int(row.get("hooks") or 0) > 40]
+    case_rows = _stage1_case_rows(summaries, artifact_dir)
+    business_hook_values = [int(row.get("businessHooks") or 0) for row in case_rows]
+    move_batch_values = [int(row.get("moveBatches") or 0) for row in case_rows]
+    over_40 = [row for row in case_rows if int(row.get("businessHooks") or 0) > 40]
     metric_cols = st.columns(7)
     metric_cols[0].metric("案例数", aggregate.get("cases", len(summaries)))
     metric_cols[1].metric("完成", aggregate.get("complete", "-"))
     metric_cols[2].metric("Partial", aggregate.get("partial", "-"))
-    metric_cols[3].metric("平均勾数", aggregate.get("avg_hooks", "-"))
-    metric_cols[4].metric("最大勾数", max(hook_values) if hook_values else 0)
-    metric_cols[5].metric(">40 勾", len(over_40))
-    metric_cols[6].metric("输出目录", artifact_dir.name)
+    metric_cols[3].metric("平均业务勾", _stage1_average(business_hook_values))
+    metric_cols[4].metric("最大业务勾", max(business_hook_values) if business_hook_values else 0)
+    metric_cols[5].metric(">40 业务勾", len(over_40))
+    metric_cols[6].metric("平均搬运批次", _stage1_average(move_batch_values))
+    st.caption(
+        "口径说明：现场业务勾数 = Get/Put 次数；搬运批次 = 求解器一次 Get+Put 搬运，"
+        "通常等于 2 个业务勾。称重 Weigh 不计入业务勾。"
+    )
 
-    case_rows = _stage1_case_rows(summaries)
     filter_cols = st.columns([2, 2, 3])
     status_filter = filter_cols[0].selectbox("状态", ["全部", "complete", "partial"], key="stage1-status-filter")
-    min_hooks = filter_cols[1].number_input("最小勾数", min_value=0, value=0, step=1, key="stage1-min-hooks")
+    min_hooks = filter_cols[1].number_input("最小业务勾数", min_value=0, value=0, step=1, key="stage1-min-hooks")
     case_query = filter_cols[2].text_input("案例/阻塞原因搜索", value="", key="stage1-case-query")
     filtered_rows = _stage1_filter_case_rows(
         case_rows,
@@ -1872,7 +1877,7 @@ def _render_stage1_simple_dashboard() -> None:
     selected_case = st.selectbox(
         "选中案例",
         options=[str(row["caseId"]) for row in filtered_rows],
-        format_func=lambda case_id: _stage1_case_label(case_id, summaries),
+        format_func=lambda case_id: _stage1_case_label(case_id, filtered_rows),
         key="stage1-selected-case",
     )
     bundle = _stage1_load_case_bundle(artifact_dir, selected_case)
@@ -1890,12 +1895,14 @@ def _render_stage1_simple_dashboard() -> None:
 
     selected_cols = st.columns(6)
     debt = summary.get("stage1_debt") or {}
+    business_hook_count = _stage1_business_hook_count(response)
+    weigh_count = _stage1_action_count(response, "Weigh")
     selected_cols[0].metric("状态", summary.get("status", ""))
-    selected_cols[1].metric("勾数", summary.get("hooks", 0))
-    selected_cols[2].metric("操作数", summary.get("operations", 0))
+    selected_cols[1].metric("业务勾数", business_hook_count)
+    selected_cols[2].metric("搬运批次", summary.get("hooks", 0))
     selected_cols[3].metric("债务", debt.get("debt_count", 0))
     selected_cols[4].metric("待编组", len(debt.get("pending_stage1_nos") or []))
-    selected_cols[5].metric("边界污染", len(debt.get("pollution_nos") or []))
+    selected_cols[5].metric("称重操作", weigh_count)
 
     operation_rows = _stage1_response_operation_rows(response)
     vehicle_display_labels = _p10_vehicle_display_labels(request_payload)
@@ -1909,9 +1916,10 @@ def _render_stage1_simple_dashboard() -> None:
         _render_p10_replay(request_payload, operation_rows, response, vehicle_display_labels)
     elif view == "勾计划":
         hook_rows = _p10_hook_summary_rows(operation_rows, vehicle_display_labels)
-        st.markdown("**按勾汇总**")
+        st.markdown("**按搬运批次汇总**")
+        st.caption("每个搬运批次通常包含 1 次 Get + 1 次 Put，即 2 个现场业务勾；有称重时中间多 1 次 Weigh。")
         st.dataframe(hook_rows, width="stretch", hide_index=True)
-        st.markdown("**接口操作序列**")
+        st.markdown("**接口操作序列（Get/Put 为业务勾）**")
         st.dataframe(_p10_operation_table_rows(operation_rows, vehicle_display_labels), width="stretch", hide_index=True)
     elif view == "终态":
         _render_p10_end_status(response, vehicle_display_labels)
@@ -1929,16 +1937,26 @@ def _render_stage1_simple_dashboard() -> None:
             st.json(_p10_response_for_display(response, vehicle_display_labels))
 
 
-def _stage1_case_rows(summaries: list[dict]) -> list[dict[str, object]]:
+def _stage1_average(values: list[int]) -> float:
+    return round(sum(values) / len(values), 3) if values else 0.0
+
+
+def _stage1_case_rows(summaries: list[dict], artifact_dir: Path | None = None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for summary in summaries:
         debt = summary.get("stage1_debt") or {}
+        case_id = str(summary.get("case_id") or "")
+        response = _stage1_try_load_response(artifact_dir, case_id) if artifact_dir is not None else {}
+        business_hooks = _stage1_business_hook_count(response) if response else int(summary.get("operations") or 0)
+        weigh_ops = _stage1_action_count(response, "Weigh") if response else 0
         rows.append(
             {
-                "caseId": summary.get("case_id", ""),
+                "caseId": case_id,
                 "status": summary.get("status", ""),
-                "hooks": int(summary.get("hooks") or 0),
-                "operations": int(summary.get("operations") or 0),
+                "businessHooks": business_hooks,
+                "moveBatches": int(summary.get("hooks") or 0),
+                "interfaceOperations": int(summary.get("operations") or 0),
+                "weighOps": weigh_ops,
                 "debt": int(debt.get("debt_count") or 0),
                 "pending": len(debt.get("pending_stage1_nos") or []),
                 "pollution": len(debt.get("pollution_nos") or []),
@@ -1946,7 +1964,7 @@ def _stage1_case_rows(summaries: list[dict]) -> list[dict[str, object]]:
                 "blockingReasons": " | ".join(summary.get("blocking_reasons") or []),
             }
         )
-    return sorted(rows, key=lambda row: (-int(row["hooks"]), str(row["caseId"])))
+    return sorted(rows, key=lambda row: (-int(row["businessHooks"]), str(row["caseId"])))
 
 
 def _stage1_filter_case_rows(
@@ -1961,7 +1979,7 @@ def _stage1_filter_case_rows(
     for row in rows:
         if status_filter != "全部" and row.get("status") != status_filter:
             continue
-        if int(row.get("hooks") or 0) < min_hooks:
+        if int(row.get("businessHooks") or 0) < min_hooks:
             continue
         haystack = f"{row.get('caseId')} {row.get('blockingReasons')}".lower()
         if query and query not in haystack:
@@ -1970,9 +1988,40 @@ def _stage1_filter_case_rows(
     return result
 
 
-def _stage1_case_label(case_id: str, summaries: list[dict]) -> str:
-    summary = next((row for row in summaries if row.get("case_id") == case_id), {})
-    return f"{case_id} | {summary.get('status', '')} | {summary.get('hooks', 0)} 勾"
+def _stage1_case_label(case_id: str, rows: list[dict]) -> str:
+    row = next((item for item in rows if item.get("caseId") == case_id), {})
+    return (
+        f"{case_id} | {row.get('status', '')} | "
+        f"{row.get('businessHooks', 0)} 业务勾 / {row.get('moveBatches', 0)} 搬运批次"
+    )
+
+
+def _stage1_try_load_response(artifact_dir: Path | None, case_id: str) -> dict:
+    if artifact_dir is None or not case_id:
+        return {}
+    path = artifact_dir / f"{case_id}_response.json"
+    if not path.exists():
+        return {}
+    try:
+        return _stage1_read_json(path)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _stage1_business_hook_count(response: dict) -> int:
+    return sum(
+        1
+        for op in (((response or {}).get("Data") or {}).get("Operations") or [])
+        if op.get("Action") in P10_BUSINESS_HOOK_ACTIONS
+    )
+
+
+def _stage1_action_count(response: dict, action: str) -> int:
+    return sum(
+        1
+        for op in (((response or {}).get("Data") or {}).get("Operations") or [])
+        if op.get("Action") == action
+    )
 
 
 def _stage1_load_case_bundle(artifact_dir: Path, case_id: str) -> dict[str, object] | None:

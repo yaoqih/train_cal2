@@ -3238,6 +3238,31 @@ def _depot_inbound_release_staging_line(
     return ""
 
 
+def _depot_inbound_reusable_staging_line(
+    *,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    staging_line: str,
+    source_batches: tuple[tuple[str, tuple[dict[str, Any], ...]], ...],
+    moving_cars: list[dict[str, Any]],
+) -> bool:
+    if not staging_line:
+        return False
+    moving_nos = {physical.car_no(car) for car in moving_cars}
+    source_lines = {source for source, _batch in source_batches}
+    if staging_line in source_lines and physical.line_has_stationary_cars(staging_line, cars, moving_nos):
+        return False
+    if not physical.line_has_length_capacity(staging_line, cars, moving_cars, moving_nos):
+        return False
+    return _depot_inbound_temporary_staging_put_allowed(
+        cars=cars,
+        depot_assignment=depot_assignment,
+        staging_line=staging_line,
+        moving_cars=moving_cars,
+        moving_nos=moving_nos,
+    )
+
+
 def _depot_inbound_temporary_staging_put_allowed(
     *,
     cars: list[dict[str, Any]],
@@ -3255,6 +3280,21 @@ def _depot_inbound_temporary_staging_put_allowed(
     )
     if len(positions) != len(moving_cars):
         return False
+    return _depot_inbound_temporary_staging_positions_allowed(
+        cars=cars,
+        staging_line=staging_line,
+        moving_nos=moving_nos,
+        positions=positions,
+    )
+
+
+def _depot_inbound_temporary_staging_positions_allowed(
+    *,
+    cars: list[dict[str, Any]],
+    staging_line: str,
+    moving_nos: set[str],
+    positions: dict[str, int],
+) -> bool:
     if not physical.line_uses_business_positions(cars, staging_line, moving_nos):
         return True
     existing_positions = [
@@ -3439,6 +3479,14 @@ def _depot_inbound_multisource_stepwise_put_plan(
         )
         if deferred_tail:
             reorder_staging_line = reorder_staging_line_by_target.get(target_line, "")
+            if reorder_staging_line and not _depot_inbound_reusable_staging_line(
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                staging_line=reorder_staging_line,
+                source_batches=source_batches,
+                moving_cars=[no_to_car[no] for no in deferred_tail],
+            ):
+                reorder_staging_line = ""
             unsafe_staging_lines = _depot_inbound_unsafe_deferred_staging_lines(
                 deferred,
                 target_line=target_line,
@@ -3612,6 +3660,14 @@ def _depot_inbound_multisource_stepwise_put_plan(
         blocking_inner = _depot_inner_blocked_by_outer_target(target_line)
         if blocking_inner and any(target_by_no.get(no) == blocking_inner for no in remaining[:start]):
             staging_line = reorder_staging_line_by_target.get(target_line, "")
+            if staging_line and not _depot_inbound_reusable_staging_line(
+                cars=planning_cars,
+                depot_assignment=depot_assignment,
+                staging_line=staging_line,
+                source_batches=source_batches,
+                moving_cars=group,
+            ):
+                staging_line = ""
             unsafe_staging_lines = _depot_inbound_unsafe_deferred_staging_lines(
                 deferred,
                 target_line=target_line,
@@ -4285,7 +4341,7 @@ def _depot_inbound_target_clearance_plan(
     return tuple(steps), tuple(put_lines), tuple(blockers), planning_cars
 
 
-DEPOT_INBOUND_CLEARANCE_STAGING_LINES = ("修1库外", "修2库外", "修3库外", "修4库外", "存4线")
+DEPOT_INBOUND_CLEARANCE_STAGING_LINES = ("修1库外", "修2库外", "修3库外", "修4库外")
 
 
 def _depot_inbound_blocked_clearance_staging_lines(
@@ -4341,7 +4397,12 @@ def _depot_inbound_clearance_put(
                     depot_assignment=depot_assignment,
                     batch_nos=set(drop),
                 )
-                if len(positions) == len(group):
+                if len(positions) == len(group) and _depot_inbound_temporary_staging_positions_allowed(
+                    cars=cars,
+                    staging_line=target_line,
+                    moving_nos=set(drop),
+                    positions=positions,
+                ):
                     return target_line, drop, positions
     return None
 
@@ -7053,6 +7114,9 @@ class DepotInboundAssemblyReleaseEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
+        stage = _four_stage_number(strategic_plan)
+        if stage and stage != 3:
+            return
         if strategic_plan is None or not strategic_plan.depot_inbound.assembly_complete:
             return
         loads = physical.line_loads(cars)
@@ -7519,7 +7583,8 @@ class DepotInboundGatherSessionEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
-        if _four_stage_number(strategic_plan) == 1:
+        stage = _four_stage_number(strategic_plan)
+        if stage and stage != 3:
             return
         loads = physical.line_loads(cars)
         subject_nos = set(contract.subject_nos)

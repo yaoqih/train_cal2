@@ -13,8 +13,9 @@
 - 候选执行后必须至少保留下一步合法候选，避免把机车推进 `存4南` 等死角后无法继续。
 - 输出 response、summary、trace，便于直接交给 `replay_validator.py` 复核。
 
-默认 `--max-hooks` 是 80，用于保证第一阶段求解完整性；如果要检查严格 40 勾边界，可以显式传
-`--max-hooks 40`。
+默认 `--max-hooks` 是 80。这里的 `hooks` 是求解器内部搬运批次：一次 `Get+Put` 算 1 批；
+现场业务勾数应按 `Operations` 里的 `Get/Put` 次数计算，通常是搬运批次的 2 倍。称重 `Weigh`
+不计入挂摘业务勾。
 
 运行：
 
@@ -30,6 +31,7 @@ python3 scripts/stage1_simple/solve.py data/truth2 --out artifacts/stage1_simple
 
 当前全量验证口径：
 
-- `data/truth2`，默认 80 勾：113/113 complete，平均 14.805 勾。
-- `data/truth2 --max-hooks 40`：111/113 complete，`0309Z` 和 `0318W` 各需要 44 勾。
+- `data/truth2`，默认 80 搬运批次：113/113 complete，平均 9.221 搬运批次。
+- 按现场业务勾口径（`Get/Put`）：平均 18.442 勾，中位数 18 勾，最大 46 勾。
+- 只有 `0317W` 超过 40 业务勾：46 勾。
 - `replay_validator.py` 物理复核：113/113 physical pass，state warning 0。
