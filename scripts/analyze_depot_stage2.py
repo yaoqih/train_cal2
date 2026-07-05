@@ -150,6 +150,9 @@ def _analyze_case(
         "remaining_outbound_nos": "|".join(sorted(no for no in outbound_nos if line_by_no.get(no) != "存4线")),
         "outbound_nos": "|".join(outbound_plan.outbound_nos),
         "route_blocker_nos": "|".join(outbound_plan.route_blocker_nos),
+        "outbound_non_cun4_target_nos": "|".join(outbound_plan.non_cun4_nos),
+        "outbound_final_cun4_target_nos": "|".join(outbound_plan.cun4_target_nos),
+        "outbound_stage2_cun4_hold_nos": "|".join(outbound_plan.cun4_nos),
         "outbound_pull_order_nos": "|".join(outbound_plan.pull_order_nos),
     }
 

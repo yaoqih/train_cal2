@@ -22,7 +22,7 @@ SOURCE_PULL_ORDER = (
 
 
 @dataclass(frozen=True)
-class AssemblyGroup:
+class DepotOutboundCun4HoldGroup:
     line: str
     vehicle_nos: tuple[str, ...]
     length_m: float
@@ -53,7 +53,7 @@ class DepotOutboundAssemblyPlan:
     cun4_free_m: float
     cun4_budget_m: float
     pull_equivalent: int
-    groups: tuple[AssemblyGroup, ...]
+    groups: tuple[DepotOutboundCun4HoldGroup, ...]
 
     @property
     def group_count(self) -> int:
@@ -173,7 +173,7 @@ def build_depot_outbound_assembly_plan(
     cun4_reserved_by_outbound_hold_nos: tuple[str, ...] = ()
     unplaced_nos: tuple[str, ...] = ()
     groups = (
-        AssemblyGroup(
+        DepotOutboundCun4HoldGroup(
             line=TARGET_LINE,
             vehicle_nos=cun4_nos,
             length_m=_length_for_nos(cars, set(cun4_nos)),
@@ -400,7 +400,7 @@ def _overflow_groups(
     *,
     cars: list[dict[str, Any]],
     rows: list[tuple[dict[str, Any], str]],
-) -> tuple[tuple[AssemblyGroup, ...], tuple[str, ...]]:
+) -> tuple[tuple[DepotOutboundCun4HoldGroup, ...], tuple[str, ...]]:
     remaining_capacity = {
         line: _line_free_after_removal(line, cars, set())
         for line in OVERFLOW_ASSEMBLY_LINES
@@ -421,7 +421,7 @@ def _overflow_groups(
         if not placed:
             unplaced.append(no)
     groups = tuple(
-        AssemblyGroup(
+        DepotOutboundCun4HoldGroup(
             line=line,
             vehicle_nos=tuple(grouped[line]),
             length_m=round(_length_for_nos(cars, set(grouped[line])), 3),

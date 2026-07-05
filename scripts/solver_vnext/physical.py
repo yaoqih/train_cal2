@@ -750,8 +750,7 @@ def route_approach_lines_for_put(
     cars: list[dict[str, Any]],
     moving_nos: set[str],
 ) -> set[str]:
-    if not line_has_stationary_cars(line, cars, moving_nos):
-        return set()
+    del cars, moving_nos
     return operation_approach_lines(line)
 
 

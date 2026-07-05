@@ -237,8 +237,9 @@ def can_enter_occupied(node: str, nxt: str, path: list[str], cars: list[dict[str
 
 def reachable_route(action: str, start: str, end: str, cars: list[dict[str, Any]],
                     moving: set[str], train_len: float) -> tuple[list[str], list[str]]:
+    del action
     dep = access(start) if has_stationary(cars, start, moving) else set()
-    app = access(end) if action == "Get" or has_stationary(cars, end, moving) else set()
+    app = access(end)
     occ, endpoints = occupied(cars, moving), {start, end}
     rejected: Counter[str] = Counter()
     queue: list[tuple[int, int, str | None, str, list[str]]] = [(0, 0, None, start, [start])]
@@ -301,7 +302,7 @@ def route_errors(index: int, action: str, path0: list[Any], starts0: set[str] | 
     dep = access(start) if has_stationary(cars, start, moving) else set()
     if dep and len(path) > 1 and path[1] not in dep:
         bad.append(V(index, "physical", "occupied_source_wrong_departure", f"{start}:next={path[1]} allowed={sorted(dep)}"))
-    app = access(end) if action == "Get" or has_stationary(cars, end, moving) else set()
+    app = access(end)
     if app and len(path) > 1 and path[-2] not in app:
         bad.append(V(index, "physical", "occupied_target_wrong_approach", f"{end}:prev={path[-2]} allowed={sorted(app)}"))
     occ = occupied(cars, moving)
@@ -365,14 +366,13 @@ def apply_put(cars: list[dict[str, Any]], line: str, move: list[str]) -> None:
 
 def put_loco_positions(path0: list[Any], line: str) -> set[str]:
     path = [norm(x) for x in path0 if norm(x)]
-    out = {line} | access(line)
     if len(path) >= 2 and path[-1] == line:
-        out.add(path[-2])
-    elif path == [line]:
+        return {path[-2]}
+    if path == [line]:
         app = access(line)
         if len(app) == 1:
-            out |= app
-    return out
+            return set(app)
+    return {line}
 
 
 def replay(req: dict[str, Any], resp: dict[str, Any]) -> tuple[list[dict[str, Any]], list[V]]:

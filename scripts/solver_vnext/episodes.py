@@ -64,6 +64,18 @@ def _four_stage_number(strategic_plan: Any | None) -> int:
     return int(getattr(getattr(strategic_plan, "four_stage", None), "stage", 0) or 0)
 
 
+def _four_stage_blocks_front_candidate(strategic_plan: Any | None, contract: FlowContract) -> bool:
+    stage = _four_stage_number(strategic_plan)
+    if stage in {2, 3}:
+        return True
+    if stage != 1:
+        return False
+    contract_lines = set(contract.source_lines) | set(contract.target_lines)
+    if contract_lines & physical.DEPOT_INBOUND_DESTINATION_LINES:
+        return True
+    return bool(set(contract.target_lines) & set(physical.DEPOT_INBOUND_ASSEMBLY_LINES))
+
+
 class DirectMoveEpisode(Episode):
     intent = IntentKind.FRONT_PREP
     template_name = "direct_accessible_prefix"
@@ -94,6 +106,8 @@ class DirectMoveEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
+        if _four_stage_blocks_front_candidate(strategic_plan, contract):
+            return
         by_no = {physical.car_no(car): car for car in cars}
         source_line = contract.source_lines[0]
         target_line = contract.target_lines[0]
@@ -215,7 +229,7 @@ class RemoteSessionPrefixDigestEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
-        if _four_stage_number(strategic_plan) == 1:
+        if _four_stage_number(strategic_plan) in {1, 2, 3}:
             return
         if strategic_plan is not None and not strategic_plan.depot_inbound.assembly_complete:
             return
@@ -399,7 +413,7 @@ class RemoteSessionEpisode(Episode):
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
         stage = _four_stage_number(strategic_plan)
-        if stage and stage != 3:
+        if stage:
             return
         loads = physical.line_loads(cars)
         subject_nos = set(contract.subject_nos)
@@ -1579,6 +1593,8 @@ class Cun4ReleaseGroupAssemblyEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
+        if _four_stage_number(strategic_plan) in {2, 3}:
+            return
         current_group = release.cun4_release_group(
             cars=cars,
             depot_assignment=depot_assignment,
@@ -1687,7 +1703,7 @@ class Cun4OutboundAssemblyReleaseEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
-        if _four_stage_number(strategic_plan) == 1:
+        if _four_stage_number(strategic_plan) in {1, 2, 3}:
             return
         target_line = contract.target_lines[0]
         line_cars = physical.line_cars_in_access_order(
@@ -1782,7 +1798,8 @@ class Cun4UnwheelReleaseEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
-        if _four_stage_number(strategic_plan) == 1:
+        stage = _four_stage_number(strategic_plan)
+        if stage in {1, 3}:
             return
         if strategic_plan is not None and not strategic_plan.depot_inbound.assembly_complete:
             return
@@ -1797,6 +1814,8 @@ class Cun4UnwheelReleaseEpisode(Episode):
             subject_nos=subject_nos,
         )
         if not unwheel_batch:
+            if stage == 2:
+                return
             release_candidate = self._unwheel_outbound_source_prefix_candidate(
                 case_id=case_id,
                 hook_index=hook_index,
@@ -7449,7 +7468,7 @@ class Cun4ReleaseAcceptEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
-        if _four_stage_number(strategic_plan) == 1:
+        if _four_stage_number(strategic_plan) in {1, 2, 3}:
             return
         port_state = release.cun4_port_state(
             cars=cars,
@@ -7806,6 +7825,9 @@ class DepotSlotSwapEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
+        stage = _four_stage_number(strategic_plan)
+        if stage and stage != 4:
+            return
         loads = physical.line_loads(cars)
 
         def planned(car: dict[str, Any]) -> tuple[str, int | None, str]:
@@ -8139,7 +8161,8 @@ class SourcePrefixReleaseEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
-        del strategic_plan
+        if _four_stage_blocks_front_candidate(strategic_plan, contract):
+            return
         source_line = contract.source_lines[0]
         target_line = contract.target_lines[0]
         if not target_line or target_line == source_line:
@@ -8765,6 +8788,8 @@ class TailBlockerPeelDigestEpisode(Episode):
         contract: FlowContract,
         strategic_plan: Any | None = None,
     ) -> Iterable[CandidateEnvelope]:
+        if _four_stage_number(strategic_plan) in {2, 3}:
+            return
         source_line = contract.source_lines[0]
         line_cars = physical.line_cars_in_access_order(
             cars=cars,
@@ -8790,6 +8815,14 @@ class TailBlockerPeelDigestEpisode(Episode):
         tail_target = self._target_for(prefix[-1], cars, depot_assignment, loads)
         if not tail_target or tail_target == source_line:
             return
+        stage = _four_stage_number(strategic_plan)
+        if stage == 1:
+            if source_line in physical.DEPOT_INBOUND_DESTINATION_LINES:
+                return
+            if tail_target in physical.DEPOT_INBOUND_DESTINATION_LINES:
+                return
+            if tail_target in physical.DEPOT_INBOUND_ASSEMBLY_LINES:
+                return
 
         tail_group = self._tail_same_target_group(prefix, tail_target, cars, depot_assignment, loads)
         if not tail_group or len(tail_group) == len(prefix):
@@ -9274,6 +9307,8 @@ class SpottingRepackEpisode(Episode):
     ) -> Iterable[CandidateEnvelope]:
         source_line = contract.source_lines[0]
         target_line = contract.target_lines[0]
+        if _four_stage_blocks_front_candidate(strategic_plan, contract):
+            return
         if not physical.is_spotting_line(target_line):
             return
 

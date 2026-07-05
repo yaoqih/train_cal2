@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,11 @@ CACHE_LINES = (
     "抛丸线",
 )
 MAX_HOOKS = 80
+# hook_index counts move batches. business_hooks in the summary counts Get/Put rows.
+MAX_NO_PROGRESS_STREAK = 30
+MAX_STALE_BEST_STREAK = 35
+MAX_CAPACITY_DEFICIT_HOOKS = 10
+DEFAULT_TIME_BUDGET_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -57,8 +63,18 @@ class CandidateView:
 
 
 class Stage1Solver:
-    def __init__(self, path: Path, *, max_hooks: int = MAX_HOOKS) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_hooks: int = MAX_HOOKS,
+        time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
+    ) -> None:
         self.case_id, self.request, self.cars, self.depot_assignment, self.loco = physical.read_case(path)
+        nos = [physical.car_no(car) for car in self.cars]
+        duplicates = [no for no, count in Counter(nos).items() if not no or count > 1]
+        if duplicates:
+            raise ValueError(f"duplicate_or_empty_car_no:{','.join(sorted(duplicates))}")
         self.graph = physical.TrackGraph()
         self.max_hooks = max_hooks
         self.hook_index = 1
@@ -66,75 +82,103 @@ class Stage1Solver:
         self.operations: list[dict[str, Any]] = []
         self.trace: list[dict[str, Any]] = []
         self.seen_states = {physical.state_signature(self.cars, self.loco)}
+        self.is_probe = False
+        self.started_at = time.monotonic()
+        self.time_budget_seconds = time_budget_seconds
+        self.validation_cache: dict[tuple[str, str], physical.PhysicalValidation] = {}
 
     def solve(self) -> dict[str, Any]:
+        no_progress_streak = 0
+        stale_best_streak = 0
+        best_progress = (10**9, 10**9)
         while self.hook_index <= self.max_hooks:
             before = self.stage1_debt()
             if before["complete"]:
+                break
+            if self.time_exhausted():
+                self.trace.append({
+                    "hook": self.hook_index,
+                    "accepted": "",
+                    "kind": "blocked",
+                    "reason": "solve_time_budget_exhausted",
+                    "candidate_count": 0,
+                    "rejected": [],
+                    "debt_before": before,
+                    "elapsed_seconds": round(time.monotonic() - self.started_at, 3),
+                })
+                break
+            before_progress = (before["debt_count"], before["blocked_g_count"])
+            if before_progress < best_progress:
+                best_progress = before_progress
+                stale_best_streak = 0
+            capacity_deficit = self.depot_assembly_capacity_deficit_m()
+            if (
+                capacity_deficit > 0
+                and (no_progress_streak >= 6 or self.hook_index > MAX_CAPACITY_DEFICIT_HOOKS)
+            ):
+                self.trace.append({
+                    "hook": self.hook_index,
+                    "accepted": "",
+                    "kind": "blocked",
+                    "reason": "assembly_capacity_impossible",
+                    "candidate_count": 0,
+                    "rejected": [],
+                    "debt_before": before,
+                    "capacity_deficit_m": round(capacity_deficit, 3),
+                })
+                break
+            if no_progress_streak >= MAX_NO_PROGRESS_STREAK:
+                self.trace.append({
+                    "hook": self.hook_index,
+                    "accepted": "",
+                    "kind": "blocked",
+                    "reason": "no_stage1_progress",
+                    "candidate_count": 0,
+                    "rejected": [],
+                    "debt_before": before,
+                })
+                break
+            if stale_best_streak >= MAX_STALE_BEST_STREAK:
+                self.trace.append({
+                    "hook": self.hook_index,
+                    "accepted": "",
+                    "kind": "blocked",
+                    "reason": "no_stage1_window_progress",
+                    "candidate_count": 0,
+                    "rejected": [],
+                    "debt_before": before,
+                    "best_progress": list(best_progress),
+                })
                 break
             accepted = self.step(before)
             if not accepted:
                 break
             after = self.stage1_debt()
+            after_progress = (after["debt_count"], after["blocked_g_count"])
+            if after_progress < best_progress:
+                best_progress = after_progress
+                stale_best_streak = 0
+            else:
+                stale_best_streak += 1
             if after["debt_count"] >= before["debt_count"] and after["blocked_g_count"] >= before["blocked_g_count"]:
                 self.trace[-1]["progress_warning"] = "no_stage1_debt_drop"
+                no_progress_streak += 1
+            else:
+                no_progress_streak = 0
         return self.result()
 
     def step(self, debt: dict[str, Any]) -> bool:
         views = sorted(self.generate_candidates(debt), key=lambda item: item.score)
         rejected: list[dict[str, Any]] = []
-        for view in views:
-            validation = physical.validate_candidate(
-                self.graph,
-                view.candidate,
-                self.cars,
-                self.loco,
-                self.depot_assignment,
-            )
-            if not validation.accepted:
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": list(validation.reasons),
-                })
-                continue
-            after_debt = self.debt_after(view.candidate, validation)
-            if not after_debt["complete"] and not self.leaves_progress(view.candidate, validation, depth=1):
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["dead_end_after_candidate"],
-                })
-                continue
-            if self.seen_after(view.candidate, validation):
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["state_cycle"],
-                })
-                continue
+        if self.try_views(views, debt, rejected):
+            return True
 
-            rows = physical.operation_rows(view.candidate, validation, self.operation_index)
-            self.operations.extend(physical.response_operation(row) for row in rows)
-            self.operation_index += len(rows)
-            physical.apply_candidate(view.candidate, self.cars, validation)
-            self.loco = physical.next_loco_location(view.candidate, validation)
-            self.seen_states.add(physical.state_signature(self.cars, self.loco))
-            self.trace.append({
-                "hook": self.hook_index,
-                "accepted": view.candidate.candidate_id,
-                "kind": view.candidate.candidate_kind,
-                "reason": view.reason,
-                "source": view.candidate.source_line,
-                "target": view.candidate.target_line,
-                "move": list(view.candidate.move_car_nos),
-                "score": list(view.score),
-                "paths": [list(path) for path in validation.operation_paths],
-                "rejected_before_accept": rejected[:8],
-                "debt_before": debt,
-                "debt_after": after_debt,
-            })
-            self.hook_index += 1
+        put_blocker_views = sorted(
+            self.route_blocker_candidates(debt, include_put_blockers=True),
+            key=lambda item: item.score,
+        )
+        if put_blocker_views and self.try_views(put_blocker_views, debt, rejected):
+            self.trace[-1]["fallback"] = "put_route_blocker_cleanup"
             return True
 
         self.trace.append({
@@ -148,24 +192,115 @@ class Stage1Solver:
         })
         return False
 
+    def try_views(
+        self,
+        views: list[CandidateView],
+        debt: dict[str, Any],
+        rejected: list[dict[str, Any]],
+    ) -> bool:
+        for view in views:
+            if self.time_exhausted():
+                return False
+            validation = self.validate_candidate(view.candidate)
+            if not validation.accepted:
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": list(validation.reasons),
+                })
+                continue
+            probe = self.probe_after(view.candidate, validation)
+            after_signature = physical.state_signature(probe.cars, probe.loco)
+            if after_signature in self.seen_states:
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": ["state_cycle"],
+                })
+                continue
+            after_debt = probe.stage1_debt()
+            if not after_debt["complete"] and not probe.can_continue(depth=1, include_put_blockers=True):
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": ["dead_end_after_candidate"],
+                })
+                continue
+            return self.accept_candidate(view, validation, after_debt, debt, rejected)
+        return False
+
+    def accept_candidate(
+        self,
+        view: CandidateView,
+        validation: physical.PhysicalValidation,
+        after_debt: dict[str, Any],
+        debt: dict[str, Any],
+        rejected: list[dict[str, Any]],
+    ) -> bool:
+        if self.is_probe:
+            raise RuntimeError("probe_solver_cannot_accept_candidate")
+        rows = physical.operation_rows(view.candidate, validation, self.operation_index)
+        self.operations.extend(physical.response_operation(row) for row in rows)
+        self.operation_index += len(rows)
+        physical.apply_candidate(view.candidate, self.cars, validation)
+        self.loco = physical.next_loco_location(view.candidate, validation)
+        self.seen_states.add(physical.state_signature(self.cars, self.loco))
+        self.trace.append({
+            "hook": self.hook_index,
+            "accepted": view.candidate.candidate_id,
+            "kind": view.candidate.candidate_kind,
+            "reason": view.reason,
+            "source": view.candidate.source_line,
+            "target": view.candidate.target_line,
+            "move": list(view.candidate.move_car_nos),
+            "score": list(view.score),
+            "paths": [list(path) for path in validation.operation_paths],
+            "rejected_before_accept": rejected[:8],
+            "debt_before": debt,
+            "debt_after": after_debt,
+        })
+        self.hook_index += 1
+        return True
+
+    def validate_candidate(self, candidate: physical.HookCandidate) -> physical.PhysicalValidation:
+        state_key = physical.state_signature(self.cars, self.loco)
+        cache_key = (state_key, candidate.candidate_id)
+        cached = self.validation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        validation = physical.validate_candidate(
+            self.graph,
+            candidate,
+            self.cars,
+            self.loco,
+            self.depot_assignment,
+        )
+        self.validation_cache[cache_key] = validation
+        return validation
+
+    def probe_after(
+        self,
+        candidate: physical.HookCandidate,
+        validation: physical.PhysicalValidation,
+    ) -> "Stage1Solver":
+        probe = self.fork()
+        physical.apply_candidate(candidate, probe.cars, validation)
+        probe.loco = physical.next_loco_location(candidate, validation)
+        return probe
+
     def debt_after(
         self,
         candidate: physical.HookCandidate,
         validation: physical.PhysicalValidation,
     ) -> dict[str, Any]:
-        probe = self.fork()
-        physical.apply_candidate(candidate, probe.cars, validation)
-        probe.loco = physical.next_loco_location(candidate, validation)
-        return probe.stage1_debt()
+        return self.probe_after(candidate, validation).stage1_debt()
 
     def seen_after(
         self,
         candidate: physical.HookCandidate,
         validation: physical.PhysicalValidation,
     ) -> bool:
-        probe = self.fork()
-        physical.apply_candidate(candidate, probe.cars, validation)
-        probe.loco = physical.next_loco_location(candidate, validation)
+        probe = self.probe_after(candidate, validation)
         return physical.state_signature(probe.cars, probe.loco) in self.seen_states
 
     def leaves_progress(
@@ -175,25 +310,23 @@ class Stage1Solver:
         *,
         depth: int,
     ) -> bool:
-        probe = self.fork()
-        physical.apply_candidate(candidate, probe.cars, validation)
-        probe.loco = physical.next_loco_location(candidate, validation)
+        probe = self.probe_after(candidate, validation)
         probe.hook_index = self.hook_index + 1
-        return probe.can_continue(depth)
+        return probe.can_continue(depth, include_put_blockers=True)
 
-    def can_continue(self, depth: int) -> bool:
+    def can_continue(self, depth: int, *, include_put_blockers: bool = False) -> bool:
         debt = self.stage1_debt()
         if debt["complete"] or depth <= 0:
             return True
-        for view in sorted(self.generate_candidates(debt), key=lambda item: item.score):
-            next_validation = physical.validate_candidate(
-                self.graph,
-                view.candidate,
-                self.cars,
-                self.loco,
-                self.depot_assignment,
-            )
-            if next_validation.accepted and self.leaves_progress(view.candidate, next_validation, depth=depth - 1):
+        views = self.continuation_views(debt, include_put_blockers=include_put_blockers)
+        for view in views:
+            next_validation = self.validate_candidate(view.candidate)
+            if not next_validation.accepted:
+                continue
+            probe = self.probe_after(view.candidate, next_validation)
+            if physical.state_signature(probe.cars, probe.loco) in self.seen_states:
+                continue
+            if depth <= 1 or probe.can_continue(depth - 1, include_put_blockers=include_put_blockers):
                 return True
         return False
 
@@ -201,19 +334,58 @@ class Stage1Solver:
         clone = Stage1Solver.__new__(Stage1Solver)
         clone.case_id = self.case_id
         clone.request = self.request
-        clone.cars = [dict(car) for car in self.cars]
+        clone.cars = [self.clone_car(car) for car in self.cars]
         clone.depot_assignment = self.depot_assignment
         clone.loco = self.loco
         clone.graph = self.graph
         clone.max_hooks = self.max_hooks
         clone.hook_index = self.hook_index
         clone.operation_index = self.operation_index
-        clone.operations = list(self.operations)
-        clone.trace = list(self.trace)
-        clone.seen_states = set(self.seen_states)
+        clone.operations = []
+        clone.trace = []
+        clone.seen_states = self.seen_states
+        clone.is_probe = True
+        clone.started_at = self.started_at
+        clone.time_budget_seconds = self.time_budget_seconds
+        clone.validation_cache = self.validation_cache
         return clone
 
+    def clone_car(self, car: dict[str, Any]) -> dict[str, Any]:
+        copied: dict[str, Any] = {}
+        for key, value in car.items():
+            if isinstance(value, list):
+                copied[key] = list(value)
+            elif isinstance(value, dict):
+                copied[key] = dict(value)
+            elif isinstance(value, set):
+                copied[key] = set(value)
+            else:
+                copied[key] = value
+        return copied
+
+    def time_exhausted(self) -> bool:
+        return (time.monotonic() - self.started_at) >= self.time_budget_seconds
+
+    def continuation_views(
+        self,
+        debt: dict[str, Any],
+        *,
+        include_put_blockers: bool,
+    ) -> list[CandidateView]:
+        views = list(self.generate_candidates(debt))
+        if include_put_blockers:
+            views.extend(self.route_blocker_candidates(debt, include_put_blockers=True))
+        unique: dict[str, CandidateView] = {}
+        for view in views:
+            unique.setdefault(view.candidate.candidate_id, view)
+        return sorted(unique.values(), key=lambda item: item.score)
+
     def generate_candidates(self, debt: dict[str, Any]) -> list[CandidateView]:
+        if "priority_route_blocker_lines" not in debt:
+            debt = {
+                **debt,
+                "priority_route_blocker_lines": self.priority_route_blocker_lines(debt),
+            }
         candidates: list[CandidateView] = []
         candidates.extend(self.direct_assembly_candidates(debt))
         candidates.extend(self.blocker_candidates(debt))
@@ -256,7 +428,7 @@ class Stage1Solver:
             targets = (
                 ("存4线",)
                 if target_group == "unwheel"
-                else (*ASSEMBLY_DEPOT, "存4线", *self.safe_temp_targets(source=line, debt=debt))
+                else (*ASSEMBLY_DEPOT, *self.safe_temp_targets(source=line, debt=debt))
             )
             for batch in self.prefix_options(max_batch):
                 for target in targets:
@@ -275,6 +447,7 @@ class Stage1Solver:
                         continue
                     candidates_score = self.score_candidate(
                         candidate,
+                        debt=debt,
                         moved_g=sum(1 for car in batch if self.stage1_goal(car)),
                         moved_x=0,
                         reason_rank=0,
@@ -296,6 +469,8 @@ class Stage1Solver:
             blockers = [by_no[no] for no in ordered_nos[:first_pending] if no in by_no]
             for batch in self.prefix_options(blockers):
                 for target in self.blocker_targets(batch, source=line, debt=debt):
+                    if not self.target_allowed(target, batch):
+                        continue
                     candidate = self.make_candidate(
                         source=line,
                         target=target,
@@ -307,13 +482,18 @@ class Stage1Solver:
                         continue
                     yield CandidateView(
                         candidate,
-                        self.score_candidate(candidate, moved_g=0, moved_x=len(batch), reason_rank=1),
+                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=1),
                         "clear_prefix_blocker",
                     )
 
-    def route_blocker_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
+    def route_blocker_candidates(
+        self,
+        debt: dict[str, Any],
+        *,
+        include_put_blockers: bool = False,
+    ) -> Iterable[CandidateView]:
         by_no = self.by_no()
-        for blocker_line, reason in self.route_blocker_requests(debt):
+        for blocker_line, reason in self.route_blocker_requests(debt, include_put_blockers=include_put_blockers):
             if blocker_line in FORBIDDEN_LINES:
                 continue
             ordered = [by_no[no] for no in physical.line_access_order(self.cars, blocker_line) if no in by_no]
@@ -334,7 +514,7 @@ class Stage1Solver:
                         continue
                     yield CandidateView(
                         candidate,
-                        self.score_candidate(candidate, moved_g=0, moved_x=len(batch), reason_rank=1),
+                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=1),
                         reason,
                     )
 
@@ -353,6 +533,8 @@ class Stage1Solver:
                 if physical.pull_equivalent(batch) > physical.PULL_LIMIT_EQUIVALENT:
                     continue
                 for target in self.blocker_targets(batch, source=line, debt=debt):
+                    if not self.target_allowed(target, batch):
+                        continue
                     candidate = self.make_candidate(
                         source=line,
                         target=target,
@@ -364,24 +546,38 @@ class Stage1Solver:
                         continue
                     yield CandidateView(
                         candidate,
-                        self.score_candidate(candidate, moved_g=0, moved_x=len(batch), reason_rank=2),
+                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=2),
                         "stage_boundary_cleanup",
                     )
 
-    def route_blocker_requests(self, debt: dict[str, Any]) -> list[tuple[str, str]]:
+    def route_blocker_requests(
+        self,
+        debt: dict[str, Any],
+        *,
+        include_put_blockers: bool = False,
+    ) -> list[tuple[str, str]]:
         by_no = self.by_no()
         seeds: list[tuple[str, set[str], str, int]] = []
+        requests: list[tuple[str, str]] = []
+        seen_requests: set[tuple[str, str]] = set()
         for no in debt["pending_stage1_nos"]:
             car = by_no.get(no)
             if car:
                 seeds.append((car["Line"], {no}, f"clear_route_blocker_for:{no}", 0))
+                if include_put_blockers:
+                    for target in self.official_stage1_targets(car):
+                        for blocker_line in self.route_blockers_for_put(car["Line"], target, {no}):
+                            if blocker_line in FORBIDDEN_LINES or blocker_line == car["Line"]:
+                                continue
+                            request_key = (blocker_line, f"clear_put_route_blocker_for:{no}")
+                            if request_key not in seen_requests:
+                                seen_requests.add(request_key)
+                                requests.append(request_key)
         for no in debt["pollution_nos"]:
             car = by_no.get(no)
             if car:
                 seeds.append((car["Line"], {no}, f"clear_route_blocker_for_pollution:{no}", 0))
 
-        requests: list[tuple[str, str]] = []
-        seen_requests: set[tuple[str, str]] = set()
         seen_seeds: set[tuple[str, tuple[str, ...], int]] = set()
         while seeds:
             source, moving_nos, reason, depth = seeds.pop(0)
@@ -404,6 +600,10 @@ class Stage1Solver:
         return requests
 
     def route_blockers_for_get(self, line: str, moving_nos: set[str]) -> tuple[str, ...]:
+        blockers, _status = self.route_blocker_status_for_get(line, moving_nos)
+        return blockers
+
+    def route_blocker_status_for_get(self, line: str, moving_nos: set[str]) -> tuple[tuple[str, ...], str]:
         occupied = physical.occupied_lines_for_get_route(self.cars, moving_nos, line)
         available = self.graph.route_avoiding_occupied(
             self.loco.line,
@@ -416,19 +616,62 @@ class Stage1Solver:
             train_length_m=0.0,
         )
         if available:
-            return ()
+            return (), "open"
 
         endpoints = {self.loco.line, line}
         candidate_paths = self.get_static_access_paths(line)
+        if not candidate_paths:
+            return (), "missing_static_path"
         blocked_paths: list[tuple[int, int, list[str]]] = []
         for path in candidate_paths:
             blockers = [node for node in path if node in occupied and node not in endpoints]
             if blockers:
                 blocked_paths.append((len(blockers), len(path), blockers))
         if not blocked_paths:
-            return ()
+            return (), "non_occupancy_route_blocked"
         _count, _length, blockers = min(blocked_paths)
-        return tuple(dict.fromkeys(blockers))
+        return tuple(dict.fromkeys(blockers)), "occupied_blockers"
+
+    def route_blockers_for_put(self, source: str, target: str, moving_nos: set[str]) -> tuple[str, ...]:
+        occupied = physical.occupied_lines_for_route(self.cars, moving_nos)
+        train_length = physical.train_length_for_nos(self.cars, moving_nos)
+        available = self.graph.route_avoiding_occupied(
+            source,
+            target,
+            occupied,
+            source_departure_lines=physical.route_departure_lines_for_source(source, self.cars, moving_nos),
+            target_approach_lines=physical.route_approach_lines_for_put(target, self.cars, moving_nos),
+            cars=self.cars,
+            moving_nos=moving_nos,
+            train_length_m=train_length,
+        )
+        if available:
+            return ()
+
+        endpoints = {source, target}
+        blockers: list[str] = []
+        for path in self.get_static_put_paths(source, target):
+            for node in path:
+                if node in occupied and node not in endpoints and node not in blockers:
+                    blockers.append(node)
+            if blockers:
+                break
+        return tuple(blockers)
+
+    def get_static_put_paths(self, source: str, target: str) -> list[list[str]]:
+        approaches = sorted(physical.route_approach_lines_for_put(target, self.cars, set()))
+        if not approaches:
+            route = self.graph.route(source, target)
+            return [route] if route else []
+        paths: list[list[str]] = []
+        for approach in approaches:
+            if approach == source:
+                paths.append([source, target])
+                continue
+            route = self.graph.route_avoiding_occupied(source, approach, {target})
+            if route:
+                paths.append([*route, target])
+        return paths
 
     def get_static_access_paths(self, line: str) -> list[list[str]]:
         approaches = sorted(physical.route_approach_lines_for_get(line))
@@ -468,7 +711,9 @@ class Stage1Solver:
             if not movable:
                 continue
             for batch in self.prefix_options(movable[:2]):
-                for target in self.safe_temp_targets(source=line, debt=debt):
+                for target in ASSEMBLY_DEPOT:
+                    if target == line:
+                        continue
                     if not self.target_allowed(target, batch):
                         continue
                     candidate = self.make_candidate(
@@ -482,7 +727,7 @@ class Stage1Solver:
                         continue
                     yield CandidateView(
                         candidate,
-                        self.score_candidate(candidate, moved_g=0, moved_x=len(batch), reason_rank=3),
+                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=0, reason_rank=3),
                         "release_gate_assembly",
                     )
 
@@ -536,6 +781,9 @@ class Stage1Solver:
         if source in FORBIDDEN_LINES or target in FORBIDDEN_LINES:
             return None
         nos = tuple(physical.car_no(car) for car in batch)
+        # build_planlet_candidate inserts a Weigh step before Put when the carried tail car needs weighing.
+        # Hard business/physical rules such as closed-door ordering, pull limits, route length, 15m locomotive
+        # allowance, and forced spotting are owned by physical.validate_candidate.
         steps = (
             physical.plan_step("Get", source, nos),
             physical.plan_step("Put", target, nos),
@@ -555,11 +803,15 @@ class Stage1Solver:
         self,
         candidate: physical.HookCandidate,
         *,
+        debt: dict[str, Any],
         moved_g: int,
         moved_x: int,
         reason_rank: int,
     ) -> tuple[Any, ...]:
         return (
+            self.pollution_rank(candidate, debt),
+            self.stage_boundary_target_penalty(candidate, debt),
+            self.route_unlock_rank(candidate, debt),
             self.candidate_source_rank(candidate),
             reason_rank,
             self.candidate_target_rank(candidate),
@@ -570,10 +822,59 @@ class Stage1Solver:
             candidate.candidate_id,
         )
 
+    def pollution_rank(self, candidate: physical.HookCandidate, debt: dict[str, Any]) -> int:
+        if not debt["pollution_nos"]:
+            return 0
+        reason = candidate.generation_reason
+        if reason == "stage_boundary_cleanup":
+            return 0
+        if reason.startswith("clear_route_blocker_for_pollution:"):
+            return 1
+        return 2
+
+    def stage_boundary_target_penalty(self, candidate: physical.HookCandidate, debt: dict[str, Any]) -> int:
+        if not debt["pollution_nos"]:
+            return 0
+        return 1 if candidate.target_line in ASSEMBLY_DEPOT else 0
+
+    def route_unlock_rank(self, candidate: physical.HookCandidate, debt: dict[str, Any]) -> int:
+        priority_blockers = set(debt.get("priority_route_blocker_lines") or ())
+        if not priority_blockers:
+            return 0
+        if candidate.generation_reason.startswith("clear_route_blocker_for:"):
+            return 0 if candidate.source_line in priority_blockers else 1
+        moving = set(candidate.move_car_nos)
+        if moving.intersection(debt["pending_stage1_nos"]):
+            return 0
+        return 1
+
+    def priority_route_blocker_lines(self, debt: dict[str, Any]) -> list[str]:
+        return list(self.pending_route_blocker_map(debt))
+
+    def pending_route_blocker_map(self, debt: dict[str, Any]) -> dict[str, list[str]]:
+        by_no = self.by_no()
+        blocker_map: dict[str, list[str]] = {}
+        for no in debt["pending_stage1_nos"]:
+            car = by_no.get(no)
+            if not car:
+                continue
+            for blocker_line in self.route_blockers_for_get(car["Line"], {no}):
+                blocker_map.setdefault(blocker_line, []).append(no)
+        return blocker_map
+
     def route_price(self, candidate: physical.HookCandidate) -> int:
         static = self.graph.route(candidate.source_line, candidate.target_line)
         hot = {"渡10", "联7", "机北1", "机北2", "预修线", "调梁线北", "存5线北"}
         return len(static) + sum(3 for line in static if line in hot)
+
+    def depot_assembly_capacity_deficit_m(self) -> float:
+        required = sum(
+            physical.car_length(car)
+            for car in self.cars
+            if self.stage1_goal(car) == "depot_assembly"
+        )
+        capacity = sum(physical.TRACK_SPECS[line].length_m for line in ASSEMBLY_DEPOT)
+        return max(0.0, required - capacity - physical.LINE_LENGTH_TOLERANCE_M)
 
     def target_allowed(self, target: str, batch: list[dict[str, Any]]) -> bool:
         if target not in physical.TRACK_SPECS:
@@ -605,8 +906,16 @@ class Stage1Solver:
         if goal == "存4线":
             return target == "存4线"
         if goal == "depot_assembly":
-            return target in ASSEMBLY_DEPOT or target == "存4线"
+            return target in ASSEMBLY_DEPOT
         return False
+
+    def official_stage1_targets(self, car: dict[str, Any]) -> tuple[str, ...]:
+        goal = self.stage1_goal(car)
+        if goal == "存4线":
+            return ("存4线",)
+        if goal == "depot_assembly":
+            return ASSEMBLY_DEPOT
+        return ()
 
     def stage1_goal(self, car: dict[str, Any]) -> str:
         if car["Line"] in physical.DEPOT_TARGET_LINES:
@@ -626,12 +935,12 @@ class Stage1Solver:
             return False
         if goal == "存4线":
             return car["Line"] == "存4线"
-        return car["Line"] in ASSEMBLY_DEPOT or car["Line"] == "存4线"
+        return car["Line"] in ASSEMBLY_DEPOT
 
     def allowed_on_stage_line(self, car: dict[str, Any], line: str) -> bool:
         goal = self.stage1_goal(car)
         if line == "存4线":
-            return goal in {"存4线", "depot_assembly"}
+            return goal == "存4线"
         if line in ASSEMBLY_DEPOT:
             return goal == "depot_assembly"
         return True
@@ -650,15 +959,21 @@ class Stage1Solver:
         pending_set = set(pending)
         for line in self.active_lines():
             ordered = physical.line_access_order(self.cars, line)
+            pending_after: list[bool] = [False] * len(ordered)
+            seen_pending = False
+            for index in range(len(ordered) - 1, -1, -1):
+                pending_after[index] = seen_pending
+                if ordered[index] in pending_set:
+                    seen_pending = True
             seen_blocker = False
-            for no in ordered:
+            for index, no in enumerate(ordered):
                 car = by_no.get(no)
                 if not car:
                     continue
                 if no in pending_set:
                     if seen_blocker:
                         blocked_g += 1
-                elif pending_set.intersection(ordered[ordered.index(no) + 1:]):
+                elif pending_after[index]:
                     seen_blocker = True
         for line in ASSEMBLY_ALL:
             for no in physical.line_access_order(self.cars, line):
@@ -686,6 +1001,7 @@ class Stage1Solver:
             "case_id": self.case_id,
             "status": "complete" if debt["complete"] else "partial",
             "hooks": self.hook_index - 1,
+            "move_batches": self.hook_index - 1,
             "business_hooks": business_hooks,
             "operations": len(self.operations),
             "stage1_debt": debt,
@@ -699,6 +1015,9 @@ class Stage1Solver:
             reasons.append(f"pending_stage1_cars:{len(debt['pending_stage1_nos'])}")
         if debt["pollution_nos"]:
             reasons.append(f"stage_boundary_pollution:{len(debt['pollution_nos'])}")
+        deficit = self.depot_assembly_capacity_deficit_m()
+        if deficit > 0:
+            reasons.append(f"assembly_capacity_deficit_m:{deficit:.1f}")
         if self.trace and self.trace[-1].get("reason") == "no_valid_candidate":
             counter = Counter(
                 violation
@@ -706,7 +1025,31 @@ class Stage1Solver:
                 for violation in item.get("violations", [])
             )
             reasons.extend(f"{key}:{count}" for key, count in counter.most_common(8))
+        if self.trace and self.trace[-1].get("reason") == "assembly_capacity_impossible":
+            reasons.append("assembly_capacity_impossible")
+        if self.trace and self.trace[-1].get("reason") == "no_stage1_progress":
+            reasons.append("no_stage1_progress")
+        if self.trace and self.trace[-1].get("reason") == "no_stage1_window_progress":
+            reasons.append("no_stage1_window_progress")
+        if self.trace and self.trace[-1].get("reason") == "solve_time_budget_exhausted":
+            reasons.append("solve_time_budget_exhausted")
+        unknown_get_blocks = self.unknown_get_route_blocks(debt)
+        if unknown_get_blocks:
+            counts = Counter(status for _no, _line, status in unknown_get_blocks)
+            reasons.extend(f"{status}:{count}" for status, count in counts.most_common())
         return reasons
+
+    def unknown_get_route_blocks(self, debt: dict[str, Any]) -> list[tuple[str, str, str]]:
+        by_no = self.by_no()
+        unknowns: list[tuple[str, str, str]] = []
+        for no in debt["pending_stage1_nos"]:
+            car = by_no.get(no)
+            if not car:
+                continue
+            blockers, status = self.route_blocker_status_for_get(car["Line"], {no})
+            if not blockers and status not in {"open", "occupied_blockers"}:
+                unknowns.append((no, car["Line"], status))
+        return unknowns
 
     def active_lines(self) -> list[str]:
         return sorted({car["Line"] for car in self.cars if car["Line"]}, key=lambda line: (self.source_rank(line), line))
@@ -717,13 +1060,7 @@ class Stage1Solver:
     def candidate_source_rank(self, candidate: physical.HookCandidate) -> int:
         rank = self.source_rank(candidate.source_line)
         moving = set(candidate.move_car_nos)
-        original_pending_exists = any(
-            self.stage1_goal(car)
-            and not self.stage1_car_complete(car)
-            and physical.car_no(car) not in moving
-            and car["Line"] == car.get("_InitialLine")
-            for car in self.cars
-        )
+        original_pending_exists = self.has_original_pending_stage1(moving)
         if not original_pending_exists:
             return rank
         by_no = self.by_no()
@@ -761,6 +1098,16 @@ class Stage1Solver:
             return 40
         return 0
 
+    def has_original_pending_stage1(self, excluded_nos: set[str] | None = None) -> bool:
+        excluded_nos = excluded_nos or set()
+        return any(
+            self.stage1_goal(car)
+            and not self.stage1_car_complete(car)
+            and physical.car_no(car) not in excluded_nos
+            and car["Line"] == car.get("_InitialLine")
+            for car in self.cars
+        )
+
     def by_no(self) -> dict[str, dict[str, Any]]:
         return {physical.car_no(car): car for car in self.cars}
 
@@ -777,8 +1124,15 @@ class Stage1Solver:
         }
 
 
-def solve_one(path: Path, out_dir: Path, *, max_hooks: int, verbose: bool = False) -> dict[str, Any]:
-    solver = Stage1Solver(path, max_hooks=max_hooks)
+def solve_one(
+    path: Path,
+    out_dir: Path,
+    *,
+    max_hooks: int,
+    time_budget_seconds: float,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    solver = Stage1Solver(path, max_hooks=max_hooks, time_budget_seconds=time_budget_seconds)
     result = solver.solve()
     out_dir.mkdir(parents=True, exist_ok=True)
     case_id = result["summary"]["case_id"]
@@ -811,6 +1165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", type=Path, help="case JSON or directory containing validation_*.json")
     parser.add_argument("--out", type=Path, required=True, help="output directory")
     parser.add_argument("--max-hooks", type=int, default=MAX_HOOKS)
+    parser.add_argument("--time-budget-seconds", type=float, default=DEFAULT_TIME_BUDGET_SECONDS)
     parser.add_argument("--limit", type=int, default=0, help="limit number of cases for directory input")
     return parser.parse_args()
 
@@ -820,11 +1175,43 @@ def main() -> None:
     files = case_files(args.input)
     if args.limit:
         files = files[: args.limit]
-    summaries = [solve_one(path, args.out, max_hooks=args.max_hooks, verbose=args.input.is_dir()) for path in files]
+    args.out.mkdir(parents=True, exist_ok=True)
+    summaries: list[dict[str, Any]] = []
+    for path in files:
+        try:
+            summaries.append(
+                solve_one(
+                    path,
+                    args.out,
+                    max_hooks=args.max_hooks,
+                    time_budget_seconds=args.time_budget_seconds,
+                    verbose=args.input.is_dir(),
+                )
+            )
+        except Exception as exc:  # keep directory batches diagnosable when one case is malformed
+            try:
+                case_id = physical.case_id_from_path(path)
+            except Exception:
+                case_id = path.stem
+            summary = {
+                "case_id": case_id,
+                "status": "error",
+                "hooks": 0,
+                "move_batches": 0,
+                "business_hooks": 0,
+                "operations": 0,
+                "stage1_debt": {"complete": False, "debt_count": 0},
+                "blocking_reasons": [f"solver_exception:{type(exc).__name__}:{exc}"],
+            }
+            summaries.append(summary)
+            write_json(args.out / f"{case_id}_summary.json", summary)
+            if args.input.is_dir():
+                print(f"{case_id} error {type(exc).__name__}: {exc}", flush=True)
     aggregate = {
         "cases": len(summaries),
         "complete": sum(1 for item in summaries if item["status"] == "complete"),
-        "partial": sum(1 for item in summaries if item["status"] != "complete"),
+        "partial": sum(1 for item in summaries if item["status"] == "partial"),
+        "error": sum(1 for item in summaries if item["status"] == "error"),
         "avg_hooks": round(sum(item["hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
         "avg_business_hooks": round(sum(item["business_hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
         "summaries": summaries,

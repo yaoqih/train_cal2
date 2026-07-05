@@ -129,10 +129,12 @@ def _analyze_stage3_case(
         "depot_inbound_reached_target_count": len(reached_nos),
         "stage3_complete": int(bool(debt_nos) and bool(completion_hook)),
         "stage3_completion_hook": completion_hook,
+        "stage3_attempt_hook_count": len(hook_indexes),
         "stage3_hook_count": len(hook_indexes) if completion_hook else 0,
         "stage3_template_counts": _counter_text(template_counts),
         "remaining_depot_inbound_nos": "|".join(remaining_nos),
         "remaining_by_source_counts": _counter_text(Counter(debt[no]["source_line"] for no in remaining_nos)),
+        "remaining_by_current_line_counts": _counter_text(Counter(line_by_no.get(no, "") for no in remaining_nos)),
         "remaining_by_target_counts": _counter_text(Counter(debt[no]["target_line"] for no in remaining_nos)),
     }
 
@@ -161,6 +163,8 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ready = [row for row in rows if row["stage3_start_hook"]]
     completed = [row for row in ready if row["stage3_complete"]]
     hook_counts = Counter(row["stage3_hook_count"] for row in completed)
+    attempt_counts = Counter(row["stage3_attempt_hook_count"] for row in ready)
+    failed_attempt_counts = Counter(row["stage3_attempt_hook_count"] for row in ready if not row["stage3_complete"])
     return {
         "case_count": len(rows),
         "stage3_ready_case_count": len(ready),
@@ -173,11 +177,16 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             sum(row["depot_inbound_count"] for row in ready),
         ),
         "stage3_hook_count_distribution": dict(sorted(hook_counts.items())),
+        "stage3_attempt_hook_count_distribution_on_ready_cases": dict(sorted(attempt_counts.items())),
+        "stage3_attempt_hook_count_distribution_on_failed_cases": dict(sorted(failed_attempt_counts.items())),
         "stage3_template_counts": dict(
             sum((Counter(_parse_counter_text(row["stage3_template_counts"])) for row in completed), Counter())
         ),
         "remaining_by_source_counts": dict(
             sum((Counter(_parse_counter_text(row["remaining_by_source_counts"])) for row in ready), Counter())
+        ),
+        "remaining_by_current_line_counts": dict(
+            sum((Counter(_parse_counter_text(row["remaining_by_current_line_counts"])) for row in ready), Counter())
         ),
         "remaining_by_target_counts": dict(
             sum((Counter(_parse_counter_text(row["remaining_by_target_counts"])) for row in ready), Counter())
