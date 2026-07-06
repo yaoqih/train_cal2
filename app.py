@@ -2211,6 +2211,18 @@ def _render_stage2_simple_dashboard() -> None:
         return
 
     case_rows = _stage2_case_rows(summaries, artifact_dir)
+    stage1_missing_count = _stage2_reason_count(aggregate, "stage1_response_missing")
+    if stage1_missing_count:
+        st.warning(
+            "当前第二阶段目录像是用错误的 --stage1-out 生成的："
+            f"{stage1_missing_count} 个案例缺少 Stage1 response。请重新生成 Stage2 产物。"
+        )
+        st.code(
+            "python3 scripts/stage1_simple/solve.py data/truth2 --out artifacts/stage1_simple_initial_depot_done\n"
+            "python3 scripts/stage2_simple/solve.py data/truth2 "
+            "--stage1-out artifacts/stage1_simple_initial_depot_done --out artifacts/stage2_simple_final",
+            language="bash",
+        )
     operation_values = [int(row.get("businessHooks") or 0) for row in case_rows if row.get("status") == "complete"]
     metric_cols = st.columns(7)
     metric_cols[0].metric("案例数", aggregate.get("cases", len(summaries)))
@@ -2249,7 +2261,9 @@ def _render_stage2_simple_dashboard() -> None:
     )
     bundle = _stage2_load_case_bundle(artifact_dir, selected_case)
     if not bundle:
-        st.warning(f"案例 {selected_case} 的 stage2_request/response/summary/trace 文件不完整。")
+        missing = _stage2_missing_case_files(artifact_dir, selected_case)
+        detail = f"缺少：{', '.join(missing)}" if missing else "文件读取失败。"
+        st.warning(f"案例 {selected_case} 的 stage2_request/response/summary/trace 文件不完整。{detail}")
         return
 
     summary = bundle["summary"]
@@ -2365,6 +2379,16 @@ def _stage2_load_case_bundle(artifact_dir: Path, case_id: str) -> dict[str, obje
         key: _stage1_read_json(path)
         for key, path in paths.items()
     }
+
+
+def _stage2_missing_case_files(artifact_dir: Path, case_id: str) -> list[str]:
+    paths = [
+        artifact_dir / f"{case_id}_summary.json",
+        artifact_dir / f"{case_id}_response.json",
+        artifact_dir / f"{case_id}_trace.json",
+        artifact_dir / f"{case_id}_stage2_request.json",
+    ]
+    return [path.name for path in paths if not path.exists()]
 
 
 def _stage2_response_with_generated(request_payload: dict, response: dict) -> dict:
