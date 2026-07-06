@@ -27,11 +27,13 @@ from solver_vnext import physical
 DEPOT_IN = tuple(f"修{i}库内" for i in range(1, 5))
 DEPOT_OUT = tuple(f"修{i}库外" for i in range(1, 5))
 SOURCE_LINES = (*DEPOT_IN, *DEPOT_OUT, "卸轮线", "存4线")
-BUFFER_LINES = (*DEPOT_OUT, *DEPOT_IN)
+DEFAULT_ALLOW_DEPOT_IN_BUFFER = False
+DEFAULT_BUFFER_LINES = DEPOT_OUT
 STORE4 = "存4线"
 UNWHEEL = "卸轮线"
 TAG_C4 = "C4"
 TAG_OFF = "OFF"
+TAG_OUT = "OUT"
 TAG_U = "U"
 TAG_STAY = "STAY"
 DEFAULT_TIME_BUDGET_SECONDS = 300.0
@@ -84,7 +86,7 @@ def normalize_car(car: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def final_loco_after_response(request: dict[str, Any], response: dict[str, Any]) -> str:
+def final_loco_after_response(request: dict[str, Any], response: dict[str, Any]) -> tuple[str, ...]:
     loco = {rv.norm((request.get("locoNode") or {}).get("Line"))}
     for row in sorted(rv.operations(response), key=lambda item: int(item.get("Index") or 0)):
         action = str(row.get("Action") or "")
@@ -95,7 +97,8 @@ def final_loco_after_response(request: dict[str, Any], response: dict[str, Any])
             loco = rv.put_loco_positions(row.get("PassbyPath") or [], line)
         elif action == "Weigh":
             loco = {rv.WEIGH}
-    return sorted(line for line in loco if line)[0] if any(loco) else rv.WEIGH
+    lines = tuple(sorted(line for line in loco if line))
+    return lines or (rv.WEIGH,)
 
 
 class Stage2Solver:
@@ -106,6 +109,8 @@ class Stage2Solver:
         stage1_response: dict[str, Any],
         *,
         time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
+        allow_depot_in_buffer: bool = DEFAULT_ALLOW_DEPOT_IN_BUFFER,
+        accept_upper_bound: bool = False,
     ) -> None:
         self.case_id = case_id
         self.original_request = request
@@ -123,9 +128,11 @@ class Stage2Solver:
         self.graph = physical.TrackGraph()
         self.started_at = time.monotonic()
         self.time_budget_seconds = time_budget_seconds
+        self.buffer_lines = (*DEPOT_OUT, *DEPOT_IN) if allow_depot_in_buffer else DEFAULT_BUFFER_LINES
+        self.accept_upper_bound = accept_upper_bound
         self.blocking_reasons: list[str] = []
         self.expansions = 0
-        self.route_cache: dict[tuple[State, str, str, tuple[str, ...]], tuple[tuple[str, ...], str]] = {}
+        self.route_cache: dict[tuple[Any, ...], tuple[tuple[str, ...], str]] = {}
         self.search_mode = "dijkstra"
 
     def classify(self, car: dict[str, Any]) -> str:
@@ -135,6 +142,8 @@ class Stage2Solver:
             return TAG_U
         if STORE4 in targets and line in set(SOURCE_LINES):
             return TAG_C4
+        if targets & set(DEPOT_OUT) and line in set(SOURCE_LINES):
+            return TAG_OUT
         if line in set(SOURCE_LINES) and not (targets & set(DEPOT_IN)) and UNWHEEL not in targets:
             return TAG_OFF
         return TAG_STAY
@@ -147,11 +156,19 @@ class Stage2Solver:
         if self.complete(state):
             return self.result(state, [], [])
         upper_state, upper_ops = self.greedy_solution(state)
+        if upper_state is not None and (self.accept_upper_bound or self.search_mode == "forced_deep_off_upper_unproved"):
+            return self.result(upper_state, upper_ops, [])
         solved, ops, reasons = self.dijkstra(state, upper_state, upper_ops)
         return self.result(solved, ops, reasons)
 
     def early_partial(self) -> list[str]:
         reasons: list[str] = []
+        source_set = set(SOURCE_LINES)
+        initial_lines = self.line_map(self.initial_state())
+        for no in sorted(self.active_nos):
+            line = self.current_line(initial_lines, no)
+            if line and line not in source_set:
+                reasons.append(f"active_car_off_source_line:{line}:{no}")
         for line in SOURCE_LINES:
             ordered = [
                 rv.car_no(car)
@@ -162,7 +179,7 @@ class Stage2Solver:
             ]
             seen_stay = False
             for no in ordered:
-                active = self.tags.get(no) != TAG_STAY
+                active = self.tags.get(no) in {TAG_C4, TAG_OFF, TAG_OUT, TAG_U}
                 if line == STORE4:
                     active = self.tags.get(no) == TAG_U
                 if active and seen_stay:
@@ -210,7 +227,7 @@ class Stage2Solver:
         return State(
             lines=tuple(sorted((line, tuple(nos)) for line, nos in by_line.items() if line)),
             held=(),
-            loco=(self.initial_loco,),
+            loco=self.initial_loco,
             new_store4=(),
         )
 
@@ -245,6 +262,9 @@ class Stage2Solver:
                 return None, [], ["stage2_time_budget_exhausted"]
             self.expansions += 1
             if self.expansions > MAX_EXPANSIONS:
+                if upper_state is not None and upper_ops is not None:
+                    self.search_mode = "greedy_upper_bound_expansion_unproved"
+                    return upper_state, upper_ops, []
                 return None, [], ["stage2_expansion_budget_exhausted"]
 
             yielded = False
@@ -267,6 +287,153 @@ class Stage2Solver:
         return None, [], reasons or ["stage2_no_solution"]
 
     def greedy_solution(self, start: State) -> tuple[State | None, list[Op]]:
+        solved, ops = self.deterministic_greedy_solution(start)
+        if solved is not None:
+            self.search_mode = "deterministic_upper_unproved"
+            return solved, ops
+        solved, ops = self.forced_deep_off_solution(start)
+        if solved is not None:
+            self.search_mode = "forced_deep_off_upper_unproved"
+            return solved, ops
+        solved, ops = self.feasible_upper_bound_search(start)
+        if solved is not None:
+            self.search_mode = "feasible_upper_unproved"
+        return solved, ops
+
+    def forced_deep_off_solution(self, start: State) -> tuple[State | None, list[Op]]:
+        state = start
+        ops: list[Op] = []
+        for _ in range(20):
+            line = self.next_deep_off_line(state)
+            if not line:
+                break
+            protected = self.matching_outer(line)
+            if protected:
+                moved = self.get_active_c4_prefix(state, protected)
+                if moved:
+                    op, state, reject = self.apply_get(state, protected, moved)
+                    if reject:
+                        return None, []
+                    ops.append(op)
+                    if not self.flush_bufferable_tail(state, ops, protected):
+                        return None, []
+                    state = self.state_after_ops(start, ops)
+
+            prefix = self.c4_prefix_before_first_off(state, line)
+            if not prefix:
+                break
+            op, state, reject = self.apply_get(state, line, prefix)
+            if reject:
+                return None, []
+            ops.append(op)
+            if not self.flush_bufferable_tail(state, ops, protected):
+                return None, []
+            state = self.state_after_ops(start, ops)
+
+            off = self.first_direct_tag(state, line, TAG_OFF)
+            if off:
+                op, next_state, reject = self.apply_get(state, line, (off,))
+                if reject and protected:
+                    moved = self.get_active_c4_prefix(state, protected)
+                    if not moved:
+                        return None, []
+                    op2, state2, reject2 = self.apply_get(state, protected, moved)
+                    if reject2:
+                        return None, []
+                    ops.append(op2)
+                    if not self.flush_bufferable_tail(state2, ops, protected):
+                        return None, []
+                    state = self.state_after_ops(start, ops)
+                    op, next_state, reject = self.apply_get(state, line, (off,))
+                if reject:
+                    return None, []
+                ops.append(op)
+                state = next_state
+
+        solved, tail_ops = self.deterministic_greedy_solution(state)
+        if solved is None:
+            return None, []
+        return solved, [*ops, *tail_ops]
+
+    def state_after_ops(self, start: State, ops: list[Op]) -> State:
+        state = start
+        for op in ops:
+            if op.action == "Get":
+                _op, state, reject = self.apply_get(state, op.line, op.move)
+            else:
+                _op, state, reject = self.apply_put(state, op.line, op.move)
+            if reject:
+                raise RuntimeError(reject)
+        return state
+
+    def flush_bufferable_tail(self, state: State, ops: list[Op], protected_line: str = "") -> bool:
+        for _ in range(20):
+            if not state.held:
+                return True
+            tail_tag = self.tags.get(state.held[-1], TAG_STAY)
+            if tail_tag == TAG_U:
+                op, next_state, reject = self.apply_put(state, UNWHEEL, (state.held[-1],))
+                if reject:
+                    return False
+                ops.append(op)
+                state = next_state
+                continue
+            if tail_tag not in {TAG_C4, TAG_OUT}:
+                return True
+            choices = [
+                (line == protected_line, self.buffer_line_penalty(state, line), -len(move), len(op.path), line, move, op, next_state)
+                for line, move, op, next_state in self.valid_puts(state)
+                if line not in {STORE4, UNWHEEL}
+            ]
+            if not choices:
+                return False
+            _protected, _penalty, _move_len, _path_len, _line, _move, op, state = min(choices)
+            ops.append(op)
+        return False
+
+    def next_deep_off_line(self, state: State) -> str:
+        line_map = self.line_map(state)
+        for line in self.ordered_source_lines(state):
+            if line == STORE4:
+                continue
+            tags = [self.effective_line_tag(line, no) for no in line_map.get(line, ())]
+            if TAG_OFF in tags:
+                before = tags[: tags.index(TAG_OFF)]
+                if TAG_C4 in before:
+                    return line
+        return ""
+
+    def c4_prefix_before_first_off(self, state: State, line: str) -> tuple[str, ...]:
+        nos = self.line_map(state).get(line, ())
+        out: list[str] = []
+        for no in nos:
+            tag = self.effective_line_tag(line, no)
+            if tag == TAG_OFF:
+                break
+            if tag in {TAG_C4, TAG_U}:
+                out.append(no)
+        return tuple(out)
+
+    def first_direct_tag(self, state: State, line: str, tag: str) -> str:
+        nos = self.line_map(state).get(line, ())
+        if nos and self.effective_line_tag(line, nos[0]) == tag:
+            return nos[0]
+        return ""
+
+    def get_active_c4_prefix(self, state: State, line: str) -> tuple[str, ...]:
+        out: list[str] = []
+        for no in self.line_map(state).get(line, ()):
+            if self.effective_line_tag(line, no) not in {TAG_C4, TAG_OUT}:
+                break
+            out.append(no)
+        return tuple(out)
+
+    def matching_outer(self, inner_line: str) -> str:
+        if inner_line in DEPOT_IN:
+            return inner_line.replace("库内", "库外")
+        return ""
+
+    def deterministic_greedy_solution(self, start: State) -> tuple[State | None, list[Op]]:
         state = start
         ops: list[Op] = []
         seen: set[State] = set()
@@ -292,6 +459,47 @@ class Stage2Solver:
             return None, []
         return None, []
 
+    def feasible_upper_bound_search(self, start: State, max_expansions: int = 8_000) -> tuple[State | None, list[Op]]:
+        queue: list[tuple[tuple[int, int, int, int, int], int, int, State]] = []
+        best_depth: dict[State, int] = {start: 0}
+        prev: dict[State, tuple[State, Op]] = {}
+        sequence = 1
+        heapq.heappush(queue, (self.feasible_priority(start, 0), 0, 0, start))
+        expansions = 0
+        while queue and expansions < max_expansions and not self.time_exhausted():
+            _priority, depth, _seq, state = heapq.heappop(queue)
+            if best_depth.get(state) != depth:
+                continue
+            if self.complete(state):
+                return state, self.reconstruct(prev, state)
+            expansions += 1
+            for op, next_state, _delta, reject in self.neighbors(state):
+                if reject:
+                    continue
+                next_depth = depth + 1
+                if next_depth >= best_depth.get(next_state, 10**9):
+                    continue
+                best_depth[next_state] = next_depth
+                prev[next_state] = (state, op)
+                heapq.heappush(queue, (self.feasible_priority(next_state, next_depth), next_depth, sequence, next_state))
+                sequence += 1
+        return None, []
+
+    def feasible_priority(self, state: State, depth: int) -> tuple[int, int, int, int, int]:
+        held_tags = [self.tags.get(no, TAG_STAY) for no in state.held]
+        bad_held = 0
+        if TAG_U in held_tags:
+            bad_held += 20
+        if self.has_c4_before_off(held_tags):
+            bad_held += 10
+        return (
+            self.source_debt_count(state),
+            self.pattern_debt_score(state) + bad_held,
+            -len(state.held),
+            depth,
+            len(self.line_map(state)),
+        )
+
     def greedy_put(self, state: State) -> tuple[Op, State] | None:
         if not state.held:
             return None
@@ -302,7 +510,7 @@ class Stage2Solver:
         for line, move, op, next_state in puts:
             if line == STORE4:
                 return op, next_state
-        if self.should_cache_tail(state):
+        if self.should_cache_tail(state) or self.should_buffer_off_tail(state) or self.should_buffer_flex_out_tail(state):
             buffer_puts = [
                 (-len(move), self.buffer_line_penalty(state, line), len(op.path), line, move, op, next_state)
                 for line, move, op, next_state in puts
@@ -341,6 +549,8 @@ class Stage2Solver:
         held_tags = [self.tags.get(no, TAG_STAY) for no in state.held]
         if self.has_c4_before_off(held_tags):
             return True
+        if TAG_OFF not in held_tags and TAG_U not in held_tags and not self.has_gettable_direct_tag(state, {TAG_OFF}):
+            return False
         if TAG_OFF not in held_tags and self.has_gettable_direct_tag(state, {TAG_OFF}):
             return True
         if TAG_OFF in held_tags and self.has_gettable_direct_tag(state, {TAG_OFF}):
@@ -351,6 +561,17 @@ class Stage2Solver:
         if TAG_OFF not in held_tags and self.count_remaining(state, TAG_OFF, exclude=held_set) > 0:
             return not self.has_gettable_blocker_prefix(state)
         return False
+
+    def should_buffer_off_tail(self, state: State) -> bool:
+        if not state.held or self.tags.get(state.held[-1], TAG_STAY) != TAG_OFF:
+            return False
+        tail_start = len(state.held) - 1
+        while tail_start > 0 and self.tags.get(state.held[tail_start - 1], TAG_STAY) == TAG_OFF:
+            tail_start -= 1
+        return any(self.tags.get(no) == TAG_U for no in state.held[:tail_start])
+
+    def should_buffer_flex_out_tail(self, state: State) -> bool:
+        return bool(state.held) and self.tags.get(state.held[-1], TAG_STAY) == TAG_OUT
 
     def has_gettable_direct_tag(self, state: State, targets: set[str]) -> bool:
         for line, move in self.get_prefixes(state):
@@ -375,22 +596,27 @@ class Stage2Solver:
 
     def greedy_get_rank(self, state: State, line: str, move: tuple[str, ...], op: Op) -> tuple[int, int, int, str]:
         tags = [self.tags.get(no, TAG_STAY) for no in move]
-        if line == UNWHEEL and any(tag in {TAG_C4, TAG_OFF} for tag in tags):
+        held_has_off = any(self.tags.get(no) == TAG_OFF for no in state.held)
+        if line == UNWHEEL and any(tag in {TAG_C4, TAG_OFF, TAG_OUT} for tag in tags):
             rank = 0
         elif line == STORE4:
             rank = 1
         elif TAG_U in tags:
             rank = 2
-        elif tags and tags[0] == TAG_OFF:
+        elif tags and tags[0] == TAG_OUT and self.flex_out_prefix_needed(state, line, len(move)):
             rank = 3
-        elif self.outside_blocks_pending_target(state, line):
+        elif tags and tags[0] == TAG_OFF:
             rank = 4
-        elif tags and tags[-1] == TAG_C4 and self.source_has_later_tag(state, line, len(move), {TAG_OFF, TAG_U}):
+        elif held_has_off and tags and tags[-1] == TAG_C4 and self.source_has_later_tag(state, line, len(move), {TAG_OFF, TAG_U}):
             rank = 5
-        elif TAG_OFF in tags:
+        elif self.outside_blocks_pending_target(state, line):
             rank = 6
-        else:
+        elif tags and tags[-1] == TAG_C4 and self.source_has_later_tag(state, line, len(move), {TAG_OFF, TAG_U}):
             rank = 7
+        elif TAG_OFF in tags:
+            rank = 8
+        else:
+            rank = 9
         return (rank, len(op.path), -len(move), line)
 
     def outside_blocks_pending_target(self, state: State, line: str) -> bool:
@@ -521,8 +747,20 @@ class Stage2Solver:
                 if held_equiv + self.pull_equivalent(prefix) > rv.PULL_LIMIT:
                     prefix.pop()
                     break
+            if prefix and all(self.tags.get(no) == TAG_OUT for no in prefix):
+                if not self.flex_out_prefix_needed(state, line, len(prefix)):
+                    continue
             for cut in self.useful_prefix_cuts(prefix):
                 yield line, tuple(prefix[:cut])
+
+    def flex_out_prefix_needed(self, state: State, line: str, cut: int) -> bool:
+        line_map = self.line_map(state)
+        later_tags = [self.effective_line_tag(line, no) for no in line_map.get(line, ())[cut:]]
+        if any(tag in {TAG_C4, TAG_OFF, TAG_U} for tag in later_tags):
+            return True
+        if line in DEPOT_OUT:
+            return self.inner_has_pending_active(line_map, self.matching_inner(line))
+        return False
 
     def pending_c4_before_off_lines(self, line_map: dict[str, tuple[str, ...]]) -> set[str]:
         out: set[str] = set()
@@ -541,15 +779,17 @@ class Stage2Solver:
             tags = [self.effective_line_tag(line, no) for no in line_map.get(line, ())]
             if line == STORE4 and any(tag == TAG_U for tag in tags):
                 return (0, 0, line)
-            if self.has_c4_before_off(tags):
+            if any(tag == TAG_OUT for tag in tags) and self.flex_out_prefix_needed(state, line, 1):
                 return (1, 0, line)
-            if any(tag == TAG_OFF for tag in tags):
+            if self.has_c4_before_off(tags):
                 return (2, 0, line)
-            if any(tag == TAG_C4 for tag in tags):
+            if any(tag == TAG_OFF for tag in tags):
                 return (3, 0, line)
-            if any(tag == TAG_U for tag in tags):
+            if any(tag == TAG_C4 for tag in tags):
                 return (4, 0, line)
-            return (5, 0, line)
+            if any(tag == TAG_U for tag in tags):
+                return (5, 0, line)
+            return (6, 0, line)
 
         return tuple(sorted(SOURCE_LINES, key=key))
 
@@ -570,10 +810,11 @@ class Stage2Solver:
             tag = self.tags.get(no, TAG_STAY)
             if tag == TAG_C4:
                 seen_c4 = True
-            elif tag == TAG_OFF and seen_c4:
-                # With a single final 存4 Put, a C4...OFF source must be
-                # reordered by first taking/cacheing the C4 prefix. Taking the
-                # mixed prefix is dominated in this simplified model.
+            elif tag in {TAG_OFF, TAG_OUT, TAG_U} and seen_c4:
+                # With a single final 存4 Put, C4 before an OFF/OUT tail must be
+                # cached before the tail is exposed. U is the same kind of hard
+                # boundary: it has to be exposed and sent to 卸轮线 before the
+                # final 存4收口, so the C4 prefix before it is a useful cut.
                 return [index]
         cuts = {len(prefix)}
         for index in range(1, len(prefix)):
@@ -581,7 +822,7 @@ class Stage2Solver:
             right = self.tags.get(prefix[index], TAG_STAY)
             # OFF/C4 boundaries are useful because the one final 存4 Put
             # requires the eventual consist to be OFF* followed by C4*.
-            if {left, right} == {TAG_C4, TAG_OFF}:
+            if {left, right} == {TAG_C4, TAG_OFF} or {left, right} == {TAG_C4, TAG_U} or TAG_OUT in {left, right}:
                 cuts.add(index)
         return sorted(cuts, reverse=True)
 
@@ -615,6 +856,8 @@ class Stage2Solver:
         if tail_tag == TAG_OFF:
             if not any(self.tags.get(no) == TAG_U for no in state.held[: len(state.held) - len(tail_run)]):
                 return
+        elif tail_tag == TAG_OUT:
+            pass
         elif tail_tag != TAG_C4:
             return
         # C4 缓存用于暴露 C4 后方的 OFF，或暴露机后被 C4 尾段压住
@@ -625,8 +868,8 @@ class Stage2Solver:
             and not self.held_has_blocked_unwheel(state.held)
         ):
             return
-        candidates: list[tuple[int, int, str, tuple[str, ...]]] = []
-        for line in self.safe_buffer_lines(state):
+        candidates: list[tuple[int, int, int, str, tuple[str, ...]]] = []
+        for line in self.safe_buffer_lines(state, tail_tag):
             move = self.longest_suffix_that_fits(state, line, tail_run)
             if not move:
                 continue
@@ -637,12 +880,26 @@ class Stage2Solver:
         for _move_len, _penalty, _route_len, line, move in sorted(candidates):
             yield line, move
 
-    def safe_buffer_lines(self, state: State) -> Iterable[str]:
+    def safe_buffer_lines(self, state: State, tail_tag: str) -> Iterable[str]:
         line_map = self.line_map(state)
-        for line in BUFFER_LINES:
-            if line_map.get(line):
-                continue
+        for line in self.buffer_lines:
+            existing = line_map.get(line, ())
+            if existing:
+                if tail_tag != TAG_C4:
+                    continue
+                if not self.can_stack_c4_buffer(state, line, existing):
+                    continue
             yield line
+
+    def can_stack_c4_buffer(self, state: State, line: str, existing: tuple[str, ...]) -> bool:
+        if not existing or any(self.tags.get(no) not in {TAG_C4, TAG_OUT} for no in existing):
+            return False
+        if line in DEPOT_OUT:
+            inner = self.matching_inner(line)
+            tags = [self.effective_line_tag(inner, no) for no in self.line_map(state).get(inner, ())]
+            if any(tag in {TAG_OFF, TAG_U} for tag in tags) or self.has_c4_before_off(tags):
+                return False
+        return True
 
     def buffer_line_penalty(self, state: State, line: str) -> int:
         penalty = 0
@@ -710,9 +967,12 @@ class Stage2Solver:
             return Op("Get", line, move, (), state.held), state, reject
         next_lines = dict(line_map)
         next_lines[line] = tuple(no for no in next_lines.get(line, ()) if no not in set(move))
+        held_after = (*state.held, *move)
+        if self.closed_door_non_store4_reject(held_after):
+            return Op("Get", line, move, route, held_after), state, "closed_door_process_violation"
         next_state = State(
             lines=self.pack_lines(next_lines),
-            held=(*state.held, *move),
+            held=held_after,
             loco=(line,),
             new_store4=state.new_store4,
         )
@@ -742,17 +1002,25 @@ class Stage2Solver:
         return Op("Put", line, move, route, held_after), next_state, ""
 
     def route(self, state: State, action: str, line: str, move: tuple[str, ...]) -> tuple[tuple[str, ...], str]:
-        cache_key = (state, action, line, move)
-        cached = self.route_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        cars = self.cars_from_state(state)
         if action == "Get":
             moving = set(state.held) | set(move)
             train_len = self.length(state.held)
         else:
             moving = set(state.held)
             train_len = self.length(state.held)
+        cache_key = (
+            state.lines,
+            tuple(sorted(state.held)),
+            state.loco,
+            action,
+            line,
+            tuple(sorted(moving)),
+            round(train_len, 3),
+        )
+        cached = self.route_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        cars = self.cars_from_state(state)
         choices: list[tuple[int, tuple[str, ...]]] = []
         blockers: list[str] = []
         for start in state.loco:
@@ -813,7 +1081,7 @@ class Stage2Solver:
 
     def stage2_debt(self, state: State | None) -> dict[str, Any]:
         if state is None:
-            pending = sorted(self.active_nos)
+            pending = sorted(no for no in self.active_nos if self.tags.get(no) != TAG_OUT)
             return {
                 "complete": False,
                 "pending_stage2_nos": pending,
@@ -839,10 +1107,31 @@ class Stage2Solver:
             "closed_door_c4_front_ok": self.c4_front_closed_door_ok(state.new_store4),
         }
 
+    def flex_out_positions(self, state: State | None) -> list[dict[str, Any]]:
+        state = state or self.initial_state()
+        line_map = self.line_map(state)
+        rows: list[dict[str, Any]] = []
+        for no in sorted(self.active_nos):
+            if self.tags.get(no) != TAG_OUT:
+                continue
+            line = self.current_line(line_map, no)
+            position = 0
+            if line:
+                position = line_map.get(line, ()).index(no) + 1
+            elif no in state.held:
+                position = state.held.index(no) + 1
+            rows.append({
+                "car_no": no,
+                "line": line or "机后",
+                "position": position,
+                "target_lines": sorted(self.meta[no].get("TargetLines") or []),
+            })
+        return rows
+
     def result(self, state: State | None, ops: list[Op], reasons: list[str]) -> dict[str, Any]:
         response = {"Data": {"Operations": self.response_operations(ops)}}
         combined = {"Data": {"Operations": self.combined_operations(response)}}
-        stage2_request = self.stage2_request()
+        stage2_request = self.stage2_request(ops)
         replayed, replay_bad = rv.replay(stage2_request, response)
         hard_bad = [
             v for v in replay_bad
@@ -865,12 +1154,19 @@ class Stage2Solver:
         )
         if hard_bad and not reasons:
             reasons = [f"replay_{v.kind}:{v.code}:{v.detail}" for v in hard_bad[:12]]
+        flex_out_positions = self.flex_out_positions(state)
         summary = {
             "case_id": self.case_id,
             "status": "complete" if stage2_debt["complete"] and not hard_bad else "partial",
             "operations": op_count,
             "business_hooks": sum(1 for row in rv.operations(response) if row.get("Action") in {"Get", "Put"}),
             "stage2_debt": stage2_debt,
+            "flex_out_positions": flex_out_positions,
+            "flex_out_in_store4": [
+                item["car_no"]
+                for item in flex_out_positions
+                if item["line"] == STORE4
+            ],
             "store4_put_count": len(store4_put_indexes),
             "store4_put_indexes": store4_put_indexes,
             "store4_put_is_final": store4_put_is_single_final,
@@ -903,14 +1199,7 @@ class Stage2Solver:
         }
 
     def waived_stage2_replay_violation(self, violation: Any) -> bool:
-        if getattr(violation, "kind", "") != "physical":
-            return False
-        detail = str(getattr(violation, "detail", ""))
-        code = getattr(violation, "code", "")
-        if code == "occupied_target_wrong_approach":
-            return detail.startswith(f"{STORE4}:") and f"prev={STORE4_STAGE2_APPROACH}" in detail
-        if code == "route_unreachable":
-            return f"->{STORE4}" in detail
+        del violation
         return False
 
     def response_operations(self, ops: list[Op], *, start_index: int = 1) -> list[dict[str, Any]]:
@@ -944,13 +1233,16 @@ class Stage2Solver:
         )
         return [*base, *extra]
 
-    def stage2_request(self) -> dict[str, Any]:
+    def stage2_request(self, ops: list[Op] | None = None) -> dict[str, Any]:
         request = dict(self.original_request)
+        loco_line = self.initial_loco[0]
+        if ops and ops[0].path:
+            loco_line = ops[0].path[0]
         request["StartStatus"] = [
             self.output_car(car)
             for car in sorted(self.initial_cars, key=lambda item: (item["Line"], int(item.get("Position") or 0), rv.car_no(item)))
         ]
-        request["locoNode"] = {"Line": self.initial_loco, "End": "North"}
+        request["locoNode"] = {"Line": loco_line, "End": "North"}
         return request
 
     def output_car(self, car: dict[str, Any]) -> dict[str, Any]:
@@ -1121,6 +1413,8 @@ def solve_one(path: Path, stage1_out: Path, out_dir: Path, args: argparse.Namesp
         read_json(path),
         read_json(response_path),
         time_budget_seconds=args.time_budget_seconds,
+        allow_depot_in_buffer=args.allow_depot_in_buffer,
+        accept_upper_bound=args.accept_upper_bound,
     )
     result = solver.solve()
     write_json(out_dir / f"{case_id}_stage2_request.json", result["stage2_request"])
@@ -1135,6 +1429,16 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(summaries)
     complete = sum(1 for item in summaries if item.get("status") == "complete")
     ops = [int(item.get("operations") or 0) for item in summaries if item.get("status") == "complete"]
+    flex_out_lines = Counter(
+        row.get("line")
+        for item in summaries
+        for row in item.get("flex_out_positions") or []
+    )
+    flex_out_in_store4 = [
+        no
+        for item in summaries
+        for no in item.get("flex_out_in_store4") or []
+    ]
     reasons = Counter(
         reason.split(":", 1)[0]
         for item in summaries
@@ -1148,6 +1452,9 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_operations_complete": round(sum(ops) / len(ops), 3) if ops else 0,
         "max_operations_complete": max(ops) if ops else 0,
         "partial_reasons": dict(reasons.most_common()),
+        "flex_out_final_lines": dict(flex_out_lines.most_common()),
+        "flex_out_in_store4_count": len(flex_out_in_store4),
+        "flex_out_in_store4": flex_out_in_store4,
         "summaries": summaries,
     }
 
@@ -1160,6 +1467,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", help="case id filter, e.g. 0226Z")
     parser.add_argument("--time-budget-seconds", type=float, default=DEFAULT_TIME_BUDGET_SECONDS)
     parser.add_argument("--include-stage1-partial", action="store_true")
+    parser.add_argument("--allow-depot-in-buffer", action="store_true")
+    parser.add_argument("--accept-upper-bound", action="store_true")
     return parser.parse_args()
 
 

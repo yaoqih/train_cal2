@@ -329,7 +329,7 @@ OCCUPIED_LINE_APPROACH_LINES: dict[str, tuple[str, ...]] = {
     "存5线南": ("存5线北",),
     "存5线北": ("渡1",),
     "存4南": ("存4线", "存3线"),
-    "存4线": ("渡1",),
+    "存4线": ("渡1", "存4南"),
     "存3线": ("渡3",),
     "存2线": ("渡3",),
     "存1线": ("机北1",),
@@ -770,6 +770,8 @@ def operation_stand_location(path: tuple[str, ...] | list[str], operation_line: 
 def post_put_loco_location(path: tuple[str, ...] | list[str], operation_line: str) -> LocoLocation:
     line = normalize_line(operation_line)
     normalized_path = [normalize_line(node) for node in path if normalize_line(node)]
+    if line == "存4线" and len(normalized_path) >= 2 and normalized_path[-2:] == ["存4南", "存4线"]:
+        return LocoLocation(line="存4线")
     if len(normalized_path) >= 2 and normalized_path[-1] == line:
         return LocoLocation(line=normalized_path[-2])
     if normalized_path == [line]:

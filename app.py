@@ -26,6 +26,8 @@ DEFAULT_EVAL_ARTIFACT = (
 )
 DEFAULT_STAGE1_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage1_simple_goal_verify"
 DEFAULT_STAGE2_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage2_simple_final"
+DEFAULT_STAGE3_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage3_speed_full_current"
+DEFAULT_STAGE3_SIMPLE_STATS_PATH = DEFAULT_STAGE3_SIMPLE_DIR / "aggregate_summary.json"
 _VNEXT_RUNTIME_CACHE = None
 P10_BUSINESS_HOOK_ACTIONS = {"Get", "Put"}
 SOLVER_VNEXT = "vNext 求解器"
@@ -139,13 +141,17 @@ def main():
     st.title("福州东调车 vNext Demo")
     st.caption("输入取送车计划，运行 vNext 求解演示，并查看评估统计。")
 
-    p10_tab, stage1_tab, stage2_tab, eval_tab = st.tabs(["vNext 求解演示", "第一阶段可视化", "第二阶段可视化", "评估统计"])
+    p10_tab, stage1_tab, stage2_tab, stage3_tab, eval_tab = st.tabs(
+        ["vNext 求解演示", "第一阶段可视化", "第二阶段可视化", "第三阶段可视化", "评估统计"]
+    )
     with p10_tab:
         _render_p10_runtime_page()
     with stage1_tab:
         _render_stage1_simple_dashboard()
     with stage2_tab:
         _render_stage2_simple_dashboard()
+    with stage3_tab:
+        _render_stage3_simple_dashboard()
     with eval_tab:
         _render_evaluation_dashboard()
 
@@ -2451,6 +2457,325 @@ def _render_stage2_trace(
             }
         )
     st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _render_stage3_simple_dashboard() -> None:
+    st.subheader("第三阶段可视化")
+    st.caption("读取 scripts/stage3_simple 的输出，从 Stage2 结束状态开始回放大库落位、库外暂存与终态台位/库外校验。")
+    artifact_text = st.text_input(
+        "第三阶段输出目录或统计 JSON",
+        value=str(DEFAULT_STAGE3_SIMPLE_STATS_PATH if DEFAULT_STAGE3_SIMPLE_STATS_PATH.exists() else DEFAULT_STAGE3_SIMPLE_DIR),
+        key="stage3-simple-artifact-dir",
+    )
+    artifact_path = Path(artifact_text).expanduser()
+    if not artifact_path.exists():
+        st.warning("第三阶段输出目录/统计 JSON 不存在。请先运行 stage3_simple 求解器生成输出。")
+        st.code(
+            "python3 scripts/stage3_simple/solve.py data/truth2 "
+            "--stage2-out artifacts/stage2_speed_full --out artifacts/stage3_speed_full_current",
+            language="bash",
+        )
+        return
+    artifact_dir = _stage3_case_artifact_dir(artifact_path)
+
+    try:
+        aggregate = _stage3_load_aggregate(artifact_path)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"读取第三阶段输出失败：{exc}")
+        return
+
+    summaries = list(aggregate.get("summaries") or [])
+    if not summaries:
+        st.warning("第三阶段输出目录中没有可用 summary。")
+        return
+
+    case_rows = _stage3_case_rows(summaries, artifact_dir)
+    operation_values = [int(row.get("businessHooks") or 0) for row in case_rows if row.get("status") == "complete"]
+    metric_cols = st.columns(8)
+    metric_cols[0].metric("案例数", aggregate.get("cases", len(summaries)))
+    metric_cols[1].metric("完成", aggregate.get("complete", "-"))
+    metric_cols[2].metric("Partial", aggregate.get("partial", "-"))
+    metric_cols[3].metric("完成均勾", aggregate.get("avg_operations_complete", _stage1_average(operation_values)))
+    metric_cols[4].metric("完成最大勾", aggregate.get("max_operations_complete", max(operation_values) if operation_values else 0))
+    metric_cols[5].metric("Stage3超时", _stage2_reason_count(aggregate, "stage3_global_time_budget_exhausted"))
+    metric_cols[6].metric("Stage2缺失", _stage2_reason_count(aggregate, "stage2_combined_response_missing"))
+    metric_cols[7].metric("Replay失败", sum(1 for row in case_rows if not row.get("replayPhysicalOk")))
+    st.caption(
+        "口径说明：第三阶段业务勾数 = Get/Put 操作数；回放起点是 stage3_request，"
+        "终态同时审查库内实际压入台位和库外目标停留。combined replay 仅用于阶段衔接诊断。"
+    )
+
+    filter_cols = st.columns([2, 2, 3])
+    status_filter = filter_cols[0].selectbox("状态", ["全部", "complete", "partial", "error"], key="stage3-status-filter")
+    min_hooks = filter_cols[1].number_input("最小业务勾数", min_value=0, value=0, step=1, key="stage3-min-hooks")
+    case_query = filter_cols[2].text_input("案例/模板/阻塞原因搜索", value="", key="stage3-case-query")
+    filtered_rows = _stage1_filter_case_rows(
+        case_rows,
+        status_filter=status_filter,
+        min_hooks=int(min_hooks),
+        query=case_query,
+    )
+    st.markdown("**全量案例**")
+    st.caption(f"当前显示 {len(filtered_rows)} / {len(case_rows)} 个案例。")
+    st.dataframe(filtered_rows, width="stretch", hide_index=True)
+
+    if not filtered_rows:
+        return
+    selected_case = st.selectbox(
+        "选中案例",
+        options=[str(row["caseId"]) for row in filtered_rows],
+        format_func=lambda case_id: _stage3_case_label(case_id, filtered_rows),
+        key="stage3-selected-case",
+    )
+    bundle = _stage3_load_case_bundle(artifact_dir, selected_case)
+    if not bundle:
+        st.warning(f"案例 {selected_case} 没有 summary 文件。")
+        return
+
+    summary = bundle["summary"]
+    response = bundle.get("response") or {"Data": {"Operations": [], "GeneratedEndStatus": []}}
+    trace = bundle.get("trace") or []
+    request_payload = bundle.get("stage3_request") or _stage1_load_truth_payload(selected_case) or {"StartStatus": [], "locoNode": {}}
+    combined_response = bundle.get("combined_response") or {}
+    operation_rows = _stage1_response_operation_rows(response)
+    vehicle_display_labels = _p10_vehicle_display_labels(request_payload)
+
+    selected_cols = st.columns(9)
+    selected_cols[0].metric("状态", summary.get("status", ""))
+    selected_cols[1].metric("模板", summary.get("template", ""))
+    selected_cols[2].metric("业务勾数", _stage1_business_hook_count(response) or int(summary.get("business_hooks") or 0))
+    selected_cols[3].metric("Active车", summary.get("active_count", 0))
+    selected_cols[4].metric("终态OK", "是" if summary.get("terminal_depot_ok") else "否")
+    selected_cols[5].metric("片段Replay", "是" if summary.get("replay_physical_ok") else "否")
+    selected_cols[6].metric("CombinedReplay", "是" if summary.get("combined_replay_physical_ok") else "否")
+    selected_cols[7].metric("搜索展开", summary.get("expansions", 0))
+    selected_cols[8].metric("耗时秒", summary.get("elapsed_seconds", 0))
+    if summary.get("blocking_reasons"):
+        st.info("阻塞原因：" + " | ".join(summary.get("blocking_reasons") or []))
+    if summary.get("replay_violations"):
+        st.warning(f"片段 replay 违规 {len(summary.get('replay_violations') or [])} 条。")
+    if summary.get("combined_replay_violations"):
+        st.caption(
+            "combined replay 违规用于审查 Stage2→Stage3 衔接；"
+            "当前 Stage3 片段成功与否以上方片段 replay/终态校验为准。"
+        )
+
+    view = st.radio(
+        "查看内容",
+        options=["可视化回放", "勾计划", "终态", "Trace/诊断", "模板/校验", "原始 JSON"],
+        horizontal=True,
+        key="stage3-view",
+    )
+    if view == "可视化回放":
+        if not operation_rows:
+            st.info("当前案例没有可回放的第三阶段操作。")
+        else:
+            _render_p10_replay(request_payload, operation_rows, response, vehicle_display_labels, key_prefix="stage3")
+    elif view == "勾计划":
+        if operation_rows:
+            st.markdown("**接口操作序列（Get/Put 为业务勾）**")
+            st.dataframe(_p10_operation_table_rows(operation_rows, vehicle_display_labels), width="stretch", hide_index=True)
+        else:
+            st.info("当前没有生成操作。")
+    elif view == "终态":
+        _render_p10_end_status(response, vehicle_display_labels)
+    elif view == "Trace/诊断":
+        _render_stage3_trace(trace, summary, vehicle_display_labels)
+    elif view == "模板/校验":
+        _render_stage3_template_and_validation(summary)
+    else:
+        json_cols = st.columns(2)
+        with json_cols[0]:
+            st.markdown("**summary**")
+            st.json(summary)
+            st.markdown("**trace**")
+            st.json(trace)
+        with json_cols[1]:
+            st.markdown("**stage3_request**")
+            st.json(_p10_response_for_display(request_payload, vehicle_display_labels))
+            st.markdown("**response**")
+            st.json(_p10_response_for_display(response, vehicle_display_labels))
+            if combined_response:
+                st.markdown("**combined_response**")
+                st.json(_p10_response_for_display(combined_response, vehicle_display_labels))
+
+
+def _stage3_load_aggregate(artifact_dir: Path) -> dict:
+    if artifact_dir.is_file():
+        payload = _p10_read_json(artifact_dir)
+        if "summaries" in payload:
+            return payload
+        raise ValueError(f"{artifact_dir} 不是包含 summaries 的第三阶段统计 JSON")
+    aggregate_path = artifact_dir / "aggregate_summary.json"
+    if aggregate_path.exists():
+        return _p10_read_json(aggregate_path)
+    summaries = []
+    for path in sorted(artifact_dir.glob("*_summary.json")):
+        try:
+            summaries.append(_stage1_read_json(path))
+        except Exception:  # noqa: BLE001
+            continue
+    return _stage3_build_aggregate(summaries)
+
+
+def _stage3_case_artifact_dir(artifact_path: Path) -> Path:
+    if artifact_path.is_dir():
+        return artifact_path
+    parent = artifact_path.parent
+    stem = artifact_path.stem
+    candidates = []
+    if "_stats_" in stem:
+        candidates.append(parent / stem.replace("_stats_", "_", 1))
+    if stem.endswith("_stats"):
+        candidates.append(parent / stem[: -len("_stats")])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return parent
+
+
+def _stage3_build_aggregate(summaries: list[dict]) -> dict:
+    complete = [item for item in summaries if item.get("status") == "complete"]
+    ops = [int(item.get("operations") or item.get("business_hooks") or 0) for item in complete]
+    reasons = Counter(
+        str(reason).split(":", 1)[0]
+        for item in summaries
+        if item.get("status") != "complete"
+        for reason in item.get("blocking_reasons") or []
+    )
+    templates = Counter(item.get("template") for item in complete)
+    return {
+        "cases": len(summaries),
+        "complete": len(complete),
+        "partial": len(summaries) - len(complete),
+        "avg_operations_complete": round(sum(ops) / len(ops), 3) if ops else 0,
+        "max_operations_complete": max(ops) if ops else 0,
+        "templates_complete": dict(sorted(templates.items())),
+        "partial_reasons": dict(reasons.most_common()),
+        "summaries": summaries,
+    }
+
+
+def _stage3_case_rows(summaries: list[dict], artifact_dir: Path | None = None) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for summary in summaries:
+        case_id = str(summary.get("case_id") or "")
+        response = _stage1_try_load_response(artifact_dir, case_id) if artifact_dir is not None else {}
+        business_hooks = _stage1_business_hook_count(response) if response else int(summary.get("business_hooks") or summary.get("operations") or 0)
+        blocking_reasons = " | ".join(summary.get("blocking_reasons") or [])
+        rows.append(
+            {
+                "caseId": case_id,
+                "status": summary.get("status", ""),
+                "template": summary.get("template", ""),
+                "businessHooks": business_hooks,
+                "moveBatches": business_hooks,
+                "interfaceOperations": int(summary.get("operations") or 0),
+                "activeCount": int(summary.get("active_count") or 0),
+                "terminalDepotOk": bool(summary.get("terminal_depot_ok")),
+                "replayPhysicalOk": bool(summary.get("replay_physical_ok")),
+                "combinedReplayOk": bool(summary.get("combined_replay_physical_ok")),
+                "expansions": int(summary.get("expansions") or 0),
+                "elapsedSeconds": summary.get("elapsed_seconds", 0),
+                "blockingReasons": blocking_reasons,
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("status")) != "partial",
+            not bool(row.get("terminalDepotOk")),
+            -int(row.get("businessHooks") or 0),
+            str(row.get("caseId")),
+        ),
+    )
+
+
+def _stage3_case_label(case_id: str, rows: list[dict]) -> str:
+    row = next((item for item in rows if item.get("caseId") == case_id), {})
+    return (
+        f"{case_id} | {row.get('status', '')} | 模板 {row.get('template', '')} | "
+        f"{row.get('businessHooks', 0)} 业务勾 | {row.get('blockingReasons', '')}"
+    )
+
+
+def _stage3_load_case_bundle(artifact_dir: Path, case_id: str) -> dict[str, object] | None:
+    summary_path = artifact_dir / f"{case_id}_summary.json"
+    if not summary_path.exists():
+        return None
+    paths = {
+        "summary": summary_path,
+        "response": artifact_dir / f"{case_id}_response.json",
+        "trace": artifact_dir / f"{case_id}_trace.json",
+        "stage3_request": artifact_dir / f"{case_id}_stage3_request.json",
+        "combined_response": artifact_dir / f"{case_id}_combined_response.json",
+    }
+    bundle: dict[str, object] = {"summary": _stage1_read_json(summary_path)}
+    for key, path in paths.items():
+        if key == "summary" or not path.exists():
+            continue
+        try:
+            bundle[key] = _stage1_read_json(path)
+        except Exception:  # noqa: BLE001
+            continue
+    return bundle
+
+
+def _render_stage3_trace(
+    trace: list[dict],
+    summary: dict,
+    vehicle_display_labels: dict[str, str],
+) -> None:
+    st.caption(f"summary blocking reasons: {' | '.join(summary.get('blocking_reasons') or []) or '无'}")
+    if not trace:
+        st.info("当前没有 stage3 trace。")
+        return
+    action_counts = Counter(str(row.get("action") or "") for row in trace)
+    st.markdown("**动作分布**")
+    st.dataframe(
+        [{"action": action, "count": count} for action, count in action_counts.most_common()],
+        width="stretch",
+        hide_index=True,
+    )
+    rows = []
+    for row in trace:
+        rows.append(
+            {
+                "index": row.get("index"),
+                "action": row.get("action"),
+                "line": row.get("line"),
+                "move": _p10_format_vehicle_list(row.get("move") or [], vehicle_display_labels),
+                "trainAfter": _p10_format_vehicle_list(row.get("train_after") or [], vehicle_display_labels),
+                "path": " -> ".join(row.get("path") or []),
+                "note": row.get("note", ""),
+            }
+        )
+    st.markdown("**Trace 明细**")
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _render_stage3_template_and_validation(summary: dict) -> None:
+    template_rows = list(summary.get("template_summaries") or [])
+    if template_rows:
+        st.markdown("**模板求解摘要**")
+        st.dataframe(template_rows, width="stretch", hide_index=True)
+    else:
+        st.info("summary 中没有 template_summaries。")
+
+    validation_cols = st.columns(4)
+    validation_cols[0].metric("终态台位/库外", "OK" if summary.get("terminal_depot_ok") else "FAIL")
+    validation_cols[1].metric("Stage3片段Replay", "OK" if summary.get("replay_physical_ok") else "FAIL")
+    validation_cols[2].metric("CombinedReplay", "OK" if summary.get("combined_replay_physical_ok") else "FAIL")
+    validation_cols[3].metric("Active车", summary.get("active_count", 0))
+
+    replay_violations = list(summary.get("replay_violations") or [])
+    combined_violations = list(summary.get("combined_replay_violations") or [])
+    if replay_violations:
+        st.markdown("**Stage3片段 replay violations**")
+        st.dataframe(replay_violations, width="stretch", hide_index=True)
+    if combined_violations:
+        st.markdown("**Combined replay violations**")
+        st.dataframe(combined_violations, width="stretch", hide_index=True)
 
 
 def _render_evaluation_dashboard() -> None:
