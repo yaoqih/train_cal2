@@ -2235,6 +2235,7 @@ def _render_stage2_simple_dashboard() -> None:
     st.caption(
         "口径说明：第二阶段按接口操作行计勾，Get/Put 都算 1 勾；本页不处理称重。"
         "Stage2 的回放起点是 stage2_request，即第一阶段求解后的实际状态。"
+        "最终 Put 存4线按 存4南→存4线 口径，且只允许一次并必须是最后一行。"
     )
 
     filter_cols = st.columns([2, 2, 3])
@@ -2275,18 +2276,19 @@ def _render_stage2_simple_dashboard() -> None:
     operation_rows = _stage1_response_operation_rows(response)
     vehicle_display_labels = _p10_vehicle_display_labels(request_payload)
 
-    selected_cols = st.columns(7)
+    selected_cols = st.columns(8)
     selected_cols[0].metric("状态", summary.get("status", ""))
     selected_cols[1].metric("业务勾数", _stage1_business_hook_count(response))
     selected_cols[2].metric("接口操作", summary.get("operations", 0))
     selected_cols[3].metric("待出库", len(debt.get("pending_stage2_nos") or []))
-    selected_cols[4].metric("存4新增段", len(debt.get("new_store4_segment") or []))
-    selected_cols[5].metric("搜索展开", summary.get("expansions", 0))
-    selected_cols[6].metric("耗时秒", summary.get("elapsed_seconds", 0))
+    selected_cols[4].metric("存4Put次数", summary.get("store4_put_count", 0))
+    selected_cols[5].metric("单次最终Put", "是" if summary.get("store4_put_is_final") else "否")
+    selected_cols[6].metric("搜索展开", summary.get("expansions", 0))
+    selected_cols[7].metric("耗时秒", summary.get("elapsed_seconds", 0))
     if summary.get("blocking_reasons"):
         st.info("阻塞原因：" + " | ".join(summary.get("blocking_reasons") or []))
     if summary.get("waived_replay_differences"):
-        st.caption("提示：waived_replay_differences 是第二阶段口径下允许的存4北通行差异，不计为硬违规。")
+        st.caption("提示：waived_replay_differences 是共享 replay 仍按渡1入口校验造成的差异；第二阶段最终 Put 存4线按存4南入口口径，不计为硬违规。")
 
     view = st.radio(
         "查看内容",
