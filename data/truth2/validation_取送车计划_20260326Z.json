@@ -625,7 +625,10 @@
       "IsWeigh": false,
       "IsClosedDoor": false,
       "TargetLines": [
-        "修3库外"
+        "修1库外",
+        "修2库外",
+        "修3库外",
+        "修4库外"
       ]
     },
     {
@@ -653,7 +656,10 @@
       "IsWeigh": false,
       "IsClosedDoor": false,
       "TargetLines": [
-        "修3库外"
+        "修1库外",
+        "修2库外",
+        "修3库外",
+        "修4库外"
       ]
     },
     {
@@ -1415,7 +1421,10 @@
       "IsWeigh": false,
       "IsClosedDoor": false,
       "TargetLines": [
-        "修3库外"
+        "修1库外",
+        "修2库外",
+        "修3库外",
+        "修4库外"
       ]
     }
   ],
