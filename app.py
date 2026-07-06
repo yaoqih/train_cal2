@@ -25,6 +25,7 @@ DEFAULT_EVAL_ARTIFACT = (
     / "l7_phase1234_truth_phase3_tail_run_preflight_20260614.json"
 )
 DEFAULT_STAGE1_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage1_simple_goal_verify"
+DEFAULT_STAGE2_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage2_simple_final"
 _VNEXT_RUNTIME_CACHE = None
 P10_BUSINESS_HOOK_ACTIONS = {"Get", "Put"}
 SOLVER_VNEXT = "vNext 求解器"
@@ -138,11 +139,13 @@ def main():
     st.title("福州东调车 vNext Demo")
     st.caption("输入取送车计划，运行 vNext 求解演示，并查看评估统计。")
 
-    p10_tab, stage1_tab, eval_tab = st.tabs(["vNext 求解演示", "第一阶段可视化", "评估统计"])
+    p10_tab, stage1_tab, stage2_tab, eval_tab = st.tabs(["vNext 求解演示", "第一阶段可视化", "第二阶段可视化", "评估统计"])
     with p10_tab:
         _render_p10_runtime_page()
     with stage1_tab:
         _render_stage1_simple_dashboard()
+    with stage2_tab:
+        _render_stage2_simple_dashboard()
     with eval_tab:
         _render_evaluation_dashboard()
 
@@ -608,7 +611,7 @@ def _render_p10_result(
         else:
             st.info("当前没有生成操作。")
     elif view == "可视化回放":
-        _render_p10_replay(payload, operation_rows, response, vehicle_display_labels)
+        _render_p10_replay(payload, operation_rows, response, vehicle_display_labels, key_prefix="p10")
     elif view == "终态":
         _render_p10_end_status(response, vehicle_display_labels)
     else:
@@ -888,6 +891,7 @@ def _render_p10_replay(
     operation_rows,
     response: dict,
     vehicle_display_labels: dict[str, str],
+    key_prefix: str = "p10",
 ) -> None:
     frames = _p10_build_replay_frames(payload, operation_rows, response)
     if not frames:
@@ -895,16 +899,17 @@ def _render_p10_replay(
         return
     vehicle_target_tracks = _p10_vehicle_target_tracks(payload)
     max_frame_index = len(frames) - 1
-    if "p10_replay_frame_index" not in st.session_state:
-        st.session_state["p10_replay_frame_index"] = 0
-    if int(st.session_state["p10_replay_frame_index"]) > max_frame_index:
-        st.session_state["p10_replay_frame_index"] = max_frame_index
+    frame_key = f"{key_prefix}_replay_frame_index"
+    if frame_key not in st.session_state:
+        st.session_state[frame_key] = 0
+    if int(st.session_state[frame_key]) > max_frame_index:
+        st.session_state[frame_key] = max_frame_index
     st.markdown('<div id="p10-replay-anchor"></div>', unsafe_allow_html=True)
     frame_index = st.slider(
         "回放步骤（按接口操作推进）",
         min_value=0,
         max_value=max_frame_index,
-        key="p10_replay_frame_index",
+        key=frame_key,
     )
     st.caption(f"回放位置：{frame_index + 1}/{len(frames)}")
     frame = frames[frame_index]
@@ -917,7 +922,7 @@ def _render_p10_replay(
             "可视化模式",
             options=["线路拓扑", "股道占用"],
             horizontal=True,
-            key="p10-replay-view-mode",
+            key=f"{key_prefix}-replay-view-mode",
         )
         if view_mode == "线路拓扑":
             st.markdown(
@@ -1952,7 +1957,7 @@ def _render_stage1_simple_dashboard() -> None:
         key="stage1-view",
     )
     if view == "可视化回放":
-        _render_p10_replay(request_payload, operation_rows, response, vehicle_display_labels)
+        _render_p10_replay(request_payload, operation_rows, response, vehicle_display_labels, key_prefix="stage1")
     elif view == "勾计划":
         hook_rows = _p10_hook_summary_rows(operation_rows, vehicle_display_labels)
         st.markdown("**按搬运批次汇总**")
@@ -2173,6 +2178,253 @@ def _render_stage1_trace(
         )
     st.caption(f"summary blocking reasons: {' | '.join(summary.get('blocking_reasons') or []) or '无'}")
     st.dataframe(trace_rows, width="stretch", hide_index=True)
+
+
+def _render_stage2_simple_dashboard() -> None:
+    st.subheader("第二阶段可视化")
+    st.caption("读取 scripts/stage2_simple 的输出，从 Stage1 结束状态开始回放卸轮翻库与大库出库编组。")
+    artifact_text = st.text_input(
+        "第二阶段输出目录",
+        value=str(DEFAULT_STAGE2_SIMPLE_DIR),
+        key="stage2-simple-artifact-dir",
+    )
+    artifact_dir = Path(artifact_text).expanduser()
+    aggregate_path = artifact_dir / "aggregate_summary.json"
+    if not aggregate_path.exists():
+        st.warning("没有找到 aggregate_summary.json。请先运行 stage2_simple 求解器生成输出。")
+        st.code(
+            "python3 scripts/stage2_simple/solve.py data/truth2 "
+            "--stage1-out artifacts/stage1_simple_initial_depot_done --out artifacts/stage2_simple_final",
+            language="bash",
+        )
+        return
+
+    try:
+        aggregate = _p10_read_json(aggregate_path)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"读取 aggregate_summary.json 失败：{exc}")
+        return
+
+    summaries = list(aggregate.get("summaries") or [])
+    if not summaries:
+        st.warning("aggregate_summary.json 中没有 summaries。")
+        return
+
+    case_rows = _stage2_case_rows(summaries, artifact_dir)
+    operation_values = [int(row.get("businessHooks") or 0) for row in case_rows if row.get("status") == "complete"]
+    metric_cols = st.columns(7)
+    metric_cols[0].metric("案例数", aggregate.get("cases", len(summaries)))
+    metric_cols[1].metric("完成", aggregate.get("complete", "-"))
+    metric_cols[2].metric("Partial", aggregate.get("partial", "-"))
+    metric_cols[3].metric("完成均勾", aggregate.get("avg_operations_complete", _stage1_average(operation_values)))
+    metric_cols[4].metric("完成最大勾", aggregate.get("max_operations_complete", max(operation_values) if operation_values else 0))
+    metric_cols[5].metric("Stage1未完成", _stage2_reason_count(aggregate, "stage1_not_complete"))
+    metric_cols[6].metric("Stage2真阻塞", _stage2_true_partial_count(case_rows))
+    st.caption(
+        "口径说明：第二阶段按接口操作行计勾，Get/Put 都算 1 勾；本页不处理称重。"
+        "Stage2 的回放起点是 stage2_request，即第一阶段求解后的实际状态。"
+    )
+
+    filter_cols = st.columns([2, 2, 3])
+    status_filter = filter_cols[0].selectbox("状态", ["全部", "complete", "partial"], key="stage2-status-filter")
+    min_hooks = filter_cols[1].number_input("最小业务勾数", min_value=0, value=0, step=1, key="stage2-min-hooks")
+    case_query = filter_cols[2].text_input("案例/阻塞原因搜索", value="", key="stage2-case-query")
+    filtered_rows = _stage1_filter_case_rows(
+        case_rows,
+        status_filter=status_filter,
+        min_hooks=int(min_hooks),
+        query=case_query,
+    )
+    st.markdown("**全量案例**")
+    st.caption(f"当前显示 {len(filtered_rows)} / {len(case_rows)} 个案例。")
+    st.dataframe(filtered_rows, width="stretch", hide_index=True)
+
+    if not filtered_rows:
+        return
+    selected_case = st.selectbox(
+        "选中案例",
+        options=[str(row["caseId"]) for row in filtered_rows],
+        format_func=lambda case_id: _stage2_case_label(case_id, filtered_rows),
+        key="stage2-selected-case",
+    )
+    bundle = _stage2_load_case_bundle(artifact_dir, selected_case)
+    if not bundle:
+        st.warning(f"案例 {selected_case} 的 stage2_request/response/summary/trace 文件不完整。")
+        return
+
+    summary = bundle["summary"]
+    response = bundle["response"]
+    trace = bundle["trace"]
+    request_payload = bundle["stage2_request"]
+    display_response = _stage2_response_with_generated(request_payload, response)
+    debt = summary.get("stage2_debt") or {}
+    operation_rows = _stage1_response_operation_rows(response)
+    vehicle_display_labels = _p10_vehicle_display_labels(request_payload)
+
+    selected_cols = st.columns(7)
+    selected_cols[0].metric("状态", summary.get("status", ""))
+    selected_cols[1].metric("业务勾数", _stage1_business_hook_count(response))
+    selected_cols[2].metric("接口操作", summary.get("operations", 0))
+    selected_cols[3].metric("待出库", len(debt.get("pending_stage2_nos") or []))
+    selected_cols[4].metric("存4新增段", len(debt.get("new_store4_segment") or []))
+    selected_cols[5].metric("搜索展开", summary.get("expansions", 0))
+    selected_cols[6].metric("耗时秒", summary.get("elapsed_seconds", 0))
+    if summary.get("blocking_reasons"):
+        st.info("阻塞原因：" + " | ".join(summary.get("blocking_reasons") or []))
+    if summary.get("waived_replay_differences"):
+        st.caption("提示：waived_replay_differences 是第二阶段口径下允许的存4北通行差异，不计为硬违规。")
+
+    view = st.radio(
+        "查看内容",
+        options=["可视化回放", "勾计划", "存4新增段", "终态", "Trace/诊断", "原始 JSON"],
+        horizontal=True,
+        key="stage2-view",
+    )
+    if view == "可视化回放":
+        _render_p10_replay(request_payload, operation_rows, display_response, vehicle_display_labels, key_prefix="stage2")
+    elif view == "勾计划":
+        st.markdown("**接口操作序列（Get/Put 为业务勾）**")
+        st.dataframe(_p10_operation_table_rows(operation_rows, vehicle_display_labels), width="stretch", hide_index=True)
+    elif view == "存4新增段":
+        _render_stage2_store4_segment(debt, vehicle_display_labels)
+    elif view == "终态":
+        _render_p10_end_status(display_response, vehicle_display_labels)
+    elif view == "Trace/诊断":
+        _render_stage2_trace(trace, summary, vehicle_display_labels)
+    else:
+        json_cols = st.columns(2)
+        with json_cols[0]:
+            st.markdown("**summary**")
+            st.json(summary)
+            st.markdown("**trace**")
+            st.json(trace)
+        with json_cols[1]:
+            st.markdown("**stage2_request**")
+            st.json(_p10_response_for_display(request_payload, vehicle_display_labels))
+            st.markdown("**response**")
+            st.json(_p10_response_for_display(response, vehicle_display_labels))
+
+
+def _stage2_case_rows(summaries: list[dict], artifact_dir: Path | None = None) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for summary in summaries:
+        debt = summary.get("stage2_debt") or {}
+        case_id = str(summary.get("case_id") or "")
+        response = _stage1_try_load_response(artifact_dir, case_id) if artifact_dir is not None else {}
+        business_hooks = _stage1_business_hook_count(response) if response else int(summary.get("business_hooks") or 0)
+        rows.append(
+            {
+                "caseId": case_id,
+                "status": summary.get("status", ""),
+                "businessHooks": business_hooks,
+                "moveBatches": business_hooks,
+                "interfaceOperations": int(summary.get("operations") or 0),
+                "pending": len(debt.get("pending_stage2_nos") or []),
+                "store4Segment": len(debt.get("new_store4_segment") or []),
+                "pattern": debt.get("new_store4_pattern", ""),
+                "expansions": int(summary.get("expansions") or 0),
+                "elapsedSeconds": summary.get("elapsed_seconds", 0),
+                "blockingReasons": " | ".join(summary.get("blocking_reasons") or []),
+            }
+        )
+    return sorted(rows, key=lambda row: (str(row["status"]) != "partial", -int(row["businessHooks"]), str(row["caseId"])))
+
+
+def _stage2_case_label(case_id: str, rows: list[dict]) -> str:
+    row = next((item for item in rows if item.get("caseId") == case_id), {})
+    return (
+        f"{case_id} | {row.get('status', '')} | "
+        f"{row.get('businessHooks', 0)} 业务勾 | {row.get('blockingReasons', '')}"
+    )
+
+
+def _stage2_reason_count(aggregate: dict, reason: str) -> int:
+    reasons = aggregate.get("partial_reasons") or {}
+    return int(reasons.get(reason) or 0)
+
+
+def _stage2_true_partial_count(case_rows: list[dict[str, object]]) -> int:
+    return sum(
+        1
+        for row in case_rows
+        if row.get("status") == "partial"
+        and "stage1_not_complete" not in str(row.get("blockingReasons") or "")
+    )
+
+
+def _stage2_load_case_bundle(artifact_dir: Path, case_id: str) -> dict[str, object] | None:
+    paths = {
+        "summary": artifact_dir / f"{case_id}_summary.json",
+        "response": artifact_dir / f"{case_id}_response.json",
+        "trace": artifact_dir / f"{case_id}_trace.json",
+        "stage2_request": artifact_dir / f"{case_id}_stage2_request.json",
+    }
+    if not all(path.exists() for path in paths.values()):
+        return None
+    return {
+        key: _stage1_read_json(path)
+        for key, path in paths.items()
+    }
+
+
+def _stage2_response_with_generated(request_payload: dict, response: dict) -> dict:
+    try:
+        import replay_validator as replay
+    except Exception:  # noqa: BLE001
+        return response
+    replayed, _bad = replay.replay(request_payload, response)
+    final_rows = [
+        {
+            "No": replay.car_no(car),
+            "Line": car.get("Line"),
+            "Position": int(car.get("Position") or 0),
+        }
+        for car in sorted(replayed, key=lambda item: (item.get("Line") or "", int(item.get("Position") or 0), replay.car_no(item)))
+    ]
+    output = json.loads(json.dumps(response, ensure_ascii=False))
+    data = output.setdefault("Data", {})
+    data["GeneratedEndStatus"] = final_rows
+    return output
+
+
+def _render_stage2_store4_segment(debt: dict, vehicle_display_labels: dict[str, str]) -> None:
+    segment = list(debt.get("new_store4_segment") or [])
+    pattern = str(debt.get("new_store4_pattern") or "")
+    st.caption("存4新增段按北→南显示；O=非存4目的车，C=存4目的车。")
+    if not segment:
+        st.info("没有存4新增段。")
+        return
+    rows = []
+    for index, no in enumerate(segment, start=1):
+        rows.append(
+            {
+                "北侧顺位": index,
+                "类型": pattern[index - 1] if index - 1 < len(pattern) else "",
+                "车辆": _p10_vehicle_label(no, vehicle_display_labels),
+            }
+        )
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _render_stage2_trace(
+    trace: list[dict],
+    summary: dict,
+    vehicle_display_labels: dict[str, str],
+) -> None:
+    st.caption(f"summary blocking reasons: {' | '.join(summary.get('blocking_reasons') or []) or '无'}")
+    rows = []
+    for row in trace:
+        rows.append(
+            {
+                "index": row.get("index"),
+                "action": row.get("action"),
+                "line": row.get("line"),
+                "move": _p10_format_vehicle_list(row.get("move") or [], vehicle_display_labels),
+                "trainAfter": _p10_format_vehicle_list(row.get("train_after") or [], vehicle_display_labels),
+                "path": " -> ".join(row.get("path") or []),
+            }
+        )
+    st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _render_evaluation_dashboard() -> None:
