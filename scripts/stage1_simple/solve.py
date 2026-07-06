@@ -21,6 +21,7 @@ from solver_vnext import physical
 
 ASSEMBLY_DEPOT = ("机南", "洗油北", "机走棚", "机走北")
 ASSEMBLY_ALL = ("存4线", *ASSEMBLY_DEPOT)
+STAGE1_INITIAL_DONE_LINES = physical.DEPOT_TARGET_LINES | {"卸轮线"}
 FORBIDDEN_LINES = physical.DEPOT_TARGET_LINES | physical.DEPOT_OUTSIDE_LINES | physical.RUNNING_LINES
 HOT_SOURCE_RANK = {
     "油漆线": 0,
@@ -918,6 +919,8 @@ class Stage1Solver:
         return ()
 
     def stage1_goal(self, car: dict[str, Any]) -> str:
+        if car.get("_InitialLine") in STAGE1_INITIAL_DONE_LINES:
+            return ""
         if car["Line"] in physical.DEPOT_TARGET_LINES:
             return ""
         targets = set(car.get("TargetLines") or ())
