@@ -123,6 +123,9 @@ def _vnext_runtime_module():
 
 
 def _vnext_physical_module():
+    scripts_path = str(SCRIPTS_DIR)
+    if scripts_path not in sys.path:
+        sys.path.insert(0, scripts_path)
     return importlib.import_module("solver_vnext.physical")
 
 
@@ -969,7 +972,9 @@ def _render_p10_replay(
 
 
 def _p10_build_replay_frames(payload: dict, operation_rows, response: dict) -> list[dict]:
-    state = _p10_initial_state(payload)
+    physical = _vnext_physical_module()
+    cars = [physical.normalized_car(car) for car in payload.get("StartStatus") or []]
+    state = _p10_state_from_physical_cars(cars, physical)
     loco = payload.get("locoNode") or {}
     frames: list[dict] = [
         {
@@ -990,10 +995,11 @@ def _p10_build_replay_frames(payload: dict, operation_rows, response: dict) -> l
     ]
 
     train_cars: list[str] = []
+    carried_order: list[str] = []
     business_hook_no = 0
     for row in sorted(operation_rows, key=lambda item: (item.hook_index, item.operation_index)):
         action = row.action
-        line = row.line
+        line = physical.normalize_line(row.line)
         move_cars = _p10_split_pipe(row.move_cars)
         path = _p10_split_pipe(row.passby_path)
         source_line = ""
@@ -1003,22 +1009,40 @@ def _p10_build_replay_frames(payload: dict, operation_rows, response: dict) -> l
         if action == "Get":
             business_hook_no += 1
             display_business_hook_no = business_hook_no
-            for car_no in move_cars:
-                _p10_remove_car(state, car_no)
-            train_cars = _p10_split_pipe(row.train_cars) or move_cars
+            move_set = set(move_cars)
+            carried_set = set(carried_order)
+            for car_no in physical.carried_order_after_get(
+                cars=cars,
+                line=line,
+                move_nos=move_set,
+                carried_nos=carried_set,
+            ):
+                if car_no not in carried_order:
+                    carried_order.append(car_no)
+            physical.apply_physical_get_order(cars, line, move_cars)
+            train_cars = _p10_split_pipe(row.train_cars) or list(carried_order)
             source_line = line
         elif action == "Weigh":
             train_cars = _p10_split_pipe(row.train_cars) or train_cars or move_cars
+            move_set = set(move_cars)
+            for car in cars:
+                if physical.car_no(car) in move_set:
+                    car["_Weighed"] = True
         elif action == "Put":
             business_hook_no += 1
             display_business_hook_no = business_hook_no
-            for car_no in move_cars:
-                _p10_remove_car(state, car_no)
-            state.setdefault(line, [])
-            existing = set(state[line])
-            state[line].extend(car_no for car_no in move_cars if car_no not in existing)
+            if move_cars and len(carried_order) >= len(move_cars):
+                put_order = carried_order[-len(move_cars):]
+            else:
+                put_order = list(move_cars)
+            if set(put_order) != set(move_cars):
+                put_order = list(move_cars)
+            physical.apply_physical_put_order(cars, line, put_order)
+            move_set = set(move_cars)
+            carried_order = [car_no for car_no in carried_order if car_no not in move_set]
             train_cars = []
             target_line = line
+        state = _p10_state_from_physical_cars(cars, physical)
 
         frames.append(
             {
@@ -1173,6 +1197,21 @@ def _p10_initial_state(payload: dict) -> dict[str, list[str]]:
     for line, _, no in sorted(rows):
         state[line].append(no)
     return dict(state)
+
+
+def _p10_state_from_physical_cars(cars: list[dict], physical) -> dict[str, list[str]]:
+    state: dict[str, list[str]] = {}
+    lines = sorted({car.get("Line") for car in cars if car.get("Line")})
+    by_no = {physical.car_no(car): car for car in cars}
+    for line in lines:
+        ordered = [
+            car_no
+            for car_no in physical.line_access_order(cars, line)
+            if car_no in by_no
+        ]
+        if ordered:
+            state[line] = ordered
+    return state
 
 
 def _p10_state_from_status(status_rows: list[dict]) -> dict[str, list[str]]:
