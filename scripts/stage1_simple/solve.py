@@ -54,6 +54,8 @@ MAX_NO_PROGRESS_STREAK = 30
 MAX_STALE_BEST_STREAK = 35
 MAX_CAPACITY_DEFICIT_HOOKS = 10
 DEFAULT_TIME_BUDGET_SECONDS = 300.0
+DYNAMIC_VALID_WINDOW = 20
+DYNAMIC_EXAMINED_WINDOW = 140
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,16 @@ class Stage1Solver:
         debt: dict[str, Any],
         rejected: list[dict[str, Any]],
     ) -> bool:
+        if self.try_dynamic_views(views, debt, rejected):
+            return True
+        return self.try_first_valid_view(views, debt, rejected)
+
+    def try_first_valid_view(
+        self,
+        views: list[CandidateView],
+        debt: dict[str, Any],
+        rejected: list[dict[str, Any]],
+    ) -> bool:
         for view in views:
             if self.time_exhausted():
                 return False
@@ -220,6 +232,13 @@ class Stage1Solver:
                 })
                 continue
             after_debt = probe.stage1_debt()
+            if self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": ["large_assembly_debt_rebound"],
+                })
+                continue
             if not after_debt["complete"] and not probe.can_continue(depth=1, include_put_blockers=True):
                 rejected.append({
                     "candidate_id": view.candidate.candidate_id,
@@ -229,6 +248,235 @@ class Stage1Solver:
                 continue
             return self.accept_candidate(view, validation, after_debt, debt, rejected)
         return False
+
+    def try_dynamic_views(
+        self,
+        views: list[CandidateView],
+        debt: dict[str, Any],
+        rejected: list[dict[str, Any]],
+    ) -> bool:
+        if debt["pollution_nos"]:
+            return False
+
+        get_blockers, get_blocked_nos = self.pending_get_blocker_info(debt)
+        put_blockers, _put_blocked_nos = self.pending_put_blocker_info(debt)
+        use_get_unlock = bool(get_blockers & set(ASSEMBLY_DEPOT))
+        use_put_unlock = not get_blockers and bool(put_blockers & set(ASSEMBLY_DEPOT))
+        use_debt_window = not get_blockers
+        if not (use_get_unlock or use_put_unlock or use_debt_window):
+            return False
+
+        dynamic_views = views
+        if use_put_unlock:
+            dynamic_views = self.dynamic_release_first_views(views, debt)
+
+        viable: list[
+            tuple[
+                tuple[Any, ...],
+                CandidateView,
+                physical.PhysicalValidation,
+                dict[str, Any],
+                set[str],
+                set[str],
+                set[str],
+                set[str],
+            ]
+        ] = []
+        examined_count = 0
+        valid_count = 0
+        for view in dynamic_views:
+            if self.time_exhausted():
+                return False
+            examined_count += 1
+            validation = self.validate_candidate(view.candidate)
+            if not validation.accepted:
+                if len(rejected) < 80:
+                    rejected.append({
+                        "candidate_id": view.candidate.candidate_id,
+                        "reason": view.reason,
+                        "violations": list(validation.reasons),
+                    })
+                continue
+            probe = self.probe_after(view.candidate, validation)
+            after_signature = physical.state_signature(probe.cars, probe.loco)
+            if after_signature in self.seen_states:
+                if len(rejected) < 80:
+                    rejected.append({
+                        "candidate_id": view.candidate.candidate_id,
+                        "reason": view.reason,
+                        "violations": ["state_cycle"],
+                    })
+                continue
+            after_debt = probe.stage1_debt()
+            if not after_debt["complete"] and not probe.can_continue(depth=1, include_put_blockers=True):
+                if len(rejected) < 80:
+                    rejected.append({
+                        "candidate_id": view.candidate.candidate_id,
+                        "reason": view.reason,
+                        "violations": ["dead_end_after_candidate"],
+                    })
+                continue
+
+            moving_nos = set(view.candidate.move_car_nos)
+            improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
+            if get_blockers:
+                after_get_blockers, _after_get_blocked_nos = probe.pending_get_blocker_info(after_debt)
+                if not use_get_unlock:
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
+                moves_get_blocked = bool(moving_nos & get_blocked_nos)
+                unlocks_get = len(after_get_blockers) < len(get_blockers)
+                if not moves_get_blocked and not unlocks_get and not after_debt["complete"]:
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
+                if (
+                    after_debt["debt_count"] > debt["debt_count"]
+                    and view.candidate.source_line in ASSEMBLY_DEPOT
+                    and view.candidate.target_line not in ASSEMBLY_DEPOT
+                    and not unlocks_get
+                ):
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
+                primary = (
+                    0
+                    if after_debt["complete"]
+                    else 1
+                    if unlocks_get and not moves_get_blocked
+                    else 2
+                    if moves_get_blocked and improves_debt
+                    else 3
+                    if improves_debt
+                    else 4
+                )
+                dynamic_score = (
+                    primary,
+                    self.dynamic_target_group(view.candidate),
+                    len(after_get_blockers),
+                    max(0, after_debt["debt_count"] - debt["debt_count"]),
+                    self.progress_tuple(after_debt),
+                    view.score,
+                )
+                viable.append((
+                    dynamic_score,
+                    view,
+                    validation,
+                    after_debt,
+                    get_blockers,
+                    after_get_blockers,
+                    put_blockers,
+                    set(),
+                ))
+            else:
+                after_put_blockers: set[str] = set()
+                unlocks_put = False
+                if put_blockers:
+                    after_put_blockers, _after_put_blocked_nos = probe.pending_put_blocker_info(after_debt)
+                    unlocks_put = bool(put_blockers & set(ASSEMBLY_DEPOT)) and len(after_put_blockers) < len(put_blockers)
+                    if len(after_put_blockers) > len(put_blockers) and not after_debt["complete"]:
+                        valid_count += 1
+                        if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                            break
+                        continue
+                if unlocks_put and self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
+                primary = (
+                    0
+                    if after_debt["complete"]
+                    else 1
+                    if unlocks_put
+                    else 2
+                    if improves_debt
+                    else 5
+                )
+                if primary == 5 and use_put_unlock:
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
+                dynamic_score = (
+                    primary,
+                    self.dynamic_target_group(view.candidate),
+                    len(after_put_blockers),
+                    max(0, after_debt["debt_count"] - debt["debt_count"]),
+                    self.progress_tuple(after_debt),
+                    view.score,
+                )
+                viable.append((
+                    dynamic_score,
+                    view,
+                    validation,
+                    after_debt,
+                    set(),
+                    set(),
+                    put_blockers,
+                    after_put_blockers,
+                ))
+
+            valid_count += 1
+            if after_debt["complete"] or valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                break
+
+        if not viable:
+            return False
+        dynamic_score, view, validation, after_debt, before_get, after_get, before_put, after_put = min(
+            viable,
+            key=lambda item: item[0],
+        )
+        accepted = self.accept_candidate(view, validation, after_debt, debt, rejected)
+        self.trace[-1]["dynamic_score"] = list(dynamic_score[:4])
+        self.trace[-1]["route_blockers_before"] = sorted(before_get)
+        self.trace[-1]["route_blockers_after"] = sorted(after_get)
+        self.trace[-1]["put_blockers_before"] = sorted(before_put)
+        self.trace[-1]["put_blockers_after"] = sorted(after_put)
+        return accepted
+
+    def dynamic_target_group(self, candidate: physical.HookCandidate) -> int:
+        if candidate.target_line == "存4线":
+            return 0
+        if candidate.target_line in {"机南", "洗油北"}:
+            return 0
+        if candidate.target_line in {"机走棚", "机走北"}:
+            return 1
+        return 2
+
+    def large_assembly_debt_rebound(
+        self,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+        after_debt: dict[str, Any],
+    ) -> bool:
+        return (
+            candidate.source_line in ASSEMBLY_DEPOT
+            and candidate.target_line not in ASSEMBLY_DEPOT
+            and after_debt["debt_count"] > debt["debt_count"] + 1
+        )
+
+    def dynamic_release_first_views(
+        self,
+        views: list[CandidateView],
+        debt: dict[str, Any],
+    ) -> list[CandidateView]:
+        release_views = sorted(self.release_gate_candidates(debt), key=lambda item: item.score)
+        if not release_views:
+            return views
+        ordered: list[CandidateView] = []
+        seen: set[str] = set()
+        for view in [*release_views, *views]:
+            candidate_id = view.candidate.candidate_id
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            ordered.append(view)
+        return ordered
 
     def accept_candidate(
         self,
@@ -852,6 +1100,18 @@ class Stage1Solver:
     def priority_route_blocker_lines(self, debt: dict[str, Any]) -> list[str]:
         return list(self.pending_route_blocker_map(debt))
 
+    def progress_tuple(self, debt: dict[str, Any]) -> tuple[int, int]:
+        return debt["debt_count"], debt["blocked_g_count"]
+
+    def pending_get_blocker_info(self, debt: dict[str, Any]) -> tuple[set[str], set[str]]:
+        blocker_map = self.pending_route_blocker_map(debt)
+        blocked_nos = {
+            no
+            for nos in blocker_map.values()
+            for no in nos
+        }
+        return set(blocker_map), blocked_nos
+
     def pending_route_blocker_map(self, debt: dict[str, Any]) -> dict[str, list[str]]:
         by_no = self.by_no()
         blocker_map: dict[str, list[str]] = {}
@@ -862,6 +1122,25 @@ class Stage1Solver:
             for blocker_line in self.route_blockers_for_get(car["Line"], {no}):
                 blocker_map.setdefault(blocker_line, []).append(no)
         return blocker_map
+
+    def pending_put_blocker_info(self, debt: dict[str, Any]) -> tuple[set[str], set[str]]:
+        blocker_map: dict[str, set[str]] = {}
+        by_no = self.by_no()
+        for no in debt["pending_stage1_nos"]:
+            car = by_no.get(no)
+            if not car:
+                continue
+            for target in self.official_stage1_targets(car):
+                for blocker_line in self.route_blockers_for_put(car["Line"], target, {no}):
+                    if blocker_line in FORBIDDEN_LINES or blocker_line == car["Line"]:
+                        continue
+                    blocker_map.setdefault(blocker_line, set()).add(no)
+        blocked_nos = {
+            no
+            for nos in blocker_map.values()
+            for no in nos
+        }
+        return set(blocker_map), blocked_nos
 
     def route_price(self, candidate: physical.HookCandidate) -> int:
         static = self.graph.route(candidate.source_line, candidate.target_line)

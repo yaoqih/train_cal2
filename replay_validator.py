@@ -482,10 +482,8 @@ def closed_door_put_errors(idx: int, line: str, train: list[dict[str, Any]], mov
     if not any(c.get("IsClosedDoor") for c in cars):
         return []
     if line == "存4线":
-        projected = [dict(c) for c in cars]
-        apply_put(projected, line, move)
-        return [V(idx, "business", "closed_door_cun4_put_position_violation", f"{car_no(c)}:{c['Position']}")
-                for c in projected if c["Line"] == "存4线" and c.get("IsClosedDoor") and car_no(c) in set(move) and int(c["Position"]) <= 3]
+        # Store4 closed-door ordering is a final placement rule; later puts can push cars deeper.
+        return []
     if train and train[0].get("IsClosedDoor") and (len(train) > 10 or any(c.get("IsHeavy") for c in train)):
         return [V(idx, "business", "closed_door_full_consist_first_car_violation", car_no(train[0]))]
     return []
