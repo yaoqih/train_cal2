@@ -32,6 +32,52 @@ python3 scripts/stage1_simple/solve.py data/truth2/validation_取送车计划_20
 python3 scripts/stage1_simple/solve.py data/truth2 --out artifacts/stage1_simple_batch --limit 10
 ```
 
+下游友好 profile：
+
+```bash
+python3 scripts/stage1_simple/solve.py data/truth2/validation_取送车计划_20260104Z.json \
+  --out artifacts/stage1_simple_portfolio/0104Z \
+  --portfolio-profiles default \
+  --portfolio-objective stage4 \
+  --time-budget-seconds 160
+```
+
+- 默认 `--profile baseline` 保持原第一阶段主合同排序。
+- `balanced / stage3 / stage4` 会在同等主进度下参考下游势函数指标。
+- `balanced / stage3 / stage4` 还会启用低风险直送：只送 `油漆线 / 抛丸线 / 洗罐站 / 预修线`，
+  且必须是北端连续段、无强制位车、目标线为空或全是已满足且无强制位车；`调梁棚` 不做直送。
+- `balanced / stage3 / stage4` 还会优先选择安全的“阻挡车整段直归真实目标线”：
+  仅限 `机库线 / 预修线 / 油漆线 / 洗罐站 / 抛丸线`，目标线必须为空或全是已满足车；
+  单车直归只允许从非存线来源触发，避免存线单车来回倒造成循环。
+- `--portfolio-profiles default` 会同时跑 `baseline,balanced,stage3,stage4` 并择优；完整解优先，其次比较
+  Stage1 debt、边界污染、Stage3 碎片、Stage4 下界和业务勾数。
+- `--portfolio-objective stage4` 用于降低第四阶段压力：完整解和第一阶段主合同仍是硬前置，
+  其后优先比较 Stage4 access blocked、Stage4 lower bound、Stage4 tail debt，再比较 Stage3 碎片和业务勾数。
+
+下游友好度统计：
+
+```bash
+python3 scripts/analyze_stage1_friendliness.py \
+  --stage1-dir artifacts/stage1_simple_batch \
+  --truth-dir data/truth2
+```
+
+输出在 `<stage1-dir>/stage1_friendliness/`：
+
+- `stage1_friendliness_cases.csv`：单案总指标。
+- `stage1_friendliness_lines.csv`：四条编组线的装载、纯度和分组碎片。
+- `stage1_friendliness_vehicles.csv`：编组线逐车明细。
+- `stage1_friendliness_summary.json`：汇总和最差案例清单。
+
+核心指标：
+
+- `stage3_ready_score`：第三阶段主列友好分，0-100；按第三阶段模板暴露顺序统计大库车分组是否连续。
+- `stage3_group_run_count` / `stage3_extra_fragment_count`：大库分组切换和碎片数；越低越好。
+- `depot_unassembled_count`：第一阶段结束仍未编入四条编组线的大库阶段车。
+- `boundary_pollution_count`：`存4线` 和四条编组线的阶段边界污染。
+- `stage4_tail_debt_count`：第一阶段后仍未到位的非大库剩余债务。
+- `stage4_access_blocked_debt_count`：这些剩余债务里被前端非债务车挡住的数量。
+
 当前全量验证口径：
 
 - `data/truth2` 默认 80 搬运批次、单案 `--time-budget-seconds 120`：112/113 complete，1/113 partial，0 error。

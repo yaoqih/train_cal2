@@ -48,6 +48,49 @@ CACHE_LINES = (
     "油漆线",
     "抛丸线",
 )
+STORAGE_CACHE_LINES = {"存1线", "存2线", "存3线", "存5线北", "存5线南"}
+REAL_TARGET_STATIC_LINES = {"机库线", "预修线", "油漆线", "洗罐站", "抛丸线"}
+STAGE3_TEMPLATE_B_ORDER = ("机走北", "机走棚", "洗油北", "机南")
+STAGE3_TEMPLATE_A_FIRST_ORDER = ("机走北", "机走棚", "机南")
+STAGE3_TEMPLATE_A_SECOND_LINE = "洗油北"
+STAGE4_IGNORED_TARGET_LINES = physical.DEPOT_TARGET_LINES | {"卸轮线"}
+HIGH_VALUE_STAGE4_TARGETS = {"预修线", "调梁棚", "调梁线北"}
+DIRECT_DELIVERY_TARGETS = ("油漆线", "抛丸线", "洗罐站", "预修线")
+DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN = 10
+DIRECT_DELIVERY_PRIORITY_MIN_BATCH = 2
+PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
+    "baseline": {
+        "downstream": False,
+        "target_aware": False,
+        "direct_delivery": False,
+        "direct_delivery_max_hooks": 0,
+        "quality_order": "none",
+    },
+    "balanced": {
+        "downstream": True,
+        "target_aware": True,
+        "direct_delivery": True,
+        "direct_delivery_max_hooks": 5,
+        "quality_order": "balanced",
+    },
+    "stage3": {
+        "downstream": True,
+        "target_aware": True,
+        "direct_delivery": True,
+        "direct_delivery_max_hooks": 5,
+        "quality_order": "stage3",
+    },
+    "stage4": {
+        "downstream": True,
+        "target_aware": True,
+        "direct_delivery": True,
+        "direct_delivery_max_hooks": 5,
+        "quality_order": "stage4",
+    },
+}
+DEFAULT_PROFILE = "baseline"
+DEFAULT_PORTFOLIO_PROFILES = ("baseline", "balanced", "stage3", "stage4")
+PORTFOLIO_OBJECTIVES = ("balanced", "stage3", "stage4")
 MAX_HOOKS = 80
 # hook_index counts move batches. business_hooks in the summary counts Get/Put rows.
 MAX_NO_PROGRESS_STREAK = 30
@@ -72,7 +115,10 @@ class Stage1Solver:
         *,
         max_hooks: int = MAX_HOOKS,
         time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
+        profile: str = DEFAULT_PROFILE,
     ) -> None:
+        if profile not in PROFILE_CONFIGS:
+            raise ValueError(f"unknown_stage1_profile:{profile}")
         self.case_id, self.request, self.cars, self.depot_assignment, self.loco = physical.read_case(path)
         nos = [physical.car_no(car) for car in self.cars]
         duplicates = [no for no, count in Counter(nos).items() if not no or count > 1]
@@ -89,6 +135,8 @@ class Stage1Solver:
         self.started_at = time.monotonic()
         self.time_budget_seconds = time_budget_seconds
         self.validation_cache: dict[tuple[str, str], physical.PhysicalValidation] = {}
+        self.profile = profile
+        self.downstream_quality_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     def solve(self) -> dict[str, Any]:
         no_progress_streak = 0
@@ -232,6 +280,13 @@ class Stage1Solver:
                 })
                 continue
             after_debt = probe.stage1_debt()
+            if self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt):
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": ["profile_sideways_stage1_move"],
+                })
+                continue
             if self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
                 rejected.append({
                     "candidate_id": view.candidate.candidate_id,
@@ -319,6 +374,7 @@ class Stage1Solver:
 
             moving_nos = set(view.candidate.move_car_nos)
             improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
+            downstream_quality = probe.downstream_quality_tuple()
             if get_blockers:
                 after_get_blockers, _after_get_blocked_nos = probe.pending_get_blocker_info(after_debt)
                 if not use_get_unlock:
@@ -329,6 +385,14 @@ class Stage1Solver:
                 moves_get_blocked = bool(moving_nos & get_blocked_nos)
                 unlocks_get = len(after_get_blockers) < len(get_blockers)
                 if not moves_get_blocked and not unlocks_get and not after_debt["complete"]:
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
+                if (
+                    self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt)
+                    and not unlocks_get
+                ):
                     valid_count += 1
                     if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
                         break
@@ -360,6 +424,8 @@ class Stage1Solver:
                     len(after_get_blockers),
                     max(0, after_debt["debt_count"] - debt["debt_count"]),
                     self.progress_tuple(after_debt),
+                    downstream_quality,
+                    self.real_target_dynamic_rank(view.candidate, debt, after_debt),
                     view.score,
                 )
                 viable.append((
@@ -388,12 +454,26 @@ class Stage1Solver:
                     if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
                         break
                     continue
+                direct_delivery_priority = (
+                    not put_blockers
+                    and self.direct_delivery_priority_candidate(view.candidate, debt, after_debt)
+                )
+                if (
+                    self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt)
+                    and not unlocks_put
+                ):
+                    valid_count += 1
+                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+                        break
+                    continue
                 primary = (
                     0
                     if after_debt["complete"]
                     else 1
-                    if unlocks_put
+                    if direct_delivery_priority
                     else 2
+                    if unlocks_put
+                    else 3
                     if improves_debt
                     else 5
                 )
@@ -408,6 +488,8 @@ class Stage1Solver:
                     len(after_put_blockers),
                     max(0, after_debt["debt_count"] - debt["debt_count"]),
                     self.progress_tuple(after_debt),
+                    downstream_quality,
+                    self.real_target_dynamic_rank(view.candidate, debt, after_debt),
                     view.score,
                 )
                 viable.append((
@@ -433,6 +515,7 @@ class Stage1Solver:
         )
         accepted = self.accept_candidate(view, validation, after_debt, debt, rejected)
         self.trace[-1]["dynamic_score"] = list(dynamic_score[:4])
+        self.trace[-1]["downstream_quality"] = list(dynamic_score[5]) if len(dynamic_score) > 5 else []
         self.trace[-1]["route_blockers_before"] = sorted(before_get)
         self.trace[-1]["route_blockers_after"] = sorted(after_get)
         self.trace[-1]["put_blockers_before"] = sorted(before_put)
@@ -448,6 +531,18 @@ class Stage1Solver:
             return 1
         return 2
 
+    def real_target_dynamic_rank(
+        self,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+        after_debt: dict[str, Any],
+    ) -> int:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return 1
+        if after_debt["debt_count"] > debt["debt_count"]:
+            return 1
+        return 0 if self.clean_real_target_put(candidate) else 1
+
     def large_assembly_debt_rebound(
         self,
         candidate: physical.HookCandidate,
@@ -459,6 +554,25 @@ class Stage1Solver:
             and candidate.target_line not in ASSEMBLY_DEPOT
             and after_debt["debt_count"] > debt["debt_count"] + 1
         )
+
+    def disallow_profile_sideways_stage1_move(
+        self,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+        after_debt: dict[str, Any],
+    ) -> bool:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return False
+        if self.progress_tuple(after_debt) < self.progress_tuple(debt):
+            return False
+        by_no = self.by_no()
+        for no in candidate.move_car_nos:
+            car = by_no.get(no)
+            if not car or not self.stage1_goal(car):
+                continue
+            if not self.official_stage1_target(car, candidate.target_line):
+                return True
+        return False
 
     def dynamic_release_first_views(
         self,
@@ -597,6 +711,8 @@ class Stage1Solver:
         clone.started_at = self.started_at
         clone.time_budget_seconds = self.time_budget_seconds
         clone.validation_cache = self.validation_cache
+        clone.profile = self.profile
+        clone.downstream_quality_cache = self.downstream_quality_cache
         return clone
 
     def clone_car(self, car: dict[str, Any]) -> dict[str, Any]:
@@ -641,6 +757,7 @@ class Stage1Solver:
         candidates.extend(self.route_blocker_candidates(debt))
         candidates.extend(self.cleanup_candidates(debt))
         candidates.extend(self.release_gate_candidates(debt))
+        candidates.extend(self.direct_delivery_candidates(debt))
         unique: dict[str, CandidateView] = {}
         for item in candidates:
             unique.setdefault(item.candidate.candidate_id, item)
@@ -702,6 +819,65 @@ class Stage1Solver:
                         reason_rank=0,
                     )
                     yield CandidateView(candidate, candidates_score, "direct_assembly")
+
+    def direct_delivery_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
+        if not PROFILE_CONFIGS[self.profile]["direct_delivery"]:
+            return
+        if self.direct_delivery_hooks_used() >= int(PROFILE_CONFIGS[self.profile]["direct_delivery_max_hooks"]):
+            return
+        if debt["pollution_nos"]:
+            return
+        ready_targets = {
+            target: self.direct_delivery_target_ready(target)
+            for target in DIRECT_DELIVERY_TARGETS
+        }
+        if not any(ready_targets.values()):
+            return
+        by_no = self.by_no()
+        for line in self.active_lines():
+            if line in FORBIDDEN_LINES:
+                continue
+            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            if not ordered:
+                continue
+            target = ""
+            max_batch: list[dict[str, Any]] = []
+            for car in ordered:
+                car_target = self.direct_delivery_target_for_car(car)
+                if not car_target or car_target == line or not ready_targets.get(car_target):
+                    break
+                if target and car_target != target:
+                    break
+                trial = [*max_batch, car]
+                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                    break
+                target = car_target
+                max_batch = trial
+                if car.get("IsWeigh") and not car.get("_Weighed"):
+                    break
+            if not target or not max_batch:
+                continue
+            for batch in self.prefix_options(max_batch):
+                if not self.direct_delivery_batch_allowed(target, batch):
+                    continue
+                if not self.target_allowed(target, batch):
+                    continue
+                if not self.direct_delivery_route_low_cost(line, target):
+                    continue
+                candidate = self.make_candidate(
+                    source=line,
+                    target=target,
+                    batch=batch,
+                    kind="vnext_stage1_direct_delivery",
+                    reason=f"stage1_direct_delivery:{target}",
+                )
+                if not candidate:
+                    continue
+                yield CandidateView(
+                    candidate,
+                    self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=4),
+                    f"stage1_direct_delivery:{target}",
+                )
 
     def blocker_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
         by_no = self.by_no()
@@ -1063,6 +1239,8 @@ class Stage1Solver:
             self.route_unlock_rank(candidate, debt),
             self.candidate_source_rank(candidate),
             reason_rank,
+            self.tail_target_rank(candidate),
+            self.real_target_static_rank(candidate),
             self.candidate_target_rank(candidate),
             -moved_g,
             -moved_x if moved_g == 0 else moved_x,
@@ -1070,6 +1248,56 @@ class Stage1Solver:
             len(candidate.move_car_nos),
             candidate.candidate_id,
         )
+
+    def tail_target_rank(self, candidate: physical.HookCandidate) -> int:
+        if not PROFILE_CONFIGS[self.profile]["target_aware"]:
+            return 1
+        moved = [car for car in self.cars if physical.car_no(car) in set(candidate.move_car_nos)]
+        if not moved:
+            return 1
+        if any(self.stage1_goal(car) for car in moved):
+            return 1
+        direct = [car for car in moved if self.stage4_target_line_satisfied_by(car, candidate.target_line)]
+        if len(direct) == len(moved):
+            return 0 if candidate.target_line in HIGH_VALUE_STAGE4_TARGETS else 1
+        if direct:
+            return 2
+        return 3
+
+    def real_target_static_rank(self, candidate: physical.HookCandidate) -> int:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return 1
+        return 0 if self.safe_static_real_target_put(candidate) else 1
+
+    def clean_real_target_put(self, candidate: physical.HookCandidate) -> bool:
+        moving_nos = set(candidate.move_car_nos)
+        if not moving_nos:
+            return False
+        by_no = self.by_no()
+        moved = [by_no[no] for no in candidate.move_car_nos if no in by_no]
+        if len(moved) != len(candidate.move_car_nos):
+            return False
+        if any(self.stage1_goal(car) for car in moved):
+            return False
+        if any(not self.stage4_target_line_satisfied_by(car, candidate.target_line) for car in moved):
+            return False
+        existing = [
+            car
+            for car in self.cars
+            if car["Line"] == candidate.target_line and physical.car_no(car) not in moving_nos
+        ]
+        return all(self.target_satisfied(car) and not physical.force_positions(car) for car in existing)
+
+    def safe_static_real_target_put(self, candidate: physical.HookCandidate) -> bool:
+        if candidate.candidate_kind != "blocker_relocation":
+            return False
+        if candidate.target_line not in REAL_TARGET_STATIC_LINES:
+            return False
+        if not self.clean_real_target_put(candidate):
+            return False
+        if len(candidate.move_car_nos) >= 2:
+            return True
+        return candidate.source_line not in STORAGE_CACHE_LINES
 
     def pollution_rank(self, candidate: physical.HookCandidate, debt: dict[str, Any]) -> int:
         if not debt["pollution_nos"]:
@@ -1146,6 +1374,267 @@ class Stage1Solver:
         static = self.graph.route(candidate.source_line, candidate.target_line)
         hot = {"渡10", "联7", "机北1", "机北2", "预修线", "调梁线北", "存5线北"}
         return len(static) + sum(3 for line in static if line in hot)
+
+    def direct_delivery_target_for_car(self, car: dict[str, Any]) -> str:
+        if self.stage1_goal(car) or self.target_satisfied(car):
+            return ""
+        if physical.force_positions(car):
+            return ""
+        if car.get("IsWeigh") and not car.get("_Weighed"):
+            return ""
+        targets = set(car.get("TargetLines") or ())
+        for target in DIRECT_DELIVERY_TARGETS:
+            if target in targets and self.stage4_target_line_satisfied_by(car, target):
+                return target
+        return ""
+
+    def direct_delivery_target_ready(self, target: str) -> bool:
+        if target not in DIRECT_DELIVERY_TARGETS:
+            return False
+        existing = [car for car in self.cars if car["Line"] == target]
+        return all(self.target_satisfied(car) and not physical.force_positions(car) for car in existing)
+
+    def direct_delivery_batch_allowed(self, target: str, batch: list[dict[str, Any]]) -> bool:
+        if not batch:
+            return False
+        return all(self.direct_delivery_target_for_car(car) == target for car in batch)
+
+    def direct_delivery_route_low_cost(self, source: str, target: str) -> bool:
+        route = self.graph.route(source, target)
+        return bool(route and len(route) <= DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN)
+
+    def is_direct_delivery_candidate(self, candidate: physical.HookCandidate) -> bool:
+        return candidate.candidate_kind == "vnext_stage1_direct_delivery"
+
+    def direct_delivery_priority_candidate(
+        self,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+        after_debt: dict[str, Any],
+    ) -> bool:
+        return (
+            self.is_direct_delivery_candidate(candidate)
+            and len(candidate.move_car_nos) >= DIRECT_DELIVERY_PRIORITY_MIN_BATCH
+            and self.progress_tuple(after_debt) <= self.progress_tuple(debt)
+        )
+
+    def direct_delivery_hooks_used(self) -> int:
+        return sum(
+            1
+            for item in self.trace
+            if str(item.get("reason") or "").startswith("stage1_direct_delivery:")
+        )
+
+    def downstream_quality_tuple(self) -> tuple[int, ...]:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return ()
+        quality = self.downstream_quality()
+        order = PROFILE_CONFIGS[self.profile]["quality_order"]
+        if order == "stage3":
+            return (
+                quality["stage3_extra_fragment_count"],
+                quality["stage3_group_run_count"],
+                quality["stage3_prefix_blocked_count"],
+                quality["stage4_access_blocked_debt_count"],
+                quality["stage4_lower_bound"],
+                quality["stage4_tail_debt_count"],
+            )
+        if order == "stage4":
+            return (
+                quality["stage4_access_blocked_debt_count"],
+                quality["stage4_lower_bound"],
+                quality["stage4_tail_debt_count"],
+                quality["stage3_extra_fragment_count"],
+                quality["stage3_group_run_count"],
+                quality["stage3_prefix_blocked_count"],
+            )
+        return (
+            quality["stage3_extra_fragment_count"],
+            quality["stage3_group_run_count"],
+            quality["stage3_prefix_blocked_count"],
+            quality["stage4_access_blocked_debt_count"],
+            quality["stage4_lower_bound"],
+            quality["stage4_tail_debt_count"],
+        )
+
+    def downstream_quality(self) -> dict[str, Any]:
+        cache_key = physical.state_signature(self.cars, self.loco)
+        cached = self.downstream_quality_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        stage3 = self.stage3_quality()
+        stage4 = self.stage4_quality()
+        quality = {
+            **stage3,
+            **stage4,
+        }
+        self.downstream_quality_cache[cache_key] = quality
+        return quality
+
+    def stage3_quality(self) -> dict[str, int]:
+        active_nos = {
+            physical.car_no(car)
+            for car in self.cars
+            if car["Line"] in set(STAGE3_TEMPLATE_B_ORDER)
+            and set(car.get("TargetLines") or ()) & physical.DEPOT_TARGET_LINES
+        }
+        if not active_nos:
+            return {
+                "stage3_active_count": 0,
+                "stage3_group_count": 0,
+                "stage3_group_run_count": 0,
+                "stage3_extra_fragment_count": 0,
+                "stage3_prefix_blocked_count": 0,
+            }
+        by_no = self.by_no()
+        group_by_no = {
+            no: self.depot_stage3_group_key(by_no[no])
+            for no in active_nos
+            if no in by_no
+        }
+        best: dict[str, int] | None = None
+        for template in ("A", "B"):
+            exposure = [no for no in self.stage3_template_exposure_order(template) if no in active_nos]
+            keys = [group_by_no.get(no, "UNGROUPED") for no in exposure]
+            run_keys = self.compressed(keys)
+            group_counts = Counter(run_keys)
+            extra_fragments = sum(max(0, count - 1) for key, count in group_counts.items() if key != "UNGROUPED")
+            metric = {
+                "stage3_active_count": len(active_nos),
+                "stage3_group_count": len({key for key in keys if key != "UNGROUPED"}),
+                "stage3_group_run_count": len(run_keys),
+                "stage3_extra_fragment_count": extra_fragments,
+                "stage3_prefix_blocked_count": self.stage3_prefix_blocked_count(active_nos),
+            }
+            if best is None or (
+                metric["stage3_extra_fragment_count"],
+                metric["stage3_group_run_count"],
+                metric["stage3_prefix_blocked_count"],
+            ) < (
+                best["stage3_extra_fragment_count"],
+                best["stage3_group_run_count"],
+                best["stage3_prefix_blocked_count"],
+            ):
+                best = metric
+        return best or {
+            "stage3_active_count": len(active_nos),
+            "stage3_group_count": 0,
+            "stage3_group_run_count": 0,
+            "stage3_extra_fragment_count": 0,
+            "stage3_prefix_blocked_count": 0,
+        }
+
+    def stage3_template_exposure_order(self, template: str) -> tuple[str, ...]:
+        if template == "A":
+            first: list[str] = []
+            for line in STAGE3_TEMPLATE_A_FIRST_ORDER:
+                first.extend(physical.line_access_order(self.cars, line))
+            second = physical.line_access_order(self.cars, STAGE3_TEMPLATE_A_SECOND_LINE)
+            return (*reversed(first), *reversed(second))
+        all_nos: list[str] = []
+        for line in STAGE3_TEMPLATE_B_ORDER:
+            all_nos.extend(physical.line_access_order(self.cars, line))
+        return tuple(reversed(all_nos))
+
+    def stage3_prefix_blocked_count(self, active_nos: set[str]) -> int:
+        blocked = 0
+        for line in STAGE3_TEMPLATE_B_ORDER:
+            ordered = physical.line_access_order(self.cars, line)
+            active_on_line = [no for no in ordered if no in active_nos]
+            if not active_on_line:
+                continue
+            reachable_prefix = set(ordered[: len(active_on_line)])
+            blocked += sum(1 for no in active_on_line if no not in reachable_prefix)
+        return blocked
+
+    def depot_stage3_group_key(self, car: dict[str, Any]) -> str:
+        targets = set(car.get("TargetLines") or ())
+        inner = sorted(targets & physical.DEPOT_LINES)
+        outer = sorted(targets & physical.DEPOT_OUTSIDE_LINES)
+        if inner and outer:
+            target_part = "IO:" + "/".join((*inner, *outer))
+        elif inner:
+            target_part = "I:修1-4" if set(inner) == physical.DEPOT_LINES else "I:" + "/".join(inner)
+        elif outer:
+            target_part = "O:" + "/".join(outer)
+        else:
+            target_part = "D:UNKNOWN"
+        repair = str(car.get("RepairProcess") or "")
+        length = float(car.get("Length") or 14.3)
+        if repair.startswith("厂"):
+            class_part = "厂修"
+        elif length >= 17.6:
+            class_part = "长车"
+        else:
+            class_part = "段修短"
+        forced = physical.force_positions(car)
+        force_part = f":F{min(forced)}-{max(forced)}" if forced else ""
+        return f"{target_part}:{class_part}{force_part}"
+
+    def stage4_quality(self) -> dict[str, int]:
+        by_no = self.by_no()
+        debt_nos = {physical.car_no(car) for car in self.cars if self.is_stage4_debt(car)}
+        source_lines = {by_no[no]["Line"] for no in debt_nos if no in by_no}
+        target_keys = {self.stage4_target_key(by_no[no]) for no in debt_nos if no in by_no}
+        target_keys.discard("")
+        blocked_debt = 0
+        for line in sorted({car["Line"] for car in self.cars if car["Line"]}):
+            ordered = physical.line_access_order(self.cars, line)
+            suffix_has_debt = [False] * (len(ordered) + 1)
+            for index in range(len(ordered) - 1, -1, -1):
+                suffix_has_debt[index] = suffix_has_debt[index + 1] or ordered[index] in debt_nos
+            seen_blocker = False
+            for index, no in enumerate(ordered):
+                if no in debt_nos:
+                    if seen_blocker:
+                        blocked_debt += 1
+                    continue
+                if suffix_has_debt[index + 1]:
+                    car = by_no.get(no)
+                    if car and not self.target_satisfied(car):
+                        seen_blocker = True
+        return {
+            "stage4_tail_debt_count": len(debt_nos),
+            "stage4_access_blocked_debt_count": blocked_debt,
+            "stage4_lower_bound": len(source_lines) + len(target_keys),
+        }
+
+    def is_stage4_debt(self, car: dict[str, Any]) -> bool:
+        targets = set(car.get("TargetLines") or ())
+        return bool(targets) and not bool(targets & STAGE4_IGNORED_TARGET_LINES) and not self.target_satisfied(car)
+
+    def target_satisfied(self, car: dict[str, Any]) -> bool:
+        targets = set(car.get("TargetLines") or ())
+        if not targets:
+            return True
+        if car["Line"] not in targets:
+            return False
+        forced = physical.force_positions(car)
+        if forced and int(car.get("Position") or 0) not in forced:
+            return False
+        if car["Line"] == "存4线" and car.get("IsClosedDoor") and int(car.get("Position") or 0) <= 3:
+            return False
+        return True
+
+    def stage4_target_key(self, car: dict[str, Any]) -> str:
+        targets = sorted(set(car.get("TargetLines") or ()) - STAGE4_IGNORED_TARGET_LINES)
+        return targets[0] if len(targets) == 1 else "/".join(targets)
+
+    def stage4_target_line_satisfied_by(self, car: dict[str, Any], line: str) -> bool:
+        if line in STAGE4_IGNORED_TARGET_LINES:
+            return False
+        targets = set(car.get("TargetLines") or ())
+        if line not in targets:
+            return False
+        forced = physical.force_positions(car)
+        return not forced
+
+    def compressed(self, items: list[str]) -> list[str]:
+        out: list[str] = []
+        for item in items:
+            if not out or out[-1] != item:
+                out.append(item)
+        return out
 
     def depot_assembly_capacity_deficit_m(self) -> float:
         required = sum(
@@ -1281,12 +1770,14 @@ class Stage1Solver:
         business_hooks = sum(1 for row in self.operations if row.get("Action") in {"Get", "Put"})
         summary = {
             "case_id": self.case_id,
+            "profile": self.profile,
             "status": "complete" if debt["complete"] else "partial",
             "hooks": self.hook_index - 1,
             "move_batches": self.hook_index - 1,
             "business_hooks": business_hooks,
             "operations": len(self.operations),
             "stage1_debt": debt,
+            "downstream_quality": self.downstream_quality(),
             "blocking_reasons": self.blocking_reasons(debt),
         }
         return {"response": response, "summary": summary, "trace": self.trace}
@@ -1412,12 +1903,35 @@ def solve_one(
     *,
     max_hooks: int,
     time_budget_seconds: float,
+    profile: str,
+    portfolio_profiles: tuple[str, ...],
+    portfolio_objective: str,
     verbose: bool = False,
 ) -> dict[str, Any]:
-    solver = Stage1Solver(path, max_hooks=max_hooks, time_budget_seconds=time_budget_seconds)
-    result = solver.solve()
+    profiles = portfolio_profiles or (profile,)
+    results: list[dict[str, Any]] = []
+    per_profile_time_budget = time_budget_seconds if len(profiles) == 1 else max(5.0, time_budget_seconds / len(profiles))
+    for item_profile in profiles:
+        solver = Stage1Solver(
+            path,
+            max_hooks=max_hooks,
+            time_budget_seconds=per_profile_time_budget,
+            profile=item_profile,
+        )
+        results.append(solver.solve())
+    result = min(results, key=lambda item: portfolio_selection_key(item, portfolio_objective))
     out_dir.mkdir(parents=True, exist_ok=True)
     case_id = result["summary"]["case_id"]
+    if len(results) > 1:
+        portfolio = {
+            "case_id": case_id,
+            "selected_profile": result["summary"].get("profile", ""),
+            "objective": portfolio_objective,
+            "profiles": [item["summary"] for item in results],
+        }
+        result["summary"]["portfolio_profiles"] = [item["summary"].get("profile", "") for item in results]
+        result["summary"]["selected_profile"] = result["summary"].get("profile", "")
+        write_json(out_dir / f"{case_id}_portfolio.json", portfolio)
     write_json(out_dir / f"{case_id}_response.json", result["response"])
     write_json(out_dir / f"{case_id}_summary.json", result["summary"])
     write_json(out_dir / f"{case_id}_trace.json", result["trace"])
@@ -1425,11 +1939,68 @@ def solve_one(
         summary = result["summary"]
         print(
             f"{summary['case_id']} {summary['status']} "
+            f"profile={summary.get('selected_profile') or summary.get('profile', '')} "
             f"business_hooks={summary['business_hooks']} "
             f"move_batches={summary['hooks']} debt={summary['stage1_debt']['debt_count']}",
             flush=True,
         )
     return result["summary"]
+
+
+def portfolio_selection_key(result: dict[str, Any], objective: str = "balanced") -> tuple[Any, ...]:
+    summary = result["summary"]
+    debt = summary.get("stage1_debt") or {}
+    quality = summary.get("downstream_quality") or {}
+    status_rank = 0 if summary.get("status") == "complete" else 1
+    common = (
+        status_rank,
+        int(debt.get("debt_count") or 0),
+        int(debt.get("blocked_g_count") or 0),
+        len(debt.get("pollution_nos") or ()),
+    )
+    tail = int(quality.get("stage4_tail_debt_count") or 0)
+    lower_bound = int(quality.get("stage4_lower_bound") or 0)
+    access_blocked = int(quality.get("stage4_access_blocked_debt_count") or 0)
+    fragments = int(quality.get("stage3_extra_fragment_count") or 0)
+    runs = int(quality.get("stage3_group_run_count") or 0)
+    prefix_blocked = int(quality.get("stage3_prefix_blocked_count") or 0)
+    business_hooks = int(summary.get("business_hooks") or 0)
+    profile_name = str(summary.get("profile") or "")
+    if objective == "stage4":
+        return (
+            *common,
+            access_blocked,
+            lower_bound,
+            tail,
+            fragments,
+            runs,
+            prefix_blocked,
+            business_hooks,
+            profile_name,
+        )
+    if objective == "stage3":
+        return (
+            *common,
+            fragments,
+            runs,
+            prefix_blocked,
+            access_blocked,
+            lower_bound,
+            tail,
+            business_hooks,
+            profile_name,
+        )
+    return (
+        *common,
+        fragments,
+        runs,
+        prefix_blocked,
+        access_blocked,
+        lower_bound,
+        tail,
+        business_hooks,
+        profile_name,
+    )
 
 
 def case_files(path: Path) -> list[Path]:
@@ -1449,7 +2020,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-hooks", type=int, default=MAX_HOOKS)
     parser.add_argument("--time-budget-seconds", type=float, default=DEFAULT_TIME_BUDGET_SECONDS)
     parser.add_argument("--limit", type=int, default=0, help="limit number of cases for directory input")
+    parser.add_argument("--profile", choices=sorted(PROFILE_CONFIGS), default=DEFAULT_PROFILE)
+    parser.add_argument("--portfolio-objective", choices=PORTFOLIO_OBJECTIVES, default="balanced")
+    parser.add_argument(
+        "--portfolio-profiles",
+        default="",
+        help=(
+            "comma-separated profiles to run and select from; use 'default' for "
+            f"{','.join(DEFAULT_PORTFOLIO_PROFILES)}"
+        ),
+    )
     return parser.parse_args()
+
+
+def parse_portfolio_profiles(text: str) -> tuple[str, ...]:
+    if not text:
+        return ()
+    if text == "default":
+        return DEFAULT_PORTFOLIO_PROFILES
+    profiles = tuple(item.strip() for item in text.split(",") if item.strip())
+    unknown = [item for item in profiles if item not in PROFILE_CONFIGS]
+    if unknown:
+        raise ValueError(f"unknown_stage1_profiles:{','.join(unknown)}")
+    return profiles
 
 
 def main() -> None:
@@ -1459,6 +2052,7 @@ def main() -> None:
         files = files[: args.limit]
     args.out.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, Any]] = []
+    portfolio_profiles = parse_portfolio_profiles(args.portfolio_profiles)
     for path in files:
         try:
             summaries.append(
@@ -1467,6 +2061,9 @@ def main() -> None:
                     args.out,
                     max_hooks=args.max_hooks,
                     time_budget_seconds=args.time_budget_seconds,
+                    profile=args.profile,
+                    portfolio_profiles=portfolio_profiles,
+                    portfolio_objective=args.portfolio_objective,
                     verbose=args.input.is_dir(),
                 )
             )
@@ -1477,6 +2074,7 @@ def main() -> None:
                 case_id = path.stem
             summary = {
                 "case_id": case_id,
+                "profile": args.profile,
                 "status": "error",
                 "hooks": 0,
                 "move_batches": 0,
@@ -1496,6 +2094,7 @@ def main() -> None:
         "error": sum(1 for item in summaries if item["status"] == "error"),
         "avg_hooks": round(sum(item["hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
         "avg_business_hooks": round(sum(item["business_hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
+        "selected_profile_counts": dict(Counter(item.get("selected_profile") or item.get("profile", "") for item in summaries)),
         "summaries": summaries,
     }
     write_json(args.out / "aggregate_summary.json", aggregate)
