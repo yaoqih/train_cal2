@@ -1333,12 +1333,17 @@ def spotting_group_positions_for_batch(
     projected = [dict(car) for car in cars]
     projected_nos = {car_no(car) for car in projected}
     for car in group:
-        if car_no(car) in projected_nos:
-            continue
-        item = dict(car)
+        no = car_no(car)
+        if no in projected_nos:
+            item = next((candidate for candidate in projected if car_no(candidate) == no), None)
+            if item is None:
+                continue
+        else:
+            item = dict(car)
+            projected.append(item)
+            projected_nos.add(no)
         item["Line"] = target_line
         item["Position"] = 0
-        projected.append(item)
     allowed = spotting_allowed_positions(projected, target_line, forced, depot_assignment)
     if not existing_set <= allowed:
         return {}
@@ -1946,6 +1951,14 @@ def target_put_order_reasons(
     ]
     reasons: list[str] = []
     for (left_no, left_position), (right_no, right_position) in zip(ordered, ordered[1:]):
+        if is_spotting_line(target_line):
+            if right_position > left_position:
+                continue
+            reasons.append(
+                "target_put_order_violation:"
+                f"{target_line}:{left_no}@{left_position}->{right_no}@{right_position}"
+            )
+            continue
         if right_position == left_position + 1:
             continue
         reasons.append(

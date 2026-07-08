@@ -1,1 +1,1 @@
-"""Fourth-stage residual closeout solver."""
+"""Closed-macro fourth-stage solver."""

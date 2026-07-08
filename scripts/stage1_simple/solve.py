@@ -49,42 +49,15 @@ CACHE_LINES = (
     "抛丸线",
 )
 STORAGE_CACHE_LINES = {"存1线", "存2线", "存3线", "存5线北", "存5线南"}
-REAL_TARGET_STATIC_LINES = {"机库线", "预修线", "油漆线", "洗罐站", "抛丸线", "调梁棚"}
+REAL_TARGET_STATIC_LINES = {"机库线", "预修线", "油漆线", "洗罐站", "抛丸线"}
 STAGE3_TEMPLATE_B_ORDER = ("机走北", "机走棚", "洗油北", "机南")
 STAGE3_TEMPLATE_A_FIRST_ORDER = ("机走北", "机走棚", "机南")
 STAGE3_TEMPLATE_A_SECOND_LINE = "洗油北"
 STAGE4_IGNORED_TARGET_LINES = physical.DEPOT_TARGET_LINES | {"卸轮线"}
 HIGH_VALUE_STAGE4_TARGETS = {"预修线", "调梁棚", "调梁线北"}
-DIRECT_DELIVERY_TARGETS = ("机库线", "油漆线", "抛丸线", "洗罐站", "预修线", "调梁棚")
+DIRECT_DELIVERY_TARGETS = ("机库线", "油漆线", "抛丸线", "洗罐站", "预修线")
 DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN = 10
 DIRECT_DELIVERY_PRIORITY_MIN_BATCH = 2
-STAGE4_EARLY_RELEASE_TARGETS = (
-    "抛丸线",
-    "洗罐站",
-    "洗罐线北",
-    "油漆线",
-    "调梁棚",
-    "机库线",
-)
-STAGE4_EARLY_RELEASE_SOURCE_LINES = (
-    "存5线北",
-    "存5线南",
-    "存3线",
-    "存2线",
-    "存1线",
-    "调梁棚",
-    "预修线",
-    "卸轮线",
-    "油漆线",
-    "洗罐线北",
-    "洗罐站",
-    "抛丸线",
-    "机库线",
-    "机走棚",
-    "机走北",
-    "洗油北",
-)
-STAGE4_EARLY_RELEASE_MAX_STATIC_ROUTE_LEN = 12
 SATISFIED_RETURN_MAX_HOOKS = 2
 STAGE4_LAYOUT_QUALITY_BASE_LINES = (
     "洗罐站",
@@ -118,8 +91,7 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": False,
         "direct_delivery": False,
         "direct_delivery_max_hooks": 0,
-        "early_release": False,
-        "early_release_max_hooks": 0,
+        "split_put": False,
         "quality_order": "none",
     },
     "balanced": {
@@ -127,8 +99,7 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": True,
         "direct_delivery": True,
         "direct_delivery_max_hooks": 5,
-        "early_release": True,
-        "early_release_max_hooks": 4,
+        "split_put": False,
         "quality_order": "balanced",
     },
     "stage3": {
@@ -136,8 +107,7 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": True,
         "direct_delivery": True,
         "direct_delivery_max_hooks": 5,
-        "early_release": True,
-        "early_release_max_hooks": 4,
+        "split_put": False,
         "quality_order": "stage3",
     },
     "stage4": {
@@ -145,8 +115,7 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": True,
         "direct_delivery": True,
         "direct_delivery_max_hooks": 5,
-        "early_release": True,
-        "early_release_max_hooks": 4,
+        "split_put": False,
         "quality_order": "stage4",
     },
 }
@@ -161,6 +130,7 @@ MAX_CAPACITY_DEFICIT_HOOKS = 10
 DEFAULT_TIME_BUDGET_SECONDS = 300.0
 DYNAMIC_VALID_WINDOW = 20
 DYNAMIC_EXAMINED_WINDOW = 140
+SPLIT_PUT_MAX_CANDIDATES_PER_SOURCE = 24
 
 
 @dataclass(frozen=True)
@@ -442,7 +412,6 @@ class Stage1Solver:
                         "violations": ["dead_end_after_candidate"],
                     })
                 continue
-
             moving_nos = set(view.candidate.move_car_nos)
             improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
             downstream_quality = probe.downstream_quality_tuple()
@@ -763,32 +732,6 @@ class Stage1Solver:
         probe.loco = physical.next_loco_location(candidate, validation)
         return probe
 
-    def debt_after(
-        self,
-        candidate: physical.HookCandidate,
-        validation: physical.PhysicalValidation,
-    ) -> dict[str, Any]:
-        return self.probe_after(candidate, validation).stage1_debt()
-
-    def seen_after(
-        self,
-        candidate: physical.HookCandidate,
-        validation: physical.PhysicalValidation,
-    ) -> bool:
-        probe = self.probe_after(candidate, validation)
-        return physical.state_signature(probe.cars, probe.loco) in self.seen_states
-
-    def leaves_progress(
-        self,
-        candidate: physical.HookCandidate,
-        validation: physical.PhysicalValidation,
-        *,
-        depth: int,
-    ) -> bool:
-        probe = self.probe_after(candidate, validation)
-        probe.hook_index = self.hook_index + 1
-        return probe.can_continue(depth, include_put_blockers=True)
-
     def can_continue(self, depth: int, *, include_put_blockers: bool = False) -> bool:
         debt = self.stage1_debt()
         if debt["complete"] or depth <= 0:
@@ -866,13 +809,13 @@ class Stage1Solver:
             }
         candidates: list[CandidateView] = []
         candidates.extend(self.direct_assembly_candidates(debt))
+        candidates.extend(self.split_put_assembly_candidates(debt))
         candidates.extend(self.blocker_candidates(debt))
         candidates.extend(self.route_blocker_candidates(debt))
         candidates.extend(self.cleanup_candidates(debt))
         candidates.extend(self.release_gate_candidates(debt))
         candidates.extend(self.satisfied_return_candidates(debt))
         candidates.extend(self.direct_delivery_candidates(debt))
-        candidates.extend(self.stage4_early_release_candidates(debt))
         unique: dict[str, CandidateView] = {}
         for item in candidates:
             unique.setdefault(item.candidate.candidate_id, item)
@@ -935,6 +878,85 @@ class Stage1Solver:
                     )
                     yield CandidateView(candidate, candidates_score, "direct_assembly")
 
+    def split_put_assembly_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
+        if not PROFILE_CONFIGS[self.profile]["split_put"]:
+            return
+        if debt["pollution_nos"]:
+            return
+        by_no = self.by_no()
+        for line in self.active_lines():
+            if line in FORBIDDEN_LINES:
+                continue
+            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            if not ordered:
+                continue
+            max_batch: list[dict[str, Any]] = []
+            for car in ordered:
+                if self.stage1_goal(car) != "depot_assembly" or self.stage1_car_complete(car):
+                    break
+                trial = [*max_batch, car]
+                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                    break
+                max_batch = trial
+                if car.get("IsWeigh") and not car.get("_Weighed"):
+                    break
+            if len(max_batch) < 2:
+                continue
+
+            emitted = 0
+            for batch in self.prefix_options(max_batch):
+                source_limit_reached = False
+                if len(batch) < 2:
+                    continue
+                for cut in range(1, len(batch)):
+                    prefix = batch[:cut]
+                    suffix = batch[cut:]
+                    if not prefix or not suffix:
+                        continue
+                    for first_target in ASSEMBLY_DEPOT:
+                        if (
+                            first_target == line
+                            or self.line_has_cars(first_target, excluded_nos={physical.car_no(car) for car in suffix})
+                            or not self.target_allowed(first_target, suffix)
+                        ):
+                            continue
+                        for second_target in ASSEMBLY_DEPOT:
+                            if (
+                                second_target == first_target
+                                or self.line_has_cars(second_target, excluded_nos={physical.car_no(car) for car in prefix})
+                                or not self.target_allowed(second_target, prefix)
+                            ):
+                                continue
+                            candidate = self.make_split_put_candidate(
+                                source=line,
+                                first_target=first_target,
+                                first_batch=suffix,
+                                second_target=second_target,
+                                second_batch=prefix,
+                                kind="vnext_depot_inbound_split_put",
+                                reason="direct_assembly_split_put",
+                            )
+                            if not candidate:
+                                continue
+                            score = self.score_candidate(
+                                candidate,
+                                debt=debt,
+                                moved_g=sum(1 for car in batch if self.stage1_goal(car)),
+                                moved_x=0,
+                                reason_rank=0,
+                            )
+                            yield CandidateView(candidate, score, "direct_assembly_split_put")
+                            emitted += 1
+                            if emitted >= SPLIT_PUT_MAX_CANDIDATES_PER_SOURCE:
+                                source_limit_reached = True
+                                break
+                        if source_limit_reached:
+                            break
+                    if source_limit_reached:
+                        break
+                if source_limit_reached:
+                    break
+
     def direct_delivery_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
         if not PROFILE_CONFIGS[self.profile]["direct_delivery"]:
             return
@@ -992,66 +1014,6 @@ class Stage1Solver:
                     candidate,
                     self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=4),
                     f"stage1_direct_delivery:{target}",
-                )
-
-    def stage4_early_release_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        if not PROFILE_CONFIGS[self.profile].get("early_release"):
-            return
-        if self.stage4_early_release_hooks_used() >= int(PROFILE_CONFIGS[self.profile]["early_release_max_hooks"]):
-            return
-        if debt["pollution_nos"]:
-            return
-        ready_targets = {
-            target: self.stage4_early_release_target_ready(target)
-            for target in STAGE4_EARLY_RELEASE_TARGETS
-        }
-        if not any(ready_targets.values()):
-            return
-        by_no = self.by_no()
-        source_lines = [line for line in STAGE4_EARLY_RELEASE_SOURCE_LINES if any(car["Line"] == line for car in self.cars)]
-        for line in source_lines:
-            if line in FORBIDDEN_LINES:
-                continue
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
-            if not ordered:
-                continue
-            target = ""
-            max_batch: list[dict[str, Any]] = []
-            for car in ordered:
-                car_target = self.stage4_early_release_target_for_car(car)
-                if not car_target or car_target == line or not ready_targets.get(car_target):
-                    break
-                if target and car_target != target:
-                    break
-                trial = [*max_batch, car]
-                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
-                    break
-                target = car_target
-                max_batch = trial
-                if car.get("IsWeigh") and not car.get("_Weighed"):
-                    break
-            if not target or not max_batch:
-                continue
-            for batch in self.prefix_options(max_batch):
-                if not self.stage4_early_release_batch_allowed(target, batch):
-                    continue
-                if not self.target_allowed(target, batch):
-                    continue
-                if not self.stage4_early_release_route_low_cost(line, target):
-                    continue
-                candidate = self.make_candidate(
-                    source=line,
-                    target=target,
-                    batch=batch,
-                    kind="vnext_stage1_direct_delivery",
-                    reason=f"stage1_early_release:{target}",
-                )
-                if not candidate:
-                    continue
-                yield CandidateView(
-                    candidate,
-                    self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=4),
-                    f"stage1_early_release:{target}",
                 )
 
     def blocker_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
@@ -1382,6 +1344,7 @@ class Stage1Solver:
 
     def blocker_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
         targets: list[str] = []
+        targets.extend(self.depot_assembly_targets_for_batch(batch, source=source))
         direct = self.common_current_target(batch)
         if (
             direct
@@ -1394,6 +1357,14 @@ class Stage1Solver:
         targets.extend(self.grouped_cache_targets(batch, source=source, debt=debt))
         targets.extend(self.safe_temp_targets(source=source, debt=debt))
         return list(dict.fromkeys(targets))
+
+    def depot_assembly_targets_for_batch(self, batch: list[dict[str, Any]], *, source: str) -> list[str]:
+        del batch, source
+        return []
+
+    def line_has_cars(self, line: str, *, excluded_nos: set[str] | None = None) -> bool:
+        excluded_nos = excluded_nos or set()
+        return any(car["Line"] == line and physical.car_no(car) not in excluded_nos for car in self.cars)
 
     def grouped_cache_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
         if not PROFILE_CONFIGS[self.profile]["downstream"]:
@@ -1501,6 +1472,39 @@ class Stage1Solver:
             hook_index=self.hook_index,
             source_line=source,
             target_line=target,
+            batch=batch,
+            steps=steps,
+            reason=reason,
+            candidate_kind=kind,
+        )
+
+    def make_split_put_candidate(
+        self,
+        *,
+        source: str,
+        first_target: str,
+        first_batch: list[dict[str, Any]],
+        second_target: str,
+        second_batch: list[dict[str, Any]],
+        kind: str,
+        reason: str,
+    ) -> physical.HookCandidate | None:
+        if source in FORBIDDEN_LINES or first_target in FORBIDDEN_LINES or second_target in FORBIDDEN_LINES:
+            return None
+        batch = [*second_batch, *first_batch]
+        all_nos = tuple(physical.car_no(car) for car in batch)
+        first_nos = tuple(physical.car_no(car) for car in first_batch)
+        second_nos = tuple(physical.car_no(car) for car in second_batch)
+        steps = (
+            physical.plan_step("Get", source, all_nos),
+            physical.plan_step("Put", first_target, first_nos),
+            physical.plan_step("Put", second_target, second_nos),
+        )
+        return physical.build_planlet_candidate(
+            case_id=self.case_id,
+            hook_index=self.hook_index,
+            source_line=source,
+            target_line=second_target,
             batch=batch,
             steps=steps,
             reason=reason,
@@ -1765,39 +1769,6 @@ class Stage1Solver:
         route = self.graph.route(source, target)
         return bool(route and len(route) <= DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN)
 
-    def stage4_early_release_target_for_car(self, car: dict[str, Any]) -> str:
-        if self.stage1_goal(car) or self.target_satisfied(car):
-            return ""
-        if physical.force_positions(car):
-            return ""
-        if car.get("IsWeigh") and not car.get("_Weighed"):
-            return ""
-        targets = set(car.get("TargetLines") or ())
-        for target in STAGE4_EARLY_RELEASE_TARGETS:
-            if target not in targets:
-                continue
-            if not self.stage4_early_release_target_ready(target):
-                continue
-            if self.stage4_target_line_satisfied_by(car, target):
-                return target
-        return ""
-
-    def stage4_early_release_target_ready(self, target: str) -> bool:
-        if target not in STAGE4_EARLY_RELEASE_TARGETS:
-            return False
-        if not self.stage1_real_target_available(target):
-            return False
-        return self.real_target_ready(target)
-
-    def stage4_early_release_batch_allowed(self, target: str, batch: list[dict[str, Any]]) -> bool:
-        if not batch:
-            return False
-        return all(self.stage4_early_release_target_for_car(car) == target for car in batch)
-
-    def stage4_early_release_route_low_cost(self, source: str, target: str) -> bool:
-        route = self.graph.route(source, target)
-        return bool(route and len(route) <= STAGE4_EARLY_RELEASE_MAX_STATIC_ROUTE_LEN)
-
     def is_direct_delivery_candidate(self, candidate: physical.HookCandidate) -> bool:
         return candidate.candidate_kind == "vnext_stage1_direct_delivery"
 
@@ -1818,13 +1789,6 @@ class Stage1Solver:
             1
             for item in self.trace
             if str(item.get("reason") or "").startswith("stage1_direct_delivery:")
-        )
-
-    def stage4_early_release_hooks_used(self) -> int:
-        return sum(
-            1
-            for item in self.trace
-            if str(item.get("reason") or "").startswith("stage1_early_release:")
         )
 
     def downstream_quality_tuple(self) -> tuple[int, ...]:

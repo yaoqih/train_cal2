@@ -126,6 +126,7 @@ class Stage2Solver:
         self.meta = {rv.car_no(car): dict(car) for car in self.initial_cars}
         self.tags = {no: self.classify(car) for no, car in self.meta.items()}
         self.deferred_store4_nos = self.defer_store4_over_pull_limit()
+        self.paint_to_unwheel_nos = self.choose_paint_to_unwheel()
         self.active_nos = {no for no, tag in self.tags.items() if tag != TAG_STAY}
         self.graph = physical.TrackGraph()
         self.started_at = time.monotonic()
@@ -195,6 +196,39 @@ class Stage2Solver:
             excess -= self.pull_equivalent((no,))
             if excess <= 0:
                 break
+        return selected
+
+    def choose_paint_to_unwheel(self) -> set[str]:
+        reserved = 0.0
+        for no, car in self.meta.items():
+            if self.tags.get(no) == TAG_U:
+                reserved += float(car.get("Length") or 0.0)
+            elif car["Line"] == UNWHEEL and self.tags.get(no) in {TAG_STAY, TAG_OUT} and not self.is_paint_flex(no):
+                reserved += float(car.get("Length") or 0.0)
+        remaining = rv.TRACK_LEN[UNWHEEL] - reserved
+        if remaining <= rv.TOL:
+            return set()
+
+        line_order: dict[str, tuple[str, ...]] = {}
+        for car in sorted(self.initial_cars, key=lambda item: (item["Line"], int(item.get("Position") or 0), rv.car_no(item))):
+            line_order.setdefault(car["Line"], tuple())
+            line_order[car["Line"]] = (*line_order[car["Line"]], rv.car_no(car))
+
+        def blocks_required(no: str) -> int:
+            line = self.meta[no]["Line"]
+            ordered = line_order.get(line, ())
+            if no not in ordered:
+                return 0
+            index = ordered.index(no)
+            return sum(1 for other in ordered[index + 1:] if self.tags.get(other) in {TAG_C4, TAG_OFF, TAG_U})
+
+        candidates = [no for no in self.tags if self.is_paint_flex(no) and self.meta[no]["Line"] != UNWHEEL]
+        selected: set[str] = set()
+        for no in sorted(candidates, key=lambda item: (-blocks_required(item), float(self.meta[item].get("Length") or 0.0), item)):
+            length = float(self.meta[no].get("Length") or 0.0)
+            if length <= remaining + rv.TOL:
+                selected.add(no)
+                remaining -= length
         return selected
 
     def solve(self) -> dict[str, Any]:
@@ -622,6 +656,12 @@ class Stage2Solver:
     def should_buffer_flex_out_tail(self, state: State) -> bool:
         return bool(state.held) and self.tags.get(state.held[-1], TAG_STAY) == TAG_OUT
 
+    def is_paint_flex(self, no: str) -> bool:
+        return self.tags.get(no) == TAG_OUT and PAINT in set(self.meta[no].get("TargetLines") or [])
+
+    def is_depot_out_flex(self, no: str) -> bool:
+        return self.tags.get(no) == TAG_OUT and bool(set(self.meta[no].get("TargetLines") or []) & set(DEPOT_OUT))
+
     def has_gettable_direct_tag(self, state: State, targets: set[str]) -> bool:
         for line, move in self.get_prefixes(state):
             if not move or self.tags.get(move[0], TAG_STAY) not in targets:
@@ -704,6 +744,11 @@ class Stage2Solver:
                     need_unwheel = True
                     if line:
                         source_lines.add(line)
+            elif tag == TAG_OUT and no in self.paint_to_unwheel_nos:
+                if line != UNWHEEL:
+                    need_unwheel = True
+                    if line:
+                        source_lines.add(line)
             elif tag in {TAG_C4, TAG_OFF}:
                 if line != STORE4:
                     need_store4 = True
@@ -718,6 +763,8 @@ class Stage2Solver:
             line = self.current_line(line_map, no)
             tag = self.tags[no]
             if tag == TAG_U and line not in {"", UNWHEEL}:
+                count += 1
+            elif tag == TAG_OUT and no in self.paint_to_unwheel_nos and line not in {"", UNWHEEL}:
                 count += 1
             elif tag in {TAG_C4, TAG_OFF} and line not in {"", STORE4}:
                 count += 1
@@ -804,6 +851,8 @@ class Stage2Solver:
 
     def flex_out_prefix_needed(self, state: State, line: str, cut: int) -> bool:
         line_map = self.line_map(state)
+        if any(no in self.paint_to_unwheel_nos for no in line_map.get(line, ())[:cut]):
+            return True
         later_tags = [self.effective_line_tag(line, no) for no in line_map.get(line, ())[cut:]]
         if any(tag in {TAG_C4, TAG_OFF, TAG_U} for tag in later_tags):
             return True
@@ -889,6 +938,11 @@ class Stage2Solver:
         if tail_tag == TAG_U:
             yield UNWHEEL, tail_run
 
+        if tail_tag == TAG_OUT:
+            move = self.longest_paint_suffix_that_fits(state, UNWHEEL, tail_run)
+            if move:
+                yield UNWHEEL, move
+
         for line, move in self.buffer_puts(state, tail_run):
             yield line, move
 
@@ -919,13 +973,16 @@ class Stage2Solver:
             return
         candidates: list[tuple[int, int, int, str, tuple[str, ...]]] = []
         for line in self.safe_buffer_lines(state, tail_tag):
-            move = self.longest_suffix_that_fits(state, line, tail_run)
+            if tail_tag == TAG_OUT:
+                move = self.longest_ordered_out_suffix_that_fits(state, line, tail_run)
+            else:
+                move = self.longest_suffix_that_fits(state, line, tail_run)
             if not move:
                 continue
             route, reject = self.route(state, "Put", line, move)
             if reject:
                 continue
-            candidates.append((-len(move), self.buffer_line_penalty(state, line), len(route), line, move))
+            candidates.append((-len(move), self.buffer_line_penalty(state, line) + self.out_buffer_penalty(state, line, move), len(route), line, move))
         for _move_len, _penalty, _route_len, line, move in sorted(candidates):
             yield line, move
 
@@ -935,10 +992,27 @@ class Stage2Solver:
             existing = line_map.get(line, ())
             if existing:
                 if tail_tag != TAG_C4:
-                    continue
-                if not self.can_stack_c4_buffer(state, line, existing):
+                    if tail_tag != TAG_OUT or not self.can_stack_out_buffer(state, line, existing):
+                        continue
+                elif not self.can_stack_c4_buffer(state, line, existing):
                     continue
             yield line
+
+    def can_stack_out_buffer(self, state: State, line: str, existing: tuple[str, ...]) -> bool:
+        return bool(existing) and all(self.tags.get(no) == TAG_OUT for no in existing)
+
+    def out_order_ok(self, state: State, line: str, move: tuple[str, ...]) -> bool:
+        line_map = self.line_map(state)
+        seen_non_paint = False
+        for no in (*move, *line_map.get(line, ())):
+            if self.tags.get(no) != TAG_OUT:
+                continue
+            if self.is_paint_flex(no):
+                if seen_non_paint:
+                    return False
+            else:
+                seen_non_paint = True
+        return True
 
     def can_stack_c4_buffer(self, state: State, line: str, existing: tuple[str, ...]) -> bool:
         if not existing or any(self.tags.get(no) not in {TAG_C4, TAG_OUT} for no in existing):
@@ -968,10 +1042,41 @@ class Stage2Solver:
                 penalty += 5
         return penalty
 
+    def out_buffer_penalty(self, state: State, line: str, move: tuple[str, ...]) -> int:
+        if not move or any(self.tags.get(no) != TAG_OUT for no in move):
+            return 0
+        line_map = self.line_map(state)
+        existing = line_map.get(line, ())
+        move_has_paint = any(self.is_paint_flex(no) for no in move)
+        existing_has_depot_out = any(self.is_depot_out_flex(no) for no in existing)
+        if move_has_paint and existing_has_depot_out:
+            return -30
+        if move_has_paint:
+            return -10
+        return 0
+
     def longest_suffix_that_fits(self, state: State, line: str, tail_run: tuple[str, ...]) -> tuple[str, ...]:
         for start in range(len(tail_run)):
             move = tail_run[start:]
             if self.line_has_capacity(state, line, move):
+                return move
+        return ()
+
+    def longest_paint_suffix_that_fits(self, state: State, line: str, tail_run: tuple[str, ...]) -> tuple[str, ...]:
+        for start in range(len(tail_run)):
+            move = tail_run[start:]
+            if not move or not all(self.is_paint_flex(no) for no in move):
+                continue
+            if self.line_has_capacity(state, line, move):
+                return move
+        return ()
+
+    def longest_ordered_out_suffix_that_fits(self, state: State, line: str, tail_run: tuple[str, ...]) -> tuple[str, ...]:
+        for start in range(len(tail_run)):
+            move = tail_run[start:]
+            if not move or any(self.tags.get(no) != TAG_OUT for no in move):
+                continue
+            if self.line_has_capacity(state, line, move) and self.out_order_ok(state, line, move):
                 return move
         return ()
 
@@ -1122,6 +1227,8 @@ class Stage2Solver:
             line = self.current_line(line_map, no)
             if tag == TAG_U and line != UNWHEEL:
                 return False
+            if tag == TAG_OUT and no in self.paint_to_unwheel_nos and line != UNWHEEL:
+                return False
             if tag in {TAG_C4, TAG_OFF} and line != STORE4:
                 return False
         if not self.is_off_star_c4_star(state.new_store4):
@@ -1143,6 +1250,8 @@ class Stage2Solver:
             tag = self.tags[no]
             line = self.current_line(line_map, no)
             if tag == TAG_U and line != UNWHEEL:
+                pending.append(no)
+            elif tag == TAG_OUT and no in self.paint_to_unwheel_nos and line != UNWHEEL:
                 pending.append(no)
             elif tag in {TAG_C4, TAG_OFF} and line != STORE4:
                 pending.append(no)
@@ -1211,6 +1320,7 @@ class Stage2Solver:
             "business_hooks": sum(1 for row in rv.operations(response) if row.get("Action") in {"Get", "Put"}),
             "stage2_debt": stage2_debt,
             "deferred_store4_nos": list(self.deferred_store4_nos),
+            "paint_to_unwheel_nos": sorted(self.paint_to_unwheel_nos),
             "flex_out_positions": flex_out_positions,
             "flex_out_in_store4": [
                 item["car_no"]
@@ -1333,6 +1443,8 @@ class Stage2Solver:
         tag = self.tags.get(no, TAG_STAY)
         if tag == TAG_U and line == UNWHEEL:
             return TAG_STAY
+        if tag == TAG_OUT and no in self.paint_to_unwheel_nos and line == UNWHEEL:
+            return TAG_STAY
         if tag in {TAG_C4, TAG_OFF} and line == STORE4:
             return TAG_STAY
         return tag
@@ -1367,6 +1479,8 @@ class Stage2Solver:
         line_map = self.line_map(state)
         for no in self.active_nos:
             if self.tags.get(no) == TAG_U and self.current_line(line_map, no) != UNWHEEL:
+                return True
+            if self.tags.get(no) == TAG_OUT and no in self.paint_to_unwheel_nos and self.current_line(line_map, no) != UNWHEEL:
                 return True
         return False
 
@@ -1494,6 +1608,11 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         for item in summaries
         for no in item.get("deferred_store4_nos") or []
     ]
+    paint_to_unwheel = [
+        no
+        for item in summaries
+        for no in item.get("paint_to_unwheel_nos") or []
+    ]
     reasons = Counter(
         reason.split(":", 1)[0]
         for item in summaries
@@ -1512,6 +1631,8 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         "flex_out_in_store4": flex_out_in_store4,
         "deferred_store4_count": len(deferred_store4),
         "deferred_store4_nos": deferred_store4,
+        "paint_to_unwheel_count": len(paint_to_unwheel),
+        "paint_to_unwheel_nos": paint_to_unwheel,
         "summaries": summaries,
     }
 
