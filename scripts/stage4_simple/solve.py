@@ -32,6 +32,8 @@ MAX_GREEDY_STEPS = 180
 MAX_TARGET_GROUP_GETS = 3
 MAX_TARGET_GROUP_BRANCHES = 36
 MAX_SPOTTING_REPACK_STEPS = 50
+MAX_SPOTTING_LOCAL_STATES = 900
+MAX_SPOTTING_LOCAL_DEPTH = 18
 MACRO_BEAM_WIDTH = 8
 MACRO_BEAM_BRANCHES = 10
 MACRO_BEAM_DEPTH = 42
@@ -40,9 +42,12 @@ MACRO_BEAM_LOW_DEBT_STATES = 5
 MACRO_CANDIDATE_POOL = 80
 STORE4 = "存4线"
 WEIGH_LINE = physical.WEIGH_LINE
+STAGE4_DEFER_TARGETS = {"油漆线", STORE4}
+STAGE4_DEFER_SOURCE_LINES = physical.DEPOT_INBOUND_DESTINATION_LINES
 # Stage 4 may route through running lines such as 联7.  The move model only
 # excludes depot-related tracks as operation/cache lines.
 BLOCKED_LINES: set[str] = set()
+STAGE4_EXCLUDED_LINES = {"存4南"}
 OUT_OF_SCOPE_STRATEGY_LINES = physical.DEPOT_INBOUND_DESTINATION_LINES
 RUNNING_LINES = physical.RUNNING_LINES
 HOT_THROATS = {"渡10"}
@@ -74,6 +79,57 @@ HIGH_CONFLICT_CACHE_LINES = {
     "机走棚",
     "机走北",
 }
+CUN5_DIRECTION_LINES = {"存5线北", "存5线南"}
+CUN5_SOUTH_TARGETS = {"油漆线", "洗罐站", "抛丸线"}
+CUN5_NORTH_TARGETS = {
+    "存1线",
+    "存2线",
+    "存3线",
+    "存4线",
+    "预修线",
+    "调梁线北",
+    "调梁棚",
+    "机库线",
+    "机走棚",
+    "机走北",
+    "洗油北",
+    "洗罐线北",
+}
+CACHE_SERVICE_BLOCKING_TARGETS = {
+    "存2线": {"预修线"},
+    "存3线": {"预修线"},
+    "存1线": {"调梁棚"},
+    "调梁线北": {"调梁棚"},
+    "机走棚": {"洗油北", "油漆线", "抛丸线"},
+    "机走北": {"洗油北", "油漆线", "抛丸线"},
+    "预修线": {"抛丸线"},
+}
+STRUCTURAL_SOURCE_ORDER = (
+    "存5线北",
+    "存5线南",
+    "存3线",
+    "存2线",
+    "存1线",
+    "调梁线北",
+    "预修线",
+    "调梁棚",
+    "卸轮线",
+    "存4线",
+    "油漆线",
+    "洗罐站",
+    "机库线",
+    "机走北",
+)
+STRUCTURAL_TARGET_PREP_ORDER = (
+    "调梁棚",
+    "预修线",
+    "油漆线",
+    "洗罐站",
+    "抛丸线",
+    "存3线",
+    "存2线",
+)
+STRUCTURAL_SINGLE_CAR_SOURCE_LINES = {"油漆线", "洗罐站", "机库线", "机走北", "调梁棚"}
 GATE_INNER_TARGET_PAIRS = (
     ("调梁线北", "调梁棚"),
     ("洗罐线北", "洗罐站"),
@@ -140,6 +196,9 @@ MOVE_MODEL_RESTRICTIONS = (
     "store4_closed_door_front_positions_are_checked_at_completion",
     "gate_inner_target_macro_may_temporarily_cache_gate_target_cars",
     "service_sweep_uses_target_topology_and_leaf_cache_lines",
+    "route_blocker_front_managed_segments_are_served_before_generic_search",
+    "cun5_residual_cars_defer_south_terminal_puts_until_the_line_is_cleared",
+    "spotting_lines_use_bounded_local_repack_search_before_global_a_star",
 )
 
 
@@ -277,6 +336,7 @@ class Stage4Solver:
         self.all_repair_nos: set[str] = set()
         self.managed_nos: set[str] = set()
         self.out_of_scope_nos: set[str] = set()
+        self.excluded_line_nos: set[str] = set()
         self.initialize_debt()
         self.initial_unsatisfied_nos = {
             rv.car_no(car)
@@ -317,6 +377,14 @@ class Stage4Solver:
                 self.depot_assignment,
                 loads,
             )
+            if self.is_stage4_deferred_depot_car(car, target):
+                self.active_nos.add(no)
+                self.target_by_no[no] = target
+                self.target_reason_by_no[no] = "stage3_deferred_depot_staging"
+                continue
+            if target in STAGE4_EXCLUDED_LINES or car["Line"] in STAGE4_EXCLUDED_LINES:
+                self.excluded_line_nos.add(no)
+                continue
             if target in OUT_OF_SCOPE_STRATEGY_LINES or car["Line"] in OUT_OF_SCOPE_STRATEGY_LINES:
                 self.out_of_scope_nos.add(no)
                 continue
@@ -326,6 +394,12 @@ class Stage4Solver:
             self.active_nos.add(no)
             self.target_by_no[no] = target
             self.target_reason_by_no[no] = reason
+
+    def is_stage4_deferred_depot_car(self, car: dict[str, Any], target: str) -> bool:
+        return (
+            target in STAGE4_DEFER_TARGETS
+            and car.get("Line") in STAGE4_DEFER_SOURCE_LINES
+        )
 
     def initialize_repair_cars(self) -> None:
         candidate_nos = self.initial_repair_candidate_nos()
@@ -464,7 +538,19 @@ class Stage4Solver:
             )
             return self.result(done)
 
-        upper_state, upper_ops = self.greedy_upper_bound(start)
+        upper_state, upper_ops = self.structural_upper_bound(start)
+        upper_state, upper_ops = self.better_solution(
+            upper_state,
+            upper_ops,
+            *self.depot_deferred_release_upper_bound(start),
+        )
+        if upper_state is not None and self.complete(upper_state):
+            upper_cost = self.ops_cost(upper_ops)
+        else:
+            upper_state, upper_ops, upper_cost = None, (), None
+
+        greedy_state, greedy_ops = self.greedy_upper_bound(start)
+        upper_state, upper_ops = self.better_solution(upper_state, upper_ops, greedy_state, greedy_ops)
         remaining = max(0.0, self.deadline - time.monotonic())
         if remaining > 4.0 and (upper_state is None or self.forced_spotting_repair_needed(start)):
             macro_state, macro_ops, _macro_reasons = self.timed_macro_upper_bound(start, max_seconds=min(55.0, remaining * 0.88))
@@ -487,6 +573,316 @@ class Stage4Solver:
         upper_cost = self.ops_cost(upper_ops) if upper_state is not None else None
         searched = self.search(start, upper_state, upper_ops, upper_cost)
         return self.result(searched)
+
+    def structural_upper_bound(self, start: State) -> tuple[State | None, tuple[Op, ...]]:
+        original_deadline = self.deadline
+        remaining = max(0.0, original_deadline - time.monotonic())
+        if remaining <= 2.0:
+            return None, ()
+        self.deadline = min(original_deadline, time.monotonic() + min(35.0, max(1.0, remaining * 0.45)))
+        state = start
+        ops: list[Op] = []
+        seen: set[State] = set()
+        try:
+            for _step in range(MAX_GREEDY_STEPS):
+                if self.complete(state):
+                    return state, tuple(ops)
+                if self.deadline_reached() or state in seen:
+                    break
+                seen.add(state)
+                candidate = self.best_structural_candidate(state, seen)
+                if candidate is None:
+                    break
+                ops.extend(candidate.ops)
+                state = candidate.state
+            if self.complete(state):
+                return state, tuple(ops)
+        finally:
+            self.deadline = original_deadline
+        return None, ()
+
+    def best_structural_candidate(self, state: State, seen: set[State]) -> MacroCandidate | None:
+        candidates = [
+            candidate
+            for candidate in self.structural_candidates(state)
+            if candidate.state not in seen
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item.score)
+
+    def structural_candidates(self, state: State) -> Iterable[MacroCandidate]:
+        if state.held:
+            yield from self.macro_held_candidates(state)
+            return
+        yield from self.structural_target_prepare_macros(state)
+        yield from self.structural_source_release_macros(state)
+        yield from self.route_cleanup_service_macros(state)
+        yield from self.spotting_front_eject_macros(state)
+        yield from self.service_sweep_macros(state)
+
+    def structural_source_release_macros(self, state: State) -> Iterable[MacroCandidate]:
+        if state.held:
+            return
+        yielded: set[tuple[str, tuple[str, ...]]] = set()
+        for line in STRUCTURAL_SOURCE_ORDER:
+            for move in self.structural_source_prefixes(state, line):
+                key = (line, move)
+                if key in yielded:
+                    continue
+                yielded.add(key)
+                candidate = self.build_service_sweep_macro(state, line, move)
+                if candidate:
+                    yield MacroCandidate(
+                        ops=candidate.ops,
+                        state=candidate.state,
+                        score=(-4, self.structural_source_rank(line), *candidate.score),
+                        reason=f"macro_structural_source_release:{line}",
+                    )
+
+    def structural_source_prefix(self, state: State, line: str) -> tuple[str, ...]:
+        prefixes = self.structural_source_prefixes(state, line)
+        return prefixes[0] if prefixes else ()
+
+    def structural_source_prefixes(self, state: State, line: str) -> tuple[tuple[str, ...], ...]:
+        if self.cun5_get_deferred(state, line):
+            return ()
+        line_map = self.line_map(state)
+        if not line_map.get(line):
+            return ()
+        debt = self.debt_nos_in_state(state)
+        must = self.must_move_nos_in_state(state, self.managed_nos)
+        ordered = physical.line_access_order(self.cars_from_state(state), line, set(state.held))
+        move: list[str] = []
+        useful = False
+        for no in ordered:
+            if no not in self.managed_nos:
+                break
+            trial = (*state.held, *move, no)
+            if self.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            move.append(no)
+            if no in debt or no in must:
+                useful = True
+        if not useful or (len(move) < 2 and line not in STRUCTURAL_SINGLE_CAR_SOURCE_LINES):
+            return ()
+        cuts = {len(move)}
+        for index in range(1, len(move)):
+            if self.target_by_no.get(move[index - 1], "") != self.target_by_no.get(move[index], ""):
+                cuts.add(index)
+        min_cut = 1 if line in STRUCTURAL_SINGLE_CAR_SOURCE_LINES else 2
+        return tuple(tuple(move[:cut]) for cut in sorted(cuts, reverse=True) if cut >= min_cut)
+
+    def structural_source_rank(self, line: str) -> int:
+        try:
+            return STRUCTURAL_SOURCE_ORDER.index(line)
+        except ValueError:
+            return len(STRUCTURAL_SOURCE_ORDER)
+
+    def structural_target_prepare_macros(self, state: State) -> Iterable[MacroCandidate]:
+        if state.held:
+            return
+        for target in STRUCTURAL_TARGET_PREP_ORDER:
+            if not self.target_front_conflict(state, target):
+                continue
+            candidate = self.build_target_front_prepare_macro(state, target)
+            if candidate:
+                yield candidate
+
+    def target_front_conflict(self, state: State, target: str) -> bool:
+        nos = self.line_map(state).get(target, ())
+        if not nos:
+            return False
+        debt = self.debt_nos_in_state(state)
+        if not any(no in debt and self.target_by_no.get(no) == target for no in nos):
+            return False
+        front = nos[0]
+        return front not in self.managed_nos or front in debt or self.target_by_no.get(front, target) != target
+
+    def build_target_front_prepare_macro(self, state: State, target: str) -> MacroCandidate | None:
+        if physical.is_spotting_line(target):
+            candidate = self.build_spotting_local_search_macro(state, target)
+            if candidate:
+                return candidate
+            candidate = self.build_spotting_repack_macro(state, target)
+            if candidate:
+                return candidate
+        move = self.target_front_blocker_segment(state, target)
+        if not move:
+            return None
+        candidate = self.build_service_sweep_macro(state, target, move)
+        if not candidate:
+            return None
+        return MacroCandidate(
+            ops=candidate.ops,
+            state=candidate.state,
+            score=(-5, self.target_prepare_rank(target), *candidate.score),
+            reason=f"macro_target_front_prepare:{target}",
+        )
+
+    def target_front_blocker_segment(self, state: State, target: str) -> tuple[str, ...]:
+        ordered = physical.line_access_order(self.cars_from_state(state), target, set(state.held))
+        debt = self.debt_nos_in_state(state)
+        if not ordered or not any(no in debt and self.target_by_no.get(no) == target for no in ordered):
+            return ()
+        move: list[str] = []
+        for no in ordered:
+            if no not in self.managed_nos:
+                break
+            if self.target_by_no.get(no) == target and no not in debt:
+                break
+            trial = (*state.held, *move, no)
+            if self.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            move.append(no)
+        return tuple(move)
+
+    def target_prepare_rank(self, target: str) -> int:
+        try:
+            return STRUCTURAL_TARGET_PREP_ORDER.index(target)
+        except ValueError:
+            return len(STRUCTURAL_TARGET_PREP_ORDER)
+
+    def depot_deferred_release_upper_bound(self, start: State) -> tuple[State | None, tuple[Op, ...]]:
+        original_deadline = self.deadline
+        remaining = max(0.0, original_deadline - time.monotonic())
+        if remaining <= 2.0:
+            return None, ()
+        prefix_state, prefix_ops = self.depot_deferred_release_prefix(start)
+        if prefix_state is None:
+            return None, ()
+        if self.complete(prefix_state):
+            return prefix_state, prefix_ops
+        best_state: State | None = None
+        best_ops: tuple[Op, ...] = ()
+        best_cost: tuple[int, int, int, int] | None = None
+        try:
+            self.deadline = min(original_deadline, time.monotonic() + min(12.0, max(1.0, remaining * 0.35)))
+            greedy_state, greedy_ops = self.greedy_upper_bound(prefix_state)
+            if greedy_state is not None and self.complete(greedy_state):
+                best_state, best_ops, best_cost = self.keep_best_complete(
+                    best_state,
+                    best_ops,
+                    best_cost,
+                    greedy_state,
+                    (*prefix_ops, *greedy_ops),
+                )
+            remaining = max(0.0, original_deadline - time.monotonic())
+            if remaining > 3.0 and len(self.debt_nos_in_state(prefix_state)) <= 16:
+                self.deadline = min(original_deadline, time.monotonic() + min(18.0, max(1.0, remaining * 0.45)))
+                result = self.search(prefix_state, None, (), None)
+                if result.state is not None and result.status in {"complete", "feasible_unproved"}:
+                    best_state, best_ops, best_cost = self.keep_best_complete(
+                        best_state,
+                        best_ops,
+                        best_cost,
+                        result.state,
+                        (*prefix_ops, *result.ops),
+                    )
+        finally:
+            self.deadline = original_deadline
+        return best_state, best_ops
+
+    def depot_deferred_release_prefix(self, start: State) -> tuple[State | None, tuple[Op, ...]]:
+        if start.held:
+            return None, ()
+        deferred = self.depot_deferred_nos_in_state(start)
+        if not deferred:
+            return None, ()
+        state = start
+        ops: list[Op] = []
+        for target in (STORE4, "油漆线"):
+            while True:
+                choice = self.next_depot_deferred_get(state, target)
+                if choice is None:
+                    break
+                line, move = choice
+                op, state, reject = self.apply_get(state, line, move)
+                if reject:
+                    return None, ()
+                ops.append(op)
+        oil_suffix = self.held_target_suffix(state, "油漆线")
+        if oil_suffix:
+            op, state, reject = self.apply_put(state, "油漆线", oil_suffix, note="target")
+            if reject:
+                return None, ()
+            ops.append(op)
+        store4_suffix = self.held_target_suffix(state, STORE4)
+        if store4_suffix:
+            op, state, reject = self.apply_put(state, STORE4, store4_suffix, note="target")
+            if reject:
+                return None, ()
+            ops.append(op)
+        moved = {no for op in ops for no in op.move}
+        if not (moved & deferred):
+            return None, ()
+        return state, tuple(ops)
+
+    def depot_deferred_nos_in_state(self, state: State) -> set[str]:
+        line_map = self.line_map(state)
+        held = set(state.held)
+        out: set[str] = set()
+        for no in self.active_nos:
+            if self.target_reason_by_no.get(no) != "stage3_deferred_depot_staging":
+                continue
+            if no in held:
+                out.add(no)
+                continue
+            line = self.current_line(line_map, no)
+            if line in STAGE4_DEFER_SOURCE_LINES:
+                out.add(no)
+        return out
+
+    def next_depot_deferred_get(self, state: State, target: str) -> tuple[str, tuple[str, ...]] | None:
+        line_map = self.line_map(state)
+        choices: list[tuple[tuple[int, str], str, tuple[str, ...]]] = []
+        for line in sorted(STAGE4_DEFER_SOURCE_LINES, key=self.depot_deferred_line_rank):
+            ordered = line_map.get(line, ())
+            if not ordered:
+                continue
+            prefix: list[str] = []
+            for no in ordered:
+                if (
+                    self.target_reason_by_no.get(no) == "stage3_deferred_depot_staging"
+                    and self.target_by_no.get(no) == target
+                ):
+                    prefix.append(no)
+                    continue
+                break
+            if not prefix:
+                continue
+            move = tuple(prefix)
+            if self.pull_equivalent((*state.held, *move)) > physical.PULL_LIMIT_EQUIVALENT:
+                continue
+            choices.append(((self.depot_deferred_line_rank(line), line), line, move))
+        if not choices:
+            return None
+        _rank, line, move = min(choices)
+        return line, move
+
+    def depot_deferred_line_rank(self, line: str) -> int:
+        order = {
+            "卸轮线": 0,
+            "修1库外": 11,
+            "修2库外": 12,
+            "修3库外": 13,
+            "修4库外": 14,
+            "修1库内": 21,
+            "修2库内": 22,
+            "修3库内": 23,
+            "修4库内": 24,
+        }
+        return order.get(line, 100)
+
+    def held_target_suffix(self, state: State, target: str) -> tuple[str, ...]:
+        held = state.held
+        if not held:
+            return ()
+        start = len(held)
+        while start > 0 and self.target_by_no.get(held[start - 1], "") == target:
+            start -= 1
+        suffix = held[start:]
+        return suffix if suffix and held[-len(suffix):] == suffix else ()
 
     def better_solution(
         self,
@@ -722,6 +1118,8 @@ class Stage4Solver:
         reasons: list[str] = []
         if self.out_of_scope_nos:
             reasons.append(f"stage3_residual_depot_debt:{len(self.out_of_scope_nos)}")
+        if self.excluded_line_nos:
+            reasons.append(f"stage4_excluded_line_debt:{len(self.excluded_line_nos)}")
         duplicates = [
             no
             for no, count in Counter(rv.car_no(car) for car in self.initial_cars).items()
@@ -735,6 +1133,8 @@ class Stage4Solver:
                 reasons.append(f"target_is_running_line:{no}:{target}")
             if target in BLOCKED_LINES:
                 reasons.append(f"target_is_blocked_line:{no}:{target}")
+            if target in STAGE4_EXCLUDED_LINES:
+                reasons.append(f"target_is_stage4_excluded_line:{no}:{target}")
         by_no = {rv.car_no(car): car for car in self.initial_cars}
         for line in sorted({by_no[no]["Line"] for no in self.active_nos if no in by_no}):
             seen_fixed_blocker = ""
@@ -952,8 +1352,11 @@ class Stage4Solver:
         return candidates
 
     def macro_candidates(self, state: State) -> Iterable[MacroCandidate]:
+        yield from self.route_cleanup_service_macros(state)
         yield from self.service_sweep_macros(state)
         yield from self.gate_inner_restore_macros(state)
+        yield from self.spotting_front_eject_macros(state)
+        yield from self.spotting_local_search_macros(state)
         yield from self.spotting_force_rebuild_macros(state)
         yield from self.spotting_repack_macros(state)
         yield from self.target_group_macros(state)
@@ -963,8 +1366,11 @@ class Stage4Solver:
         yield from self.macro_empty_train_candidates(state)
 
     def fast_macro_candidates(self, state: State) -> Iterable[MacroCandidate]:
+        yield from self.route_cleanup_service_macros(state)
         yield from self.service_sweep_macros(state)
         yield from self.gate_inner_restore_macros(state)
+        yield from self.spotting_front_eject_macros(state)
+        yield from self.spotting_local_search_macros(state)
         yield from self.spotting_force_rebuild_macros(state)
         yield from self.spotting_repack_macros(state)
         if state.held:
@@ -972,6 +1378,98 @@ class Stage4Solver:
             return
         yield from self.target_sweep_macros(state)
         yield from self.macro_empty_train_candidates(state)
+
+    def route_cleanup_service_macros(self, state: State) -> Iterable[MacroCandidate]:
+        if state.held:
+            return
+        cleanup_lines = self.cleanup_candidate_lines(state)
+        if not cleanup_lines:
+            return
+        yielded: set[tuple[str, tuple[str, ...], str]] = set()
+        for line in sorted(cleanup_lines, key=lambda item: self.cleanup_line_rank(state, item)):
+            move = self.cleanup_front_segment(state, line)
+            if not move:
+                continue
+            target = self.common_target(move)
+            if target and not self.cleanup_target_should_cache(state, line, target):
+                key = (line, move, "target")
+                if key not in yielded:
+                    yielded.add(key)
+                    candidate = self.build_get_target_put_macro(
+                        state,
+                        line,
+                        move,
+                        reason_rank=-8,
+                        reason="macro_clear_route_blocker_target",
+                    )
+                    if candidate:
+                        yield candidate
+                        continue
+            key = (line, move, "cache")
+            if key in yielded:
+                continue
+            yielded.add(key)
+            yield from self.build_get_cache_macros(
+                state,
+                line,
+                move,
+                reason_rank=-7,
+                reason="macro_clear_route_blocker_cache",
+            )
+
+    def cleanup_line_rank(self, state: State, line: str) -> tuple[int, int, int, str]:
+        line_order = {
+            "存5线北": 0,
+            "存5线南": 1,
+            "存2线": 2,
+            "存3线": 3,
+            "存1线": 4,
+            "调梁线北": 5,
+            "预修线": 6,
+            "机走北": 7,
+            "机走棚": 8,
+        }
+        front = self.line_map(state).get(line, ())[:1]
+        target = self.target_by_no.get(front[0], "") if front else ""
+        target_deferred = 1 if target and self.cleanup_target_should_cache(state, line, target) else 0
+        return (line_order.get(line, 50), target_deferred, self.line_rank(line), line)
+
+    def cleanup_front_segment(self, state: State, line: str) -> tuple[str, ...]:
+        ordered = physical.line_access_order(self.cars_from_state(state), line, set(state.held))
+        if not ordered or ordered[0] not in self.managed_nos:
+            return ()
+        first = ordered[0]
+        first_target = self.target_by_no.get(first, "")
+        first_forced = bool(physical.force_positions(self.meta.get(first, {})))
+        move: list[str] = []
+        debt = self.debt_nos_in_state(state)
+        must_move = self.must_move_nos_in_state(state, self.managed_nos)
+        if first_target == line and first not in debt and first not in must_move:
+            return ()
+        useful = False
+        for no in ordered:
+            if no not in self.managed_nos:
+                break
+            if self.target_by_no.get(no, "") != first_target:
+                break
+            if bool(physical.force_positions(self.meta.get(no, {}))) != first_forced:
+                break
+            trial = (*state.held, *move, no)
+            if self.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            move.append(no)
+            if no in debt or no in must_move or line in self.route_cleanup_lines(state):
+                useful = True
+        return tuple(move) if move and useful else ()
+
+    def cleanup_target_should_cache(self, state: State, source_line: str, target: str) -> bool:
+        if not target or target == source_line:
+            return True
+        if self.service_target_deferred(state, target, self.service_rank_map(state)):
+            return True
+        if physical.is_spotting_line(target):
+            return not self.target_ready(state, target)
+        return False
 
     def service_sweep_macros(self, state: State) -> Iterable[MacroCandidate]:
         if state.held:
@@ -1545,6 +2043,189 @@ class Stage4Solver:
             if physical.force_positions(self.meta.get(no, {})):
                 targets.add(target)
         return tuple(sorted(targets, key=lambda line: (self.line_rank(line), line)))
+
+    def spotting_front_eject_macros(self, state: State) -> Iterable[MacroCandidate]:
+        if state.held:
+            return
+        for target in self.spotting_repack_targets(state):
+            if target != "调梁棚":
+                continue
+            if self.service_target_deferred(state, target, self.service_rank_map(state)):
+                continue
+            move = self.spotting_front_blocker_prefix(state, target)
+            if not move:
+                continue
+            candidate = self.build_service_sweep_macro(state, target, move)
+            if candidate:
+                yield MacroCandidate(
+                    ops=candidate.ops,
+                    state=candidate.state,
+                    score=(-6, *candidate.score),
+                    reason="macro_spotting_front_eject",
+                )
+
+    def spotting_front_blocker_prefix(self, state: State, target: str) -> tuple[str, ...]:
+        ordered = physical.line_access_order(self.cars_from_state(state), target, set(state.held))
+        if not ordered:
+            return ()
+        debt = self.debt_nos_in_state(state)
+        if not any(no in debt and self.target_by_no.get(no) == target for no in ordered):
+            return ()
+        move: list[str] = []
+        seen_blocker = False
+        for no in ordered:
+            if no not in self.managed_nos:
+                break
+            no_target = self.target_by_no.get(no, "")
+            if no_target == target:
+                break
+            trial = (*state.held, *move, no)
+            if self.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            move.append(no)
+            if no in debt or no_target:
+                seen_blocker = True
+        return tuple(move) if seen_blocker else ()
+
+    def spotting_local_search_macros(self, state: State) -> Iterable[MacroCandidate]:
+        if state.held:
+            return
+        for target in self.spotting_repack_targets(state):
+            if target != "调梁棚":
+                continue
+            if self.service_target_deferred(state, target, self.service_rank_map(state)):
+                continue
+            candidate = self.build_spotting_local_search_macro(state, target)
+            if candidate:
+                yield candidate
+
+    def build_spotting_local_search_macro(self, origin: State, target: str) -> MacroCandidate | None:
+        if origin.held or not physical.is_spotting_line(target):
+            return None
+        start_target_debt = self.managed_target_debt_count(origin, target)
+        if start_target_debt <= 0:
+            return None
+        best_progress: tuple[tuple[int, int, int, int], State, tuple[Op, ...]] | None = None
+        queue: list[tuple[tuple[int, int, int, int, int], int, State, tuple[Op, ...]]] = []
+        start_rank = self.spotting_local_rank(origin, target, ())
+        heapq.heappush(queue, (start_rank, 0, origin, ()))
+        best_cost: dict[State, tuple[int, int, int, int]] = {origin: (0, 0, 0, 0)}
+        sequence = 1
+        expanded = 0
+        while queue and expanded < MAX_SPOTTING_LOCAL_STATES and not self.deadline_reached():
+            _rank, _seq, state, ops = heapq.heappop(queue)
+            cost = self.ops_cost(ops)
+            if best_cost.get(state) != cost:
+                continue
+            if len(ops) > MAX_SPOTTING_LOCAL_DEPTH:
+                continue
+            target_debt = self.managed_target_debt_count(state, target)
+            if not state.held and target_debt == 0:
+                return self.make_macro_candidate(
+                    origin,
+                    ops,
+                    state,
+                    reason_rank=-6,
+                    reason="macro_spotting_local_repack_complete",
+                )
+            if not state.held and target_debt < start_target_debt:
+                progress_key = (target_debt, len(self.debt_nos_in_state(state)), cost[0], cost[2])
+                if best_progress is None or progress_key < best_progress[0]:
+                    best_progress = (progress_key, state, ops)
+            expanded += 1
+            for op, next_state, reject in self.local_spotting_neighbors(state, target):
+                if reject or next_state == state:
+                    continue
+                next_ops = (*ops, op)
+                if len(next_ops) > MAX_SPOTTING_LOCAL_DEPTH:
+                    continue
+                next_cost = self.ops_cost(next_ops)
+                if next_cost >= best_cost.get(next_state, (INF_COST, INF_COST, INF_COST, INF_COST)):
+                    continue
+                best_cost[next_state] = next_cost
+                heapq.heappush(
+                    queue,
+                    (self.spotting_local_rank(next_state, target, next_ops), sequence, next_state, next_ops),
+                )
+                sequence += 1
+        if best_progress is None:
+            return None
+        _progress_key, state, ops = best_progress
+        return self.make_macro_candidate(
+            origin,
+            ops,
+            state,
+            reason_rank=-5,
+            reason="macro_spotting_local_repack_progress",
+        )
+
+    def local_spotting_neighbors(self, state: State, target: str) -> Iterable[tuple[Op, State, str]]:
+        if state.held:
+            weigh = self.weigh_candidate(state)
+            if weigh is not None:
+                yield weigh
+            held_target = self.common_target(state.held)
+            if held_target:
+                if held_target == target or not self.service_target_deferred(state, held_target, self.service_rank_map(state)):
+                    yield self.apply_put(state, held_target, state.held, note="target")
+            for line in self.leaf_cache_lines(state, state.held)[:4]:
+                if line in state.loco:
+                    continue
+                yield self.apply_put(state, line, state.held, note="cache")
+            return
+
+        yielded: set[tuple[str, tuple[str, ...]]] = set()
+        lines = list(self.spotting_repack_relevant_lines(state, target))
+        for line in sorted(self.route_cleanup_lines(state), key=lambda item: self.cleanup_line_rank(state, item)):
+            if line not in lines:
+                lines.append(line)
+        for line in lines[:10]:
+            move = self.local_spotting_front_segment(state, line, target)
+            if not move:
+                continue
+            key = (line, move)
+            if key in yielded:
+                continue
+            yielded.add(key)
+            yield self.apply_get(state, line, move)
+
+    def local_spotting_front_segment(self, state: State, line: str, target: str) -> tuple[str, ...]:
+        line_map = self.line_map(state)
+        ordered = physical.line_access_order(self.cars_from_state(state), line, set(state.held))
+        if not ordered or ordered[0] not in self.managed_nos:
+            return ()
+        if line != target and not self.line_relevant_for_spotting_target(state, line_map.get(line, ()), target):
+            if line not in self.route_cleanup_lines(state):
+                return ()
+        target_debt = self.managed_target_debt_count(state, target)
+        if line == target and target_debt <= 0:
+            return ()
+        first = ordered[0]
+        first_target = self.target_by_no.get(first, "")
+        first_forced = bool(physical.force_positions(self.meta.get(first, {})))
+        move: list[str] = []
+        for no in ordered:
+            if no not in self.managed_nos:
+                break
+            if self.target_by_no.get(no, "") != first_target:
+                break
+            if bool(physical.force_positions(self.meta.get(no, {}))) != first_forced:
+                break
+            trial = (*state.held, *move, no)
+            if self.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            move.append(no)
+        return tuple(move)
+
+    def spotting_local_rank(self, state: State, target: str, ops: tuple[Op, ...]) -> tuple[int, int, int, int, int]:
+        cost = self.ops_cost(ops)
+        return (
+            self.managed_target_debt_count(state, target),
+            len(self.debt_nos_in_state(state)),
+            0 if not state.held else 1,
+            cost[0],
+            cost[2],
+        )
 
     def build_spotting_repack_macro(self, origin: State, target: str) -> MacroCandidate | None:
         state = origin
@@ -2407,6 +3088,8 @@ class Stage4Solver:
         debt = self.must_move_nos_in_state(state, managed)
         cleanup_lines = self.cleanup_candidate_lines(state) if allow_repair else set()
         for line in self.ordered_get_lines(state):
+            if self.cun5_get_deferred(state, line):
+                continue
             full_order = physical.line_access_order(cars, line, held_set)
             prefix: list[str] = []
             seen_debt = False
@@ -2446,6 +3129,11 @@ class Stage4Solver:
 
         return tuple(sorted((line for line, nos in line_map.items() if nos), key=key))
 
+    def cun5_get_deferred(self, state: State, line: str) -> bool:
+        if line != "存5线南":
+            return False
+        return bool(self.line_map(state).get("存5线北"))
+
     def useful_get_cuts(self, prefix: list[str]) -> tuple[int, ...]:
         cuts = {len(prefix)}
         for index in range(1, len(prefix)):
@@ -2470,7 +3158,7 @@ class Stage4Solver:
         for start in range(len(held)):
             move = held[start:]
             target = self.common_target(move)
-            if target and target not in BLOCKED_LINES:
+            if target and target not in BLOCKED_LINES and target not in STAGE4_EXCLUDED_LINES:
                 if start == 0 and target in state.loco:
                     continue
                 if start > 0 and target in state.loco:
@@ -2507,7 +3195,9 @@ class Stage4Solver:
                 continue
             if line in HIGH_CONFLICT_CACHE_LINES:
                 continue
-            if line in BLOCKED_LINES or line in RUNNING_LINES or line == STORE4:
+            if self.cache_line_blocks_pending_service(state, line):
+                continue
+            if line in BLOCKED_LINES or line in STAGE4_EXCLUDED_LINES or line in RUNNING_LINES or line == STORE4:
                 continue
             if line in physical.DEPOT_TARGET_LINES:
                 continue
@@ -2521,6 +3211,17 @@ class Stage4Solver:
                 continue
             out.append(line)
         return tuple(out)
+
+    def cache_line_blocks_pending_service(self, state: State, line: str) -> bool:
+        blocked_targets = CACHE_SERVICE_BLOCKING_TARGETS.get(line)
+        if not blocked_targets:
+            return False
+        pending_targets = {
+            self.target_by_no.get(no, "")
+            for no in self.active_debt_nos_in_state(state)
+            if self.target_by_no.get(no, "")
+        }
+        return bool(blocked_targets & pending_targets)
 
     def common_target(self, nos: tuple[str, ...]) -> str:
         if not nos:
@@ -2576,6 +3277,8 @@ class Stage4Solver:
         line_map = self.line_map(state)
         if not move:
             return Op("Get", line, move, (), state.held), state, "empty_get"
+        if line in STAGE4_EXCLUDED_LINES:
+            return Op("Get", line, move, (), state.held), state, f"stage4_excluded_get_line:{line}"
         cars = self.cars_from_state(state)
         if tuple(physical.line_access_order(cars, line, set(state.held))[: len(move)]) != move:
             return Op("Get", line, move, (), state.held), state, "get_order_violation"
@@ -2613,7 +3316,7 @@ class Stage4Solver:
     def apply_put(self, state: State, line: str, move: tuple[str, ...], *, note: str) -> tuple[Op, State, str]:
         if not move:
             return Op("Put", line, move, (), state.held, note), state, "empty_put"
-        if line in BLOCKED_LINES or line in RUNNING_LINES:
+        if line in BLOCKED_LINES or line in STAGE4_EXCLUDED_LINES or line in RUNNING_LINES:
             return Op("Put", line, move, (), state.held, note), state, f"target_blocked:{line}"
         if state.held[-len(move):] != move:
             return Op("Put", line, move, (), state.held, note), state, "put_tail_order_violation"
@@ -2626,13 +3329,18 @@ class Stage4Solver:
             return Op("Put", line, move, (), state.held, note), state, closed_door_reason
         if not self.line_has_capacity(state, line, move):
             return Op("Put", line, move, (), state.held, note), state, f"target_capacity_violation:{line}"
+        direction_reason = self.cun5_direction_put_reason(state, line, move)
+        if direction_reason:
+            return Op("Put", line, move, (), state.held, note), state, direction_reason
         route, reject = self.route(state, "Put", line, move)
         if reject:
             return Op("Put", line, move, (), state.held, note), state, reject
         line_map = dict(self.line_map(state))
         existing = tuple(no for no in line_map.get(line, ()) if no not in set(move))
         cars_before_put = self.cars_from_state(state)
-        put_positions = rv.forced_put_positions(cars_before_put, line, list(move))
+        put_positions = self.spotting_forced_put_positions(cars_before_put, line, move)
+        if not put_positions:
+            put_positions = rv.forced_put_positions(cars_before_put, line, list(move))
         if not put_positions:
             put_positions = {no: position for position, no in enumerate((*move, *existing), start=1)}
         next_positions = self.position_map(state)
@@ -2654,6 +3362,8 @@ class Stage4Solver:
             weighed=state.weighed,
         )
         projected = self.cars_from_state(next_state)
+        if not self.put_front_accessible(projected, line, move):
+            return Op("Put", line, move, route, state.held, note), state, f"put_not_front_accessible:{line}"
         if note == "cache" and not self.cache_front_accessible(projected, line, move):
             return Op("Put", line, move, route, state.held, note), state, f"cache_not_front_accessible:{line}"
         projected_unsatisfied = {
@@ -2673,6 +3383,78 @@ class Stage4Solver:
         if damage_reason:
             return Op("Put", line, move, route, state.held, note), state, damage_reason
         return Op("Put", line, move, route, next_state.held, note), next_state, ""
+
+    def put_front_accessible(self, cars: list[dict[str, Any]], line: str, move: tuple[str, ...]) -> bool:
+        if not move:
+            return False
+        ordered = tuple(physical.line_access_order(cars, line, set()))
+        return ordered[: len(move)] == move
+
+    def spotting_forced_put_positions(
+        self,
+        cars: list[dict[str, Any]],
+        line: str,
+        move: tuple[str, ...],
+    ) -> dict[str, int]:
+        if not physical.is_spotting_line(line):
+            return {}
+        moving = set(move)
+        batch = [self.meta[no] for no in move]
+        if not any(physical.force_positions(car) for car in batch):
+            return {}
+        total = rv.SPOTTING_TOTAL.get(line, 0)
+        if total <= 0:
+            return {}
+        occupied = {
+            int(car.get("Position") or 0)
+            for car in cars
+            if car["Line"] == line and rv.car_no(car) not in moving and int(car.get("Position") or 0) > 0
+        }
+        planned: dict[str, int] = {}
+        used = set(occupied)
+        forced_groups: dict[tuple[int, ...], list[str]] = {}
+        for no in move:
+            forced = tuple(position for position in physical.force_positions(self.meta[no]) if position > 0)
+            if forced:
+                forced_groups.setdefault(forced, []).append(no)
+        for forced, nos in sorted(forced_groups.items(), key=lambda item: (item[0], item[1])):
+            available = [position for position in forced if position not in used and 1 <= position <= total]
+            if len(available) < len(nos):
+                return {}
+            for no, position in zip(nos, available):
+                planned[no] = position
+                used.add(position)
+        next_position = 1
+        for no in move:
+            if no in planned:
+                continue
+            while next_position in used and next_position <= total:
+                next_position += 1
+            if next_position > total:
+                return {}
+            planned[no] = next_position
+            used.add(next_position)
+        return planned
+
+    def cun5_direction_put_reason(self, state: State, target: str, move: tuple[str, ...]) -> str:
+        moving = set(move)
+        line_map = self.line_map(state)
+        if target == "存5线南":
+            north_residual = [no for no in line_map.get("存5线北", ()) if no not in moving]
+            if north_residual:
+                return "cun5_south_target_deferred:存5线北_not_clear"
+        if target in CUN5_SOUTH_TARGETS:
+            for start in state.loco:
+                if start not in CUN5_DIRECTION_LINES:
+                    continue
+                residual = [no for no in line_map.get(start, ()) if no not in moving]
+                if residual:
+                    return f"cun5_direction_deferred:{start}->{target}"
+        if target in CUN5_NORTH_TARGETS and "存5线南" in state.loco:
+            north_residual = [no for no in line_map.get("存5线北", ()) if no not in moving]
+            if north_residual:
+                return f"cun5_north_approach_deferred:存5线南->{target}"
+        return ""
 
     def cache_front_accessible(self, cars: list[dict[str, Any]], line: str, move: tuple[str, ...]) -> bool:
         if not move:
@@ -2719,7 +3501,8 @@ class Stage4Solver:
             moving = set(state.held)
             train_len = self.length(state.held)
             target_approach = physical.route_approach_lines_for_put(line, cars, moving)
-        occupied = physical.occupied_lines_for_route(cars, moving) | BLOCKED_LINES
+        blocked = BLOCKED_LINES | STAGE4_EXCLUDED_LINES
+        occupied = physical.occupied_lines_for_route(cars, moving) | blocked
         train_bucket = round(train_len, 1)
         cache_key = (
             action,
@@ -2750,7 +3533,7 @@ class Stage4Solver:
                 moving_nos=moving,
                 train_length_m=train_len,
             )
-            if path and not (set(path) & BLOCKED_LINES):
+            if path and not (set(path) & blocked):
                 choices.append((len(path), tuple(path)))
             else:
                 blockers.append(f"{start}->{line}")
@@ -3075,7 +3858,7 @@ class Stage4Solver:
     ) -> bool:
         del state
         line_map = line_map or {}
-        if line in BLOCKED_LINES or line in RUNNING_LINES or line in OUT_OF_SCOPE_STRATEGY_LINES:
+        if line in BLOCKED_LINES or line in STAGE4_EXCLUDED_LINES or line in RUNNING_LINES or line in OUT_OF_SCOPE_STRATEGY_LINES:
             return False
         if line not in rv.TRACK_LEN:
             return False
@@ -3089,7 +3872,12 @@ class Stage4Solver:
         seen_requests: set[tuple[str, str]] = set()
 
         def add(blocker_line: str, reason: str) -> None:
-            if blocker_line in BLOCKED_LINES or blocker_line in RUNNING_LINES or blocker_line in OUT_OF_SCOPE_STRATEGY_LINES:
+            if (
+                blocker_line in BLOCKED_LINES
+                or blocker_line in STAGE4_EXCLUDED_LINES
+                or blocker_line in RUNNING_LINES
+                or blocker_line in OUT_OF_SCOPE_STRATEGY_LINES
+            ):
                 return
             if not blocker_line or blocker_line not in rv.TRACK_LEN:
                 return
@@ -3152,7 +3940,8 @@ class Stage4Solver:
     ) -> tuple[tuple[str, ...], str]:
         cars = self.cars_from_state(state)
         moving = set(state.held) | set(moving_nos)
-        occupied = physical.occupied_lines_for_get_route(cars, moving, line) | BLOCKED_LINES
+        blocked = BLOCKED_LINES | STAGE4_EXCLUDED_LINES
+        occupied = physical.occupied_lines_for_get_route(cars, moving, line) | blocked
         train_length = self.length(state.held)
         for start in state.loco:
             available = self.graph.route_avoiding_occupied(
@@ -3165,7 +3954,7 @@ class Stage4Solver:
                 moving_nos=moving,
                 train_length_m=train_length,
             )
-            if available and not (set(available) & BLOCKED_LINES):
+            if available and not (set(available) & blocked):
                 return (), "open"
 
         endpoints = {line, *state.loco}
@@ -3209,7 +3998,8 @@ class Stage4Solver:
         if not target:
             return ()
         cars = self.cars_from_state(state)
-        occupied = physical.occupied_lines_for_route(cars, moving_nos) | BLOCKED_LINES
+        blocked = BLOCKED_LINES | STAGE4_EXCLUDED_LINES
+        occupied = physical.occupied_lines_for_route(cars, moving_nos) | blocked
         train_length = self.length(moving_nos)
         target_approach = physical.route_approach_lines_for_put(target, cars, moving_nos)
         for start in starts:
@@ -3223,7 +4013,7 @@ class Stage4Solver:
                 moving_nos=moving_nos,
                 train_length_m=train_length,
             )
-            if available and not (set(available) & BLOCKED_LINES):
+            if available and not (set(available) & blocked):
                 return ()
 
         endpoints = {*starts, target}
@@ -3243,7 +4033,7 @@ class Stage4Solver:
         paths: list[list[str]] = []
         for start in state.loco:
             if not approaches:
-                route = self.graph.route(start, line)
+                route = self.graph.route_avoiding_occupied(start, line, STAGE4_EXCLUDED_LINES)
                 if route:
                     paths.append(route)
                 continue
@@ -3251,7 +4041,7 @@ class Stage4Solver:
                 if approach == start:
                     paths.append([start, line])
                     continue
-                route = self.graph.route_avoiding_occupied(start, approach, {line})
+                route = self.graph.route_avoiding_occupied(start, approach, {line} | STAGE4_EXCLUDED_LINES)
                 if route:
                     paths.append([*route, line])
         return paths
@@ -3260,14 +4050,14 @@ class Stage4Solver:
         cars = self.cars_from_state(state)
         approaches = sorted(physical.route_approach_lines_for_put(target, cars, set()))
         if not approaches:
-            route = self.graph.route(source, target)
+            route = self.graph.route_avoiding_occupied(source, target, STAGE4_EXCLUDED_LINES)
             return [route] if route else []
         paths: list[list[str]] = []
         for approach in approaches:
             if approach == source:
                 paths.append([source, target])
                 continue
-            route = self.graph.route_avoiding_occupied(source, approach, {target})
+            route = self.graph.route_avoiding_occupied(source, approach, {target} | STAGE4_EXCLUDED_LINES)
             if route:
                 paths.append([*route, target])
         return paths
@@ -3421,6 +4211,7 @@ class Stage4Solver:
             "active_nos": sorted(self.active_nos),
             "repair_nos": sorted(self.repair_nos),
             "out_of_scope_count": len(self.out_of_scope_nos),
+            "excluded_line_count": len(self.excluded_line_nos),
             "lower_bound_initial": self.lower_bound_initial,
             "best_solution_operations": len(chosen.ops),
             "best_solution_business_hooks": sum(1 for op in chosen.ops if op.action in {"Get", "Put"}),

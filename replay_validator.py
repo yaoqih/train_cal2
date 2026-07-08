@@ -341,6 +341,40 @@ def apply_get(cars: list[dict[str, Any]], line: str, move: list[str]) -> None:
 
 def forced_put_positions(cars: list[dict[str, Any]], line: str, move: list[str]) -> dict[str, int]:
     by = {car_no(c): c for c in cars}
+    if line in SPOTTING_TOTAL and any((by.get(no) or {}).get("_Force") for no in move):
+        total = SPOTTING_TOTAL.get(line, 0)
+        old_pos = {
+            int(c["Position"])
+            for c in cars
+            if c["Line"] == line and car_no(c) not in set(move) and int(c["Position"]) > 0
+        }
+        used, pos = set(old_pos), {}
+        forced_groups: dict[tuple[int, ...], list[str]] = defaultdict(list)
+        for no in move:
+            c = by.get(no)
+            if not c or line not in c["TargetLines"]:
+                return {}
+            forced = tuple(int(p) for p in c.get("_Force") or () if int(p) > 0)
+            if forced:
+                forced_groups[forced].append(no)
+        for forced, nos in sorted(forced_groups.items(), key=lambda item: (item[0], item[1])):
+            free = [p for p in forced if p not in used and 1 <= p <= total]
+            if len(free) < len(nos):
+                return {}
+            for no, p in zip(nos, free):
+                pos[no] = p
+                used.add(p)
+        next_pos = 1
+        for no in move:
+            if no in pos:
+                continue
+            while next_pos in used and next_pos <= total:
+                next_pos += 1
+            if next_pos > total:
+                return {}
+            pos[no] = next_pos
+            used.add(next_pos)
+        return pos
     old_pos = {int(c["Position"]) for c in cars if c["Line"] == line and car_no(c) not in set(move)}
     used, pos = set(old_pos), {}
     for no in move:

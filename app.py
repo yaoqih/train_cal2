@@ -25,9 +25,9 @@ DEFAULT_EVAL_ARTIFACT = (
     / "l7_phase1234_truth_phase3_tail_run_preflight_20260614.json"
 )
 DEFAULT_STAGE1_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage1_simple_goal_verify"
-DEFAULT_STAGE2_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage2_simple_final"
-DEFAULT_STAGE3_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage3_speed_full_current"
-DEFAULT_STAGE4_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage4_simple_eval_current"
+DEFAULT_STAGE2_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage2_defer_nonheavy_full"
+DEFAULT_STAGE3_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage3_defer_current"
+DEFAULT_STAGE4_SIMPLE_DIR = ROOT_DIR / "artifacts" / "stage4_defer_current"
 _VNEXT_RUNTIME_CACHE = None
 P10_BUSINESS_HOOK_ACTIONS = {"Get", "Put"}
 SOLVER_VNEXT = "vNext 求解器"

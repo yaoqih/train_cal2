@@ -31,6 +31,7 @@ DEFAULT_ALLOW_DEPOT_IN_BUFFER = False
 DEFAULT_BUFFER_LINES = DEPOT_OUT
 STORE4 = "存4线"
 UNWHEEL = "卸轮线"
+PAINT = "油漆线"
 TAG_C4 = "C4"
 TAG_OFF = "OFF"
 TAG_OUT = "OUT"
@@ -124,6 +125,7 @@ class Stage2Solver:
         self.initial_loco = final_loco_after_response(request, stage1_response)
         self.meta = {rv.car_no(car): dict(car) for car in self.initial_cars}
         self.tags = {no: self.classify(car) for no, car in self.meta.items()}
+        self.deferred_store4_nos = self.defer_store4_over_pull_limit()
         self.active_nos = {no for no, tag in self.tags.items() if tag != TAG_STAY}
         self.graph = physical.TrackGraph()
         self.started_at = time.monotonic()
@@ -140,6 +142,8 @@ class Stage2Solver:
         targets = set(car.get("TargetLines") or [])
         if UNWHEEL in targets and line != UNWHEEL:
             return TAG_U
+        if PAINT in targets and line in set(SOURCE_LINES):
+            return TAG_OUT
         if STORE4 in targets and line in set(SOURCE_LINES):
             return TAG_C4
         if targets & set(DEPOT_OUT) and line in set(SOURCE_LINES):
@@ -147,6 +151,51 @@ class Stage2Solver:
         if line in set(SOURCE_LINES) and not (targets & set(DEPOT_IN)) and UNWHEEL not in targets:
             return TAG_OFF
         return TAG_STAY
+
+    def defer_store4_over_pull_limit(self) -> list[str]:
+        final_nos = [
+            no for no, tag in self.tags.items()
+            if tag in {TAG_C4, TAG_OFF} and self.meta[no]["Line"] != STORE4
+        ]
+        excess = self.pull_equivalent(final_nos) - rv.PULL_LIMIT
+        if excess <= 0:
+            return []
+        line_order: dict[str, tuple[str, ...]] = {}
+        for car in sorted(self.initial_cars, key=lambda item: (item["Line"], int(item.get("Position") or 0), rv.car_no(item))):
+            line_order.setdefault(car["Line"], tuple())
+            line_order[car["Line"]] = (*line_order[car["Line"]], rv.car_no(car))
+
+        final_set = set(final_nos)
+
+        def blocked_after(no: str) -> int:
+            line = self.meta[no]["Line"]
+            ordered = line_order.get(line, ())
+            if no not in ordered:
+                return 0
+            index = ordered.index(no)
+            return sum(1 for other in ordered[index + 1:] if other in final_set and self.tags.get(other) != TAG_OUT)
+
+        def rank(no: str) -> tuple[int, int, int, str]:
+            # Prefer cars that do not block later required cars; then prefer
+            # non-heavy C4 cars. Heavy C4 cars are deferred only if ordinary
+            # C4 cars cannot reduce the final pull equivalent to <= 20.
+            line = self.meta[no]["Line"]
+            ordered = line_order.get(line, ())
+            position = ordered.index(no) + 1 if no in ordered else 0
+            return (blocked_after(no), int(bool(self.meta[no].get("IsHeavy"))), -position, no)
+
+        selected: list[str] = []
+        candidates = [
+            no for no in final_nos
+            if self.tags.get(no) == TAG_C4 and not self.meta[no].get("IsClosedDoor")
+        ]
+        for no in sorted(candidates, key=rank):
+            self.tags[no] = TAG_OUT
+            selected.append(no)
+            excess -= self.pull_equivalent((no,))
+            if excess <= 0:
+                break
+        return selected
 
     def solve(self) -> dict[str, Any]:
         early = self.early_partial()
@@ -1161,6 +1210,7 @@ class Stage2Solver:
             "operations": op_count,
             "business_hooks": sum(1 for row in rv.operations(response) if row.get("Action") in {"Get", "Put"}),
             "stage2_debt": stage2_debt,
+            "deferred_store4_nos": list(self.deferred_store4_nos),
             "flex_out_positions": flex_out_positions,
             "flex_out_in_store4": [
                 item["car_no"]
@@ -1439,6 +1489,11 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         for item in summaries
         for no in item.get("flex_out_in_store4") or []
     ]
+    deferred_store4 = [
+        no
+        for item in summaries
+        for no in item.get("deferred_store4_nos") or []
+    ]
     reasons = Counter(
         reason.split(":", 1)[0]
         for item in summaries
@@ -1455,6 +1510,8 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
         "flex_out_final_lines": dict(flex_out_lines.most_common()),
         "flex_out_in_store4_count": len(flex_out_in_store4),
         "flex_out_in_store4": flex_out_in_store4,
+        "deferred_store4_count": len(deferred_store4),
+        "deferred_store4_nos": deferred_store4,
         "summaries": summaries,
     }
 

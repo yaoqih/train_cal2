@@ -49,21 +49,77 @@ CACHE_LINES = (
     "抛丸线",
 )
 STORAGE_CACHE_LINES = {"存1线", "存2线", "存3线", "存5线北", "存5线南"}
-REAL_TARGET_STATIC_LINES = {"机库线", "预修线", "油漆线", "洗罐站", "抛丸线"}
+REAL_TARGET_STATIC_LINES = {"机库线", "预修线", "油漆线", "洗罐站", "抛丸线", "调梁棚"}
 STAGE3_TEMPLATE_B_ORDER = ("机走北", "机走棚", "洗油北", "机南")
 STAGE3_TEMPLATE_A_FIRST_ORDER = ("机走北", "机走棚", "机南")
 STAGE3_TEMPLATE_A_SECOND_LINE = "洗油北"
 STAGE4_IGNORED_TARGET_LINES = physical.DEPOT_TARGET_LINES | {"卸轮线"}
 HIGH_VALUE_STAGE4_TARGETS = {"预修线", "调梁棚", "调梁线北"}
-DIRECT_DELIVERY_TARGETS = ("油漆线", "抛丸线", "洗罐站", "预修线")
+DIRECT_DELIVERY_TARGETS = ("机库线", "油漆线", "抛丸线", "洗罐站", "预修线", "调梁棚")
 DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN = 10
 DIRECT_DELIVERY_PRIORITY_MIN_BATCH = 2
+STAGE4_EARLY_RELEASE_TARGETS = (
+    "抛丸线",
+    "洗罐站",
+    "洗罐线北",
+    "油漆线",
+    "调梁棚",
+    "机库线",
+)
+STAGE4_EARLY_RELEASE_SOURCE_LINES = (
+    "存5线北",
+    "存5线南",
+    "存3线",
+    "存2线",
+    "存1线",
+    "调梁棚",
+    "预修线",
+    "卸轮线",
+    "油漆线",
+    "洗罐线北",
+    "洗罐站",
+    "抛丸线",
+    "机库线",
+    "机走棚",
+    "机走北",
+    "洗油北",
+)
+STAGE4_EARLY_RELEASE_MAX_STATIC_ROUTE_LEN = 12
+SATISFIED_RETURN_MAX_HOOKS = 2
+STAGE4_LAYOUT_QUALITY_BASE_LINES = (
+    "洗罐站",
+    "油漆线",
+    "调梁棚",
+    "存1线",
+    "存2线",
+    "存3线",
+    "存5线南",
+    "存5线北",
+)
+STAGE4_LAYOUT_QUALITY_CONDITIONAL_LINES = ("机库线",)
+STAGE4_CACHE_GROUP_TARGETS = {
+    "机库线",
+    "预修线",
+    "油漆线",
+    "洗罐站",
+    "抛丸线",
+    "调梁棚",
+    "调梁线北",
+    "机走棚",
+    "存1线",
+    "存2线",
+    "存3线",
+    "存5线南",
+}
+STAGE4_CACHE_GROUP_LINES = ("存5线北", "存3线", "存2线", "存1线", "存5线南")
 PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
     "baseline": {
         "downstream": False,
         "target_aware": False,
         "direct_delivery": False,
         "direct_delivery_max_hooks": 0,
+        "early_release": False,
+        "early_release_max_hooks": 0,
         "quality_order": "none",
     },
     "balanced": {
@@ -71,6 +127,8 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": True,
         "direct_delivery": True,
         "direct_delivery_max_hooks": 5,
+        "early_release": True,
+        "early_release_max_hooks": 4,
         "quality_order": "balanced",
     },
     "stage3": {
@@ -78,6 +136,8 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": True,
         "direct_delivery": True,
         "direct_delivery_max_hooks": 5,
+        "early_release": True,
+        "early_release_max_hooks": 4,
         "quality_order": "stage3",
     },
     "stage4": {
@@ -85,6 +145,8 @@ PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
         "target_aware": True,
         "direct_delivery": True,
         "direct_delivery_max_hooks": 5,
+        "early_release": True,
+        "early_release_max_hooks": 4,
         "quality_order": "stage4",
     },
 }
@@ -137,6 +199,11 @@ class Stage1Solver:
         self.validation_cache: dict[tuple[str, str], physical.PhysicalValidation] = {}
         self.profile = profile
         self.downstream_quality_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self.initial_stage4_satisfied_nos = {
+            physical.car_no(car)
+            for car in self.cars
+            if self.stage4_target_key(car) and self.target_satisfied(car)
+        }
 
     def solve(self) -> dict[str, Any]:
         no_progress_streak = 0
@@ -145,6 +212,10 @@ class Stage1Solver:
         while self.hook_index <= self.max_hooks:
             before = self.stage1_debt()
             if before["complete"]:
+                if self.try_satisfied_return_cleanup(before):
+                    no_progress_streak = 0
+                    stale_best_streak = 0
+                    continue
                 break
             if self.time_exhausted():
                 self.trace.append({
@@ -592,6 +663,47 @@ class Stage1Solver:
             ordered.append(view)
         return ordered
 
+    def try_satisfied_return_cleanup(self, debt: dict[str, Any]) -> bool:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return False
+        if debt["pollution_nos"]:
+            return False
+        if self.satisfied_return_hooks_used() >= SATISFIED_RETURN_MAX_HOOKS:
+            return False
+        views = sorted(self.satisfied_return_candidates(debt), key=lambda item: item.score)
+        rejected: list[dict[str, Any]] = []
+        for view in views:
+            if self.time_exhausted():
+                return False
+            validation = self.validate_candidate(view.candidate)
+            if not validation.accepted:
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": list(validation.reasons),
+                })
+                continue
+            probe = self.probe_after(view.candidate, validation)
+            after_debt = probe.stage1_debt()
+            if not after_debt["complete"]:
+                rejected.append({
+                    "candidate_id": view.candidate.candidate_id,
+                    "reason": view.reason,
+                    "violations": ["satisfied_return_reopens_stage1_debt"],
+                })
+                continue
+            accepted = self.accept_candidate(view, validation, after_debt, debt, rejected)
+            self.trace[-1]["post_stage1_cleanup"] = True
+            return accepted
+        return False
+
+    def satisfied_return_hooks_used(self) -> int:
+        return sum(
+            1
+            for item in self.trace
+            if str(item.get("reason") or "").startswith("stage1_satisfied_return:")
+        )
+
     def accept_candidate(
         self,
         view: CandidateView,
@@ -713,6 +825,7 @@ class Stage1Solver:
         clone.validation_cache = self.validation_cache
         clone.profile = self.profile
         clone.downstream_quality_cache = self.downstream_quality_cache
+        clone.initial_stage4_satisfied_nos = set(self.initial_stage4_satisfied_nos)
         return clone
 
     def clone_car(self, car: dict[str, Any]) -> dict[str, Any]:
@@ -757,7 +870,9 @@ class Stage1Solver:
         candidates.extend(self.route_blocker_candidates(debt))
         candidates.extend(self.cleanup_candidates(debt))
         candidates.extend(self.release_gate_candidates(debt))
+        candidates.extend(self.satisfied_return_candidates(debt))
         candidates.extend(self.direct_delivery_candidates(debt))
+        candidates.extend(self.stage4_early_release_candidates(debt))
         unique: dict[str, CandidateView] = {}
         for item in candidates:
             unique.setdefault(item.candidate.candidate_id, item)
@@ -877,6 +992,66 @@ class Stage1Solver:
                     candidate,
                     self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=4),
                     f"stage1_direct_delivery:{target}",
+                )
+
+    def stage4_early_release_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
+        if not PROFILE_CONFIGS[self.profile].get("early_release"):
+            return
+        if self.stage4_early_release_hooks_used() >= int(PROFILE_CONFIGS[self.profile]["early_release_max_hooks"]):
+            return
+        if debt["pollution_nos"]:
+            return
+        ready_targets = {
+            target: self.stage4_early_release_target_ready(target)
+            for target in STAGE4_EARLY_RELEASE_TARGETS
+        }
+        if not any(ready_targets.values()):
+            return
+        by_no = self.by_no()
+        source_lines = [line for line in STAGE4_EARLY_RELEASE_SOURCE_LINES if any(car["Line"] == line for car in self.cars)]
+        for line in source_lines:
+            if line in FORBIDDEN_LINES:
+                continue
+            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            if not ordered:
+                continue
+            target = ""
+            max_batch: list[dict[str, Any]] = []
+            for car in ordered:
+                car_target = self.stage4_early_release_target_for_car(car)
+                if not car_target or car_target == line or not ready_targets.get(car_target):
+                    break
+                if target and car_target != target:
+                    break
+                trial = [*max_batch, car]
+                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                    break
+                target = car_target
+                max_batch = trial
+                if car.get("IsWeigh") and not car.get("_Weighed"):
+                    break
+            if not target or not max_batch:
+                continue
+            for batch in self.prefix_options(max_batch):
+                if not self.stage4_early_release_batch_allowed(target, batch):
+                    continue
+                if not self.target_allowed(target, batch):
+                    continue
+                if not self.stage4_early_release_route_low_cost(line, target):
+                    continue
+                candidate = self.make_candidate(
+                    source=line,
+                    target=target,
+                    batch=batch,
+                    kind="vnext_stage1_direct_delivery",
+                    reason=f"stage1_early_release:{target}",
+                )
+                if not candidate:
+                    continue
+                yield CandidateView(
+                    candidate,
+                    self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=4),
+                    f"stage1_early_release:{target}",
                 )
 
     def blocker_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
@@ -1156,6 +1331,55 @@ class Stage1Solver:
                         "release_gate_assembly",
                     )
 
+    def satisfied_return_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return
+        if debt["pollution_nos"]:
+            return
+        by_no = self.by_no()
+        for line in self.active_lines():
+            if line in FORBIDDEN_LINES or line in ASSEMBLY_ALL:
+                continue
+            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            if not ordered:
+                continue
+            target = ""
+            max_batch: list[dict[str, Any]] = []
+            for car in ordered:
+                car_target = self.satisfied_return_target_for_car(car)
+                if not car_target or car_target == line:
+                    break
+                if target and car_target != target:
+                    break
+                if not self.real_target_ready(car_target):
+                    break
+                trial = [*max_batch, car]
+                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+                    break
+                target = car_target
+                max_batch = trial
+            if not target or not max_batch:
+                continue
+            for batch in self.prefix_options(max_batch):
+                if not all(self.satisfied_return_target_for_car(car) == target for car in batch):
+                    continue
+                if not self.target_allowed(target, batch):
+                    continue
+                candidate = self.make_candidate(
+                    source=line,
+                    target=target,
+                    batch=batch,
+                    kind="vnext_stage1_satisfied_return",
+                    reason=f"stage1_satisfied_return:{target}",
+                )
+                if not candidate:
+                    continue
+                yield CandidateView(
+                    candidate,
+                    self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=3),
+                    f"stage1_satisfied_return:{target}",
+                )
+
     def blocker_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
         targets: list[str] = []
         direct = self.common_current_target(batch)
@@ -1163,11 +1387,31 @@ class Stage1Solver:
             direct
             and direct not in FORBIDDEN_LINES
             and direct != source
+            and self.stage1_real_target_available(direct)
             and not self.would_pollute_stage_boundary(direct, batch)
         ):
             targets.append(direct)
+        targets.extend(self.grouped_cache_targets(batch, source=source, debt=debt))
         targets.extend(self.safe_temp_targets(source=source, debt=debt))
         return list(dict.fromkeys(targets))
+
+    def grouped_cache_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return []
+        target = self.common_stage4_cache_target(batch)
+        if not target:
+            return []
+        blocked_lines = set(debt["lines_with_pending_stage1"])
+        moving_nos = {physical.car_no(car) for car in batch}
+        ranked: list[tuple[tuple[int, int, int, int, int], str]] = []
+        for line in STAGE4_CACHE_GROUP_LINES:
+            if line == source or line in blocked_lines or line in FORBIDDEN_LINES:
+                continue
+            if not self.target_allowed(line, batch):
+                continue
+            ranked.append((self.cache_line_rank_for_target(line, target, moving_nos), line))
+        ranked.sort()
+        return [line for _rank, line in ranked]
 
     def safe_temp_targets(self, *, source: str, debt: dict[str, Any]) -> list[str]:
         blocked_lines = set(debt["lines_with_pending_stage1"])
@@ -1193,6 +1437,45 @@ class Stage1Solver:
             if car.get("IsWeigh") and not car.get("_Weighed"):
                 break
         return [prefix[:size] for size in range(len(prefix), 0, -1)]
+
+    def common_stage4_cache_target(self, batch: list[dict[str, Any]]) -> str:
+        targets: list[str] = []
+        for car in batch:
+            if self.stage1_goal(car):
+                return ""
+            target = self.stage4_target_key(car)
+            if target not in STAGE4_CACHE_GROUP_TARGETS:
+                return ""
+            targets.append(target)
+        return targets[0] if targets and all(target == targets[0] for target in targets) else ""
+
+    def cache_line_rank_for_target(
+        self,
+        line: str,
+        target: str,
+        moving_nos: set[str],
+    ) -> tuple[int, int, int, int, int]:
+        existing_targets = [
+            self.stage4_target_key(car)
+            for car in self.cars
+            if car["Line"] == line
+            and physical.car_no(car) not in moving_nos
+            and self.is_stage4_debt(car)
+        ]
+        target_types = {item for item in existing_targets if item}
+        if not existing_targets:
+            group_state = 2
+        elif target_types == {target}:
+            group_state = 0
+        elif target in target_types:
+            group_state = 1
+        else:
+            group_state = 3
+        new_target_type = 0 if target in target_types or not target_types else 1
+        mixed_count = len(target_types - {target})
+        current_load = len(existing_targets)
+        storage_bias = STAGE4_CACHE_GROUP_LINES.index(line) if line in STAGE4_CACHE_GROUP_LINES else 99
+        return (group_state, new_target_type, mixed_count, current_load, storage_bias)
 
     def make_candidate(
         self,
@@ -1241,7 +1524,9 @@ class Stage1Solver:
             reason_rank,
             self.tail_target_rank(candidate),
             self.real_target_static_rank(candidate),
+            self.cache_group_rank(candidate),
             self.candidate_target_rank(candidate),
+            self.satisfied_break_penalty(candidate),
             -moved_g,
             -moved_x if moved_g == 0 else moved_x,
             self.route_price(candidate),
@@ -1273,6 +1558,8 @@ class Stage1Solver:
         moving_nos = set(candidate.move_car_nos)
         if not moving_nos:
             return False
+        if not self.stage1_real_target_available(candidate.target_line):
+            return False
         by_no = self.by_no()
         moved = [by_no[no] for no in candidate.move_car_nos if no in by_no]
         if len(moved) != len(candidate.move_car_nos):
@@ -1289,9 +1576,15 @@ class Stage1Solver:
         return all(self.target_satisfied(car) and not physical.force_positions(car) for car in existing)
 
     def safe_static_real_target_put(self, candidate: physical.HookCandidate) -> bool:
-        if candidate.candidate_kind != "blocker_relocation":
+        if candidate.candidate_kind not in {
+            "blocker_relocation",
+            "vnext_stage1_direct_delivery",
+            "vnext_stage1_satisfied_return",
+        }:
             return False
         if candidate.target_line not in REAL_TARGET_STATIC_LINES:
+            return False
+        if not self.stage1_real_target_available(candidate.target_line):
             return False
         if not self.clean_real_target_put(candidate):
             return False
@@ -1375,6 +1668,37 @@ class Stage1Solver:
         hot = {"渡10", "联7", "机北1", "机北2", "预修线", "调梁线北", "存5线北"}
         return len(static) + sum(3 for line in static if line in hot)
 
+    def satisfied_break_penalty(self, candidate: physical.HookCandidate) -> int:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return 0
+        by_no = self.by_no()
+        penalty = 0
+        for no in candidate.move_car_nos:
+            car = by_no.get(no)
+            if not car or not self.protected_satisfied_car(car):
+                continue
+            if self.stage4_target_line_satisfied_by(car, candidate.target_line):
+                continue
+            penalty += 1
+        return penalty
+
+    def protected_satisfied_car(self, car: dict[str, Any]) -> bool:
+        if car["Line"] in ASSEMBLY_DEPOT:
+            return False
+        return bool(self.stage4_target_key(car)) and self.target_satisfied(car)
+
+    def cache_group_rank(self, candidate: physical.HookCandidate) -> tuple[int, int, int, int, int]:
+        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+            return (0, 0, 0, 0, 0)
+        if candidate.target_line not in CACHE_LINES:
+            return (0, 0, 0, 0, 0)
+        by_no = self.by_no()
+        batch = [by_no[no] for no in candidate.move_car_nos if no in by_no]
+        target = self.common_stage4_cache_target(batch)
+        if not target:
+            return (9, 0, 0, 0, 0)
+        return self.cache_line_rank_for_target(candidate.target_line, target, set(candidate.move_car_nos))
+
     def direct_delivery_target_for_car(self, car: dict[str, Any]) -> str:
         if self.stage1_goal(car) or self.target_satisfied(car):
             return ""
@@ -1384,15 +1708,53 @@ class Stage1Solver:
             return ""
         targets = set(car.get("TargetLines") or ())
         for target in DIRECT_DELIVERY_TARGETS:
+            if not self.stage1_real_target_available(target):
+                continue
             if target in targets and self.stage4_target_line_satisfied_by(car, target):
                 return target
         return ""
 
+    def satisfied_return_target_for_car(self, car: dict[str, Any]) -> str:
+        no = physical.car_no(car)
+        if no not in self.initial_stage4_satisfied_nos:
+            return ""
+        if self.stage1_goal(car) or self.target_satisfied(car):
+            return ""
+        if physical.force_positions(car):
+            return ""
+        target = self.stage4_target_key(car)
+        if target not in REAL_TARGET_STATIC_LINES:
+            return ""
+        if not self.stage1_real_target_available(target):
+            return ""
+        return target if self.stage4_target_line_satisfied_by(car, target) else ""
+
     def direct_delivery_target_ready(self, target: str) -> bool:
         if target not in DIRECT_DELIVERY_TARGETS:
             return False
+        if not self.stage1_real_target_available(target):
+            return False
+        return self.real_target_ready(target)
+
+    def real_target_ready(self, target: str) -> bool:
+        if not self.stage1_real_target_available(target):
+            return False
         existing = [car for car in self.cars if car["Line"] == target]
         return all(self.target_satisfied(car) and not physical.force_positions(car) for car in existing)
+
+    def stage1_real_target_available(self, target: str) -> bool:
+        if target != physical.WEIGH_LINE:
+            return True
+        return not self.has_pending_weigh_cars()
+
+    def has_pending_weigh_cars(self) -> bool:
+        return any(self.pending_weigh(car) for car in self.cars)
+
+    def pending_weigh_count(self) -> int:
+        return sum(1 for car in self.cars if self.pending_weigh(car))
+
+    def pending_weigh(self, car: dict[str, Any]) -> bool:
+        return bool(car.get("IsWeigh")) and not bool(car.get("_Weighed"))
 
     def direct_delivery_batch_allowed(self, target: str, batch: list[dict[str, Any]]) -> bool:
         if not batch:
@@ -1402,6 +1764,39 @@ class Stage1Solver:
     def direct_delivery_route_low_cost(self, source: str, target: str) -> bool:
         route = self.graph.route(source, target)
         return bool(route and len(route) <= DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN)
+
+    def stage4_early_release_target_for_car(self, car: dict[str, Any]) -> str:
+        if self.stage1_goal(car) or self.target_satisfied(car):
+            return ""
+        if physical.force_positions(car):
+            return ""
+        if car.get("IsWeigh") and not car.get("_Weighed"):
+            return ""
+        targets = set(car.get("TargetLines") or ())
+        for target in STAGE4_EARLY_RELEASE_TARGETS:
+            if target not in targets:
+                continue
+            if not self.stage4_early_release_target_ready(target):
+                continue
+            if self.stage4_target_line_satisfied_by(car, target):
+                return target
+        return ""
+
+    def stage4_early_release_target_ready(self, target: str) -> bool:
+        if target not in STAGE4_EARLY_RELEASE_TARGETS:
+            return False
+        if not self.stage1_real_target_available(target):
+            return False
+        return self.real_target_ready(target)
+
+    def stage4_early_release_batch_allowed(self, target: str, batch: list[dict[str, Any]]) -> bool:
+        if not batch:
+            return False
+        return all(self.stage4_early_release_target_for_car(car) == target for car in batch)
+
+    def stage4_early_release_route_low_cost(self, source: str, target: str) -> bool:
+        route = self.graph.route(source, target)
+        return bool(route and len(route) <= STAGE4_EARLY_RELEASE_MAX_STATIC_ROUTE_LEN)
 
     def is_direct_delivery_candidate(self, candidate: physical.HookCandidate) -> bool:
         return candidate.candidate_kind == "vnext_stage1_direct_delivery"
@@ -1425,11 +1820,23 @@ class Stage1Solver:
             if str(item.get("reason") or "").startswith("stage1_direct_delivery:")
         )
 
+    def stage4_early_release_hooks_used(self) -> int:
+        return sum(
+            1
+            for item in self.trace
+            if str(item.get("reason") or "").startswith("stage1_early_release:")
+        )
+
     def downstream_quality_tuple(self) -> tuple[int, ...]:
         if not PROFILE_CONFIGS[self.profile]["downstream"]:
             return ()
         quality = self.downstream_quality()
         order = PROFILE_CONFIGS[self.profile]["quality_order"]
+        layout = (
+            quality["stage4_extra_target_fragment_count"],
+            quality["stage4_target_run_count"],
+            -quality["stage4_south_settled_tail_count"],
+        )
         if order == "stage3":
             return (
                 quality["stage3_extra_fragment_count"],
@@ -1438,12 +1845,14 @@ class Stage1Solver:
                 quality["stage4_access_blocked_debt_count"],
                 quality["stage4_lower_bound"],
                 quality["stage4_tail_debt_count"],
+                *layout,
             )
         if order == "stage4":
             return (
                 quality["stage4_access_blocked_debt_count"],
                 quality["stage4_lower_bound"],
                 quality["stage4_tail_debt_count"],
+                *layout,
                 quality["stage3_extra_fragment_count"],
                 quality["stage3_group_run_count"],
                 quality["stage3_prefix_blocked_count"],
@@ -1455,6 +1864,7 @@ class Stage1Solver:
             quality["stage4_access_blocked_debt_count"],
             quality["stage4_lower_bound"],
             quality["stage4_tail_debt_count"],
+            *layout,
         )
 
     def downstream_quality(self) -> dict[str, Any]:
@@ -1597,7 +2007,47 @@ class Stage1Solver:
             "stage4_tail_debt_count": len(debt_nos),
             "stage4_access_blocked_debt_count": blocked_debt,
             "stage4_lower_bound": len(source_lines) + len(target_keys),
+            **self.stage4_layout_quality(),
         }
+
+    def stage4_layout_quality(self) -> dict[str, int]:
+        by_no = self.by_no()
+        lines = self.stage4_layout_quality_lines()
+        south_settled_tail_count = 0
+        target_run_count = 0
+        extra_target_fragment_count = 0
+        for line in lines:
+            south_to_north = list(reversed(physical.line_access_order(self.cars, line)))
+            for no in south_to_north:
+                car = by_no.get(no)
+                if car and self.stage4_target_key(car) and self.target_satisfied(car):
+                    south_settled_tail_count += 1
+                    continue
+                break
+            target_keys = [
+                self.stage4_target_key(car)
+                for no in south_to_north
+                if (car := by_no.get(no)) and self.stage4_target_key(car)
+            ]
+            run_keys = self.compressed(target_keys)
+            target_run_count += len(run_keys)
+            extra_target_fragment_count += sum(
+                max(0, count - 1)
+                for count in Counter(run_keys).values()
+            )
+        return {
+            "stage4_layout_quality_line_count": len(lines),
+            "stage4_pending_weigh_count": self.pending_weigh_count(),
+            "stage4_south_settled_tail_count": south_settled_tail_count,
+            "stage4_target_run_count": target_run_count,
+            "stage4_extra_target_fragment_count": extra_target_fragment_count,
+        }
+
+    def stage4_layout_quality_lines(self) -> tuple[str, ...]:
+        lines = list(STAGE4_LAYOUT_QUALITY_BASE_LINES)
+        if not self.has_pending_weigh_cars():
+            lines.extend(STAGE4_LAYOUT_QUALITY_CONDITIONAL_LINES)
+        return tuple(line for line in lines if line in physical.TRACK_SPECS)
 
     def is_stage4_debt(self, car: dict[str, Any]) -> bool:
         targets = set(car.get("TargetLines") or ())
@@ -1961,6 +2411,9 @@ def portfolio_selection_key(result: dict[str, Any], objective: str = "balanced")
     tail = int(quality.get("stage4_tail_debt_count") or 0)
     lower_bound = int(quality.get("stage4_lower_bound") or 0)
     access_blocked = int(quality.get("stage4_access_blocked_debt_count") or 0)
+    layout_fragments = int(quality.get("stage4_extra_target_fragment_count") or 0)
+    layout_runs = int(quality.get("stage4_target_run_count") or 0)
+    south_settled = int(quality.get("stage4_south_settled_tail_count") or 0)
     fragments = int(quality.get("stage3_extra_fragment_count") or 0)
     runs = int(quality.get("stage3_group_run_count") or 0)
     prefix_blocked = int(quality.get("stage3_prefix_blocked_count") or 0)
@@ -1972,6 +2425,9 @@ def portfolio_selection_key(result: dict[str, Any], objective: str = "balanced")
             access_blocked,
             lower_bound,
             tail,
+            layout_fragments,
+            layout_runs,
+            -south_settled,
             fragments,
             runs,
             prefix_blocked,
@@ -1987,6 +2443,9 @@ def portfolio_selection_key(result: dict[str, Any], objective: str = "balanced")
             access_blocked,
             lower_bound,
             tail,
+            layout_fragments,
+            layout_runs,
+            -south_settled,
             business_hooks,
             profile_name,
         )
@@ -1998,6 +2457,9 @@ def portfolio_selection_key(result: dict[str, Any], objective: str = "balanced")
         access_blocked,
         lower_bound,
         tail,
+        layout_fragments,
+        layout_runs,
+        -south_settled,
         business_hooks,
         profile_name,
     )

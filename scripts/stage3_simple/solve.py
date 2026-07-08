@@ -31,6 +31,10 @@ DEPOT_OUT = tuple(f"修{i}库外" for i in range(1, 5))
 DEPOT_TARGETS = (*DEPOT_IN, *DEPOT_OUT)
 DEPOT_OUT_BY_IN = {f"修{i}库内": f"修{i}库外" for i in range(1, 5)}
 DEPOT_IN_BY_OUT = {value: key for key, value in DEPOT_OUT_BY_IN.items()}
+UNWHEEL = "卸轮线"
+STAGE4_DEFER_TARGETS = {"油漆线", "存4线"}
+STAGE4_DEFER_LINES = (*DEPOT_OUT, UNWHEEL, *DEPOT_IN)
+STAGE4_STAGING_LINES = (UNWHEEL, *DEPOT_OUT)
 ASSEMBLY_LINES = ("机走北", "机走棚", "洗油北", "机南")
 PREPICKUP_OUTER_SOURCE = "存4线"
 STAGE3_SOURCE_LINES = (*ASSEMBLY_LINES, PREPICKUP_OUTER_SOURCE)
@@ -180,6 +184,8 @@ class Stage3Solver:
                 and not (targets & set(DEPOT_IN))
             ):
                 active.add(rv.car_no(car))
+            elif car["Line"] in set(STAGE4_DEFER_LINES) and targets & STAGE4_DEFER_TARGETS:
+                active.add(rv.car_no(car))
         return active
 
     def build_fixed_depot_positions(self) -> dict[str, dict[int, str]]:
@@ -200,6 +206,7 @@ class Stage3Solver:
         exposure_time = {no: index for index, no in enumerate(exposure)}
         inner_nos = sorted(no for no in self.active_nos if self.inner_target_lines(no))
         outer_nos = sorted(no for no in self.active_nos if not self.inner_target_lines(no) and self.outer_target_lines(no))
+        deferred_nos = sorted(no for no in self.active_nos if self.is_stage4_deferred(no))
         slots: list[tuple[str, int]] = []
         for line in DEPOT_IN:
             if DEPOT_OUT_BY_IN[line] in self.fixed_outer_lines:
@@ -277,17 +284,153 @@ class Stage3Solver:
         assigned_outer, missing_outer = self.assign_outer_targets(outer_nos, set(line for line, _pos in assigned_inner.values()))
         assigned_lines = {no: line for no, (line, _position) in assigned_inner.items()}
         assigned_lines.update(assigned_outer)
+        assigned_deferred, missing_deferred = self.assign_deferred_stage4_targets(deferred_nos)
+        assigned_lines.update(assigned_deferred)
         if missing_inner or missing_outer:
             reasons: list[str] = []
             if missing_inner:
                 reasons.append(f"inner_assignment_incomplete:{template}:{','.join(missing_inner)}")
             if missing_outer:
                 reasons.append(f"outer_assignment_incomplete:{template}:{','.join(missing_outer)}")
+            if missing_deferred:
+                reasons.append(f"stage4_defer_staging_incomplete:{template}:{','.join(missing_deferred)}")
             self.assignment_reasons = tuple(reasons)
+            return assigned_lines
+        if missing_deferred:
+            self.assignment_reasons = (f"stage4_defer_staging_incomplete:{template}:{','.join(missing_deferred)}",)
             return assigned_lines
 
         self.assigned_slot_by_no = dict(assigned_inner)
         return assigned_lines
+
+    def is_stage4_deferred(self, no: str) -> bool:
+        car = self.meta.get(no, {})
+        targets = set(car.get("TargetLines") or [])
+        return bool(targets & STAGE4_DEFER_TARGETS) and not (targets & set(DEPOT_TARGETS))
+
+    def deferred_stage4_preferred_line(self, no: str) -> str:
+        car = self.meta[no]
+        line = car["Line"]
+        if line in set(STAGE4_STAGING_LINES):
+            return line
+        return UNWHEEL
+
+    def deferred_stage4_target(self, no: str) -> str:
+        targets = set(self.meta[no].get("TargetLines") or []) & STAGE4_DEFER_TARGETS
+        if "存4线" in targets:
+            return "存4线"
+        if "油漆线" in targets:
+            return "油漆线"
+        return sorted(targets)[0] if targets else ""
+
+    def assign_deferred_stage4_targets(self, deferred_nos: list[str]) -> tuple[dict[str, str], tuple[str, ...]]:
+        if not deferred_nos:
+            return {}, ()
+        remaining = {
+            line: float(rv.TRACK_LEN.get(line) or 0.0)
+            - sum(float(car.get("Length") or CAR_LENGTH_DEFAULT_M) for car in self.fixed_cars if car["Line"] == line)
+            for line in STAGE4_STAGING_LINES
+        }
+        assigned: dict[str, str] = {}
+        for target in ("存4线", "油漆线"):
+            group = [no for no in self.deferred_stage4_order(deferred_nos) if self.deferred_stage4_target(no) == target]
+            if not group:
+                continue
+            packed = self.pack_deferred_stage4_group(group, remaining)
+            if packed is None:
+                return assigned, tuple(sorted(no for no in deferred_nos if no not in assigned))
+            for line, chunk in packed:
+                for no in chunk:
+                    assigned[no] = line
+                remaining[line] -= self.length(chunk)
+        missing = tuple(sorted(no for no in deferred_nos if no not in assigned))
+        return assigned, missing
+
+    def deferred_stage4_order(self, nos: Iterable[str]) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                nos,
+                key=lambda no: (
+                    0 if self.deferred_stage4_target(no) == "存4线" else 1,
+                    self.line_rank_for_deferred(self.meta[no]["Line"]),
+                    int(self.meta[no].get("Position") or 0),
+                    no,
+                ),
+            )
+        )
+
+    def line_rank_for_deferred(self, line: str) -> int:
+        order = {
+            "卸轮线": 0,
+            "修1库内": 11,
+            "修1库外": 12,
+            "修2库内": 21,
+            "修2库外": 22,
+            "修3库内": 31,
+            "修3库外": 32,
+            "修4库内": 41,
+            "修4库外": 42,
+        }
+        return order.get(line, 100)
+
+    def pack_deferred_stage4_group(
+        self,
+        ordered_nos: list[str],
+        remaining: dict[str, float],
+    ) -> list[tuple[str, tuple[str, ...]]] | None:
+        n = len(ordered_nos)
+        lengths = [self.length((no,)) for no in ordered_nos]
+        prefix = [0.0]
+        for value in lengths:
+            prefix.append(prefix[-1] + value)
+
+        def chunk_len(left: int, right: int) -> float:
+            return prefix[right] - prefix[left]
+
+        line_order = tuple(
+            sorted(
+                STAGE4_STAGING_LINES,
+                key=lambda line: (
+                    0 if line == UNWHEEL else 1,
+                    self.line_number(line),
+                    line,
+                ),
+            )
+        )
+        best: tuple[tuple[int, int, float, tuple[str, ...]], list[tuple[str, tuple[str, ...]]]] | None = None
+
+        def rec(index: int, available: tuple[str, ...], chunks: list[tuple[str, tuple[str, ...]]]) -> None:
+            nonlocal best
+            if index >= n:
+                used = tuple(line for line, _chunk in chunks)
+                score = (
+                    len(chunks),
+                    sum(1 for line in used if line != UNWHEEL),
+                    round(sum(remaining[line] for line in used), 3),
+                    used,
+                )
+                candidate = (score, list(chunks))
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+                return
+            if best is not None and len(chunks) >= best[0][0]:
+                return
+            for line in available:
+                limit = remaining.get(line, 0.0)
+                if limit <= rv.TOL:
+                    continue
+                for end in range(n, index, -1):
+                    size = chunk_len(index, end)
+                    if size > limit + rv.TOL:
+                        continue
+                    chunk = tuple(ordered_nos[index:end])
+                    next_available = tuple(item for item in available if item != line)
+                    chunks.append((line, chunk))
+                    rec(end, next_available, chunks)
+                    chunks.pop()
+
+        rec(0, line_order, [])
+        return best[1] if best else None
 
     def assign_outer_targets(self, outer_nos: list[str], used_inner_lines: set[str]) -> tuple[dict[str, str], tuple[str, ...]]:
         if not outer_nos:
@@ -413,7 +556,7 @@ class Stage3Solver:
             {
                 self.meta[no]["Line"]
                 for no in self.active_nos
-                if self.meta[no]["Line"] not in set(STAGE3_SOURCE_LINES) | set(DEPOT_IN)
+                if self.meta[no]["Line"] not in set(STAGE3_SOURCE_LINES) | set(STAGE4_DEFER_LINES)
             }
         )
         if unsupported_sources:
@@ -437,7 +580,7 @@ class Stage3Solver:
         for no in sorted(self.active_nos):
             car = self.meta[no]
             depot_targets = set(car.get("TargetLines") or []) & set(DEPOT_TARGETS)
-            if not depot_targets:
+            if not depot_targets and not self.is_stage4_deferred(no):
                 reasons.append(f"active_without_depot_target:{no}")
             if car.get("IsWeigh") and not car.get("_Weighed"):
                 reasons.append(f"active_unweighed:{no}")
@@ -637,7 +780,39 @@ class Stage3Solver:
         *,
         avoid_outer_line: str = "",
     ) -> tuple[str, ...]:
-        if target in set(DEPOT_OUT):
+        if target in set(DEPOT_IN) and all(self.is_stage4_deferred(no) for no in move):
+            line_map = self.line_map(state)
+            outer = DEPOT_OUT_BY_IN[target]
+            pending_inner_targets = {
+                self.assigned_line_by_no.get(no)
+                for no in pending_before
+                if self.assigned_line_by_no.get(no) in set(DEPOT_IN)
+                and not self.is_stage4_deferred(no)
+            }
+            reusable_outers = tuple(
+                line
+                for line in DEPOT_OUT
+                if line != outer
+                and (
+                    not line_map.get(line)
+                    or all(self.terminal_line_satisfied(no, line) for no in line_map.get(line, ()))
+                )
+            )
+            nonblocking_outers = tuple(
+                line for line in reusable_outers if DEPOT_IN_BY_OUT[line] not in pending_inner_targets
+            )
+            blocking_outers = tuple(
+                line for line in reusable_outers if DEPOT_IN_BY_OUT[line] in pending_inner_targets
+            )
+            alternates = (UNWHEEL, *nonblocking_outers, *blocking_outers)
+            pending_same_inner = any(
+                self.assigned_line_by_no.get(no) == target and not self.is_stage4_deferred(no)
+                for no in pending_before
+            )
+            if pending_same_inner:
+                return (*alternates, outer, target)
+            return (target, *alternates, outer)
+        if target in set(DEPOT_OUT) and not all(self.is_stage4_deferred(no) for no in move):
             pending_inner_targets = {
                 self.assigned_line_by_no.get(no)
                 for no in pending_before
@@ -672,11 +847,64 @@ class Stage3Solver:
             if any(self.assigned_line_by_no.get(no) == blocking_inner for no in pending_before):
                 return (*target_first, *nonblocking_alternates, *blocking_alternates, *target_later, blocking_inner)
             return (*target_first, *nonblocking_alternates, *blocking_alternates, *target_later, blocking_inner)
+        if target in set(STAGE4_DEFER_LINES) and target not in set(DEPOT_IN):
+            line_map = self.line_map(state)
+            pending_inner_targets = {
+                self.assigned_line_by_no.get(no)
+                for no in pending_before
+                if self.assigned_line_by_no.get(no) in set(DEPOT_IN)
+                and not self.is_stage4_deferred(no)
+            }
+            alternates = tuple(
+                line
+                for line in STAGE4_STAGING_LINES
+                if line != target
+                and (
+                    not line_map.get(line)
+                    or all(self.terminal_line_satisfied(no, line) for no in line_map.get(line, ()))
+                )
+            )
+            def nonblocking(line: str) -> bool:
+                return line == UNWHEEL or DEPOT_IN_BY_OUT.get(line, "") not in pending_inner_targets
+
+            immediate_inner = ""
+            for no in reversed(pending_before):
+                if self.is_stage4_deferred(no):
+                    continue
+                candidate = self.assigned_line_by_no.get(no, "")
+                if candidate in set(DEPOT_IN):
+                    immediate_inner = candidate
+                    break
+            immediate_outer = DEPOT_OUT_BY_IN.get(immediate_inner, "")
+            target_first = (target,) if target in set(STAGE4_STAGING_LINES) and nonblocking(target) else ()
+            target_later = (target,) if target in set(STAGE4_STAGING_LINES) and not nonblocking(target) else ()
+            safe = tuple(line for line in alternates if nonblocking(line))
+            blocking = tuple(
+                sorted(
+                    (line for line in alternates if not nonblocking(line)),
+                    key=lambda line: (line == immediate_outer, self.line_number(line), line),
+                )
+            )
+            return (*target_first, *safe, *blocking, *target_later)
         outer = DEPOT_OUT_BY_IN[target]
+        immediate_inner = ""
+        for no in reversed(pending_before):
+            if self.is_stage4_deferred(no):
+                continue
+            candidate = self.assigned_line_by_no.get(no, "")
+            if candidate in set(DEPOT_IN):
+                immediate_inner = candidate
+                break
+        immediate_outer = DEPOT_OUT_BY_IN.get(immediate_inner, "")
         alternate_buffers = tuple(
-            line
-            for line in DEPOT_OUT
-            if line != outer and not self.line_map(state).get(line)
+            sorted(
+                (
+                    line
+                    for line in DEPOT_OUT
+                    if line != outer and not self.line_map(state).get(line)
+                ),
+                key=lambda line: (line == immediate_outer, self.line_number(line), line),
+            )
         )
         pending_same_target = [no for no in pending_before if self.assigned_line_by_no.get(no) == target]
         pending_factory = any(self.repair_process(self.meta[no]).startswith("厂") for no in pending_same_target)
@@ -704,11 +932,11 @@ class Stage3Solver:
         if len(targets) != 1:
             return ""
         target = next(iter(targets))
-        return target if target in set(DEPOT_TARGETS) else ""
+        return target if target in set(DEPOT_TARGETS) | set(STAGE4_DEFER_LINES) else ""
 
     def greedy_get_outer(self, state: State) -> tuple[Op, State] | None:
         line_map = self.line_map(state)
-        for line in (*DEPOT_OUT, *DEPOT_IN):
+        for line in (*DEPOT_OUT, UNWHEEL, *DEPOT_IN):
             nos = tuple(line_map.get(line, ()))
             if not nos:
                 continue
@@ -1057,6 +1285,15 @@ class Stage3Solver:
             ordered = tuple(line_map.get(line, ()))
             if not ordered:
                 continue
+            leading_deferred: list[str] = []
+            for no in ordered:
+                if self.is_stage4_deferred(no):
+                    leading_deferred.append(no)
+                    continue
+                break
+            if leading_deferred:
+                yield line, tuple(leading_deferred)
+                continue
             if all(self.terminal_line_satisfied(no, line) for no in ordered):
                 continue
             for cut in range(len(ordered), 0, -1):
@@ -1066,7 +1303,7 @@ class Stage3Solver:
         held = state.held
         if not held:
             return
-        candidate_lines = (*DEPOT_IN, *DEPOT_OUT)
+        candidate_lines = (*DEPOT_IN, *DEPOT_OUT, UNWHEEL)
         for line in candidate_lines:
             for cut in range(0, len(held)):
                 move = held[cut:]
@@ -1080,8 +1317,24 @@ class Stage3Solver:
 
     def put_candidate_allowed(self, state: State, line: str, move: tuple[str, ...]) -> bool:
         assigned = {self.assigned_line_by_no.get(no, "") for no in move}
+        move_is_deferred = all(self.is_stage4_deferred(no) for no in move)
+        if not move_is_deferred and self.line_has_stage4_deferred(state, line):
+            return False
         if len(assigned) == 1:
             target = next(iter(assigned))
+            if move_is_deferred:
+                if line in set(DEPOT_IN):
+                    if line != target:
+                        return False
+                    pending_before = state.held[: len(state.held) - len(move)]
+                    if any(
+                        self.assigned_line_by_no.get(no) == line and not self.is_stage4_deferred(no)
+                        for no in pending_before
+                    ):
+                        return False
+                    proposed = (*move, *self.line_map(state).get(line, ()))
+                    return self.partial_depot_line_possible(line, proposed)
+                return line in set(STAGE4_STAGING_LINES)
             needs_buffer = self.needs_buffer_before_pending_deep(state, target, move)
             if line == target:
                 if line in set(DEPOT_IN):
@@ -1111,6 +1364,9 @@ class Stage3Solver:
             return False
         return len(move) <= 3 and self.length(move) <= float(rv.TRACK_LEN.get(line) or 0.0) + rv.TOL
 
+    def line_has_stage4_deferred(self, state: State, line: str) -> bool:
+        return any(self.is_stage4_deferred(no) for no in self.line_map(state).get(line, ()))
+
     def needs_buffer_before_pending_deep(self, state: State, target: str, move: tuple[str, ...]) -> bool:
         if target not in set(DEPOT_IN):
             return False
@@ -1131,7 +1387,7 @@ class Stage3Solver:
         # Outside buffers are preferred, but inner depot get-back is part of
         # the stage-3 reordering contract.  It is kept prefix-only; process
         # legality is length/route based, while final slot rules are terminal.
-        for line in (*DEPOT_OUT, *DEPOT_IN):
+        for line in (*DEPOT_OUT, UNWHEEL, *DEPOT_IN):
             ordered = line_map.get(line, ())
             if not ordered:
                 continue
@@ -1142,6 +1398,8 @@ class Stage3Solver:
 
     def line_can_stay_terminal(self, line: str, ordered: tuple[str, ...]) -> bool:
         if line in set(DEPOT_OUT):
+            return all(self.terminal_line_satisfied(no, line) for no in ordered)
+        if line == UNWHEEL:
             return all(self.terminal_line_satisfied(no, line) for no in ordered)
         if line in set(DEPOT_IN):
             return all(self.terminal_line_satisfied(no, line) for no in ordered) and self.partial_depot_line_possible(line, ordered)
@@ -1163,7 +1421,7 @@ class Stage3Solver:
         next_phase: int | None = None,
     ) -> tuple[Op, State, str]:
         line_map = self.line_map(state)
-        if not allow_source and line not in set(DEPOT_IN) | set(DEPOT_OUT):
+        if not allow_source and line not in set(DEPOT_IN) | set(DEPOT_OUT) | {UNWHEEL}:
             return Op("Get", line, move, (), state.held), state, "get_line_not_allowed"
         if tuple(line_map.get(line, ())[: len(move)]) != move:
             return Op("Get", line, move, (), state.held), state, "get_order_violation"
@@ -1314,7 +1572,7 @@ class Stage3Solver:
             line, _index = found[0]
             if not self.terminal_line_satisfied(no, line):
                 reasons.append(f"active_terminal_line_violation:{no}:{line}")
-            elif line in set(DEPOT_OUT):
+            elif line in set(DEPOT_OUT) or line == UNWHEEL:
                 positions[no] = (line, _index)
                 car = self.meta[no]
                 forced = tuple(int(value) for value in car.get("_ForcePositions") or () if int(value) > 0)
@@ -1325,6 +1583,17 @@ class Stage3Solver:
 
         for line in DEPOT_IN:
             active = tuple(line_map.get(line, ()))
+            deferred_prefix: list[str] = []
+            depot_active: list[str] = []
+            seen_depot = False
+            for no in active:
+                if self.is_stage4_deferred(no):
+                    if seen_depot:
+                        reasons.append(f"deferred_after_depot_car:{no}:{line}")
+                    deferred_prefix.append(no)
+                else:
+                    seen_depot = True
+                    depot_active.append(no)
             fixed_positions = sorted(self.fixed_depot_positions.get(line, {}))
             capacity = self.caps.get(line, 5)
             usable_limit = (min(fixed_positions) - 1) if fixed_positions else capacity
@@ -1336,6 +1605,12 @@ class Stage3Solver:
                 position = start_position + offset
                 positions[no] = (line, position)
                 car = self.meta[no]
+                if self.is_stage4_deferred(no):
+                    if not self.terminal_line_satisfied(no, line):
+                        reasons.append(f"deferred_stage4_line_violation:{no}:{line}")
+                    if car.get("IsWeigh") and not car.get("_Weighed"):
+                        reasons.append(f"depot_weigh_pending:{no}")
+                    continue
                 if not self.inner_target_lines(no) or line not in self.inner_target_lines(no):
                     reasons.append(f"depot_target_line_violation:{no}:{line}")
                 if car.get("IsWeigh") and not car.get("_Weighed"):
@@ -1344,7 +1619,7 @@ class Stage3Solver:
                     reasons.append(f"depot_slot_rule_violation:{no}:{line}:{position}")
 
             factory_positions: list[int] = []
-            for no in active:
+            for no in depot_active:
                 if self.repair_process(self.meta[no]).startswith("厂"):
                     factory_positions.append(positions[no][1])
             for position, no in self.fixed_depot_positions.get(line, {}).items():
@@ -1353,7 +1628,7 @@ class Stage3Solver:
                     factory_positions.append(position)
             if factory_positions:
                 factory_min = min(factory_positions)
-                for no in active:
+                for no in depot_active:
                     position = positions[no][1]
                     if self.repair_process(self.meta[no]).startswith("段") and position > factory_min:
                         reasons.append(f"depot_section_after_factory:{no}:{line}:{position}>{factory_min}")
@@ -1367,7 +1642,15 @@ class Stage3Solver:
             return False
         start_position = usable_limit - len(nos) + 1
         positions = {no: start_position + offset for offset, no in enumerate(nos)}
+        seen_depot = False
         for no, position in positions.items():
+            if self.is_stage4_deferred(no):
+                if seen_depot:
+                    return False
+                if not self.terminal_line_satisfied(no, line):
+                    return False
+                continue
+            seen_depot = True
             if self.assigned_line_by_no.get(no) != line:
                 return False
             if line not in set(self.meta[no].get("TargetLines") or []):
@@ -1391,6 +1674,8 @@ class Stage3Solver:
         return True
 
     def terminal_line_satisfied(self, no: str, line: str) -> bool:
+        if self.is_stage4_deferred(no):
+            return line in set(STAGE4_STAGING_LINES)
         if self.inner_target_lines(no):
             return line in self.inner_target_lines(no)
         if self.outer_target_lines(no):
@@ -1502,6 +1787,7 @@ class Stage3Solver:
         if state is None:
             return []
         _ok, _reasons, positions = self.terminal_depot_ok(state)
+        positions.update(self.generated_staging_positions(state))
         rows: list[dict[str, Any]] = []
         line_map = self.line_map(state)
         for car in self.initial_cars:
@@ -1518,6 +1804,27 @@ class Stage3Solver:
                         break
             rows.append({"No": no, "Line": line, "Position": position})
         return sorted(rows, key=lambda item: item["No"])
+
+    def generated_staging_positions(self, state: State) -> dict[str, tuple[str, int]]:
+        line_map = self.line_map(state)
+        out: dict[str, tuple[str, int]] = {}
+        for line in STAGE4_STAGING_LINES:
+            active = list(line_map.get(line, ()))
+            fixed = [
+                rv.car_no(car)
+                for car in sorted(
+                    (item for item in self.fixed_cars if item["Line"] == line),
+                    key=lambda item: (int(item.get("Position") or 0), rv.car_no(item)),
+                )
+            ]
+            if not active and not fixed:
+                continue
+            # Stage 4 pulls from the north/outside end.  Deferred oil/store4
+            # staging cars must therefore stay in front of fixed unwheel/depot
+            # cars that are already satisfied on the same holding line.
+            for position, no in enumerate((*active, *fixed), start=1):
+                out[no] = (line, position)
+        return out
 
     def response_operations(self, ops: Iterable[Op], *, start_index: int = 1) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
