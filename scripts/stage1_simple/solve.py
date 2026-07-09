@@ -8,7 +8,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,39 +85,40 @@ STAGE4_CACHE_GROUP_TARGETS = {
     "存5线南",
 }
 STAGE4_CACHE_GROUP_LINES = ("存5线北", "存3线", "存2线", "存1线", "存5线南")
-PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
-    "baseline": {
-        "downstream": False,
-        "target_aware": False,
-        "direct_delivery": False,
-        "direct_delivery_max_hooks": 0,
-        "split_put": False,
-        "quality_order": "none",
-    },
-    "balanced": {
-        "downstream": True,
-        "target_aware": True,
-        "direct_delivery": True,
-        "direct_delivery_max_hooks": 5,
-        "split_put": False,
-        "quality_order": "balanced",
-    },
-    "stage3": {
-        "downstream": True,
-        "target_aware": True,
-        "direct_delivery": True,
-        "direct_delivery_max_hooks": 5,
-        "split_put": False,
-        "quality_order": "stage3",
-    },
-    "stage4": {
-        "downstream": True,
-        "target_aware": True,
-        "direct_delivery": True,
-        "direct_delivery_max_hooks": 5,
-        "split_put": False,
-        "quality_order": "stage4",
-    },
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    downstream: bool = False
+    target_aware: bool = False
+    direct_delivery: bool = False
+    direct_delivery_max_hooks: int = 0
+    quality_order: str = "none"
+
+
+PROFILE_CONFIGS: dict[str, ProfileConfig] = {
+    "baseline": ProfileConfig(),
+    "balanced": ProfileConfig(
+        downstream=True,
+        target_aware=True,
+        direct_delivery=True,
+        direct_delivery_max_hooks=5,
+        quality_order="balanced",
+    ),
+    "stage3": ProfileConfig(
+        downstream=True,
+        target_aware=True,
+        direct_delivery=True,
+        direct_delivery_max_hooks=5,
+        quality_order="stage3",
+    ),
+    "stage4": ProfileConfig(
+        downstream=True,
+        target_aware=True,
+        direct_delivery=True,
+        direct_delivery_max_hooks=5,
+        quality_order="stage4",
+    ),
 }
 DEFAULT_PROFILE = "baseline"
 DEFAULT_PORTFOLIO_PROFILES = ("baseline", "balanced", "stage3", "stage4")
@@ -130,7 +131,27 @@ MAX_CAPACITY_DEFICIT_HOOKS = 10
 DEFAULT_TIME_BUDGET_SECONDS = 300.0
 DYNAMIC_VALID_WINDOW = 20
 DYNAMIC_EXAMINED_WINDOW = 140
-SPLIT_PUT_MAX_CANDIDATES_PER_SOURCE = 24
+
+
+def downstream_quality_vector(quality: dict[str, Any], objective: str) -> tuple[int, ...]:
+    layout = (
+        int(quality.get("stage4_extra_target_fragment_count") or 0),
+        int(quality.get("stage4_target_run_count") or 0),
+        -int(quality.get("stage4_south_settled_tail_count") or 0),
+    )
+    stage3 = (
+        int(quality.get("stage3_extra_fragment_count") or 0),
+        int(quality.get("stage3_group_run_count") or 0),
+        int(quality.get("stage3_prefix_blocked_count") or 0),
+    )
+    stage4 = (
+        int(quality.get("stage4_access_blocked_debt_count") or 0),
+        int(quality.get("stage4_lower_bound") or 0),
+        int(quality.get("stage4_tail_debt_count") or 0),
+    )
+    if objective == "stage4":
+        return (*stage4, *layout, *stage3)
+    return (*stage3, *stage4, *layout)
 
 
 @dataclass(frozen=True)
@@ -138,6 +159,34 @@ class CandidateView:
     candidate: physical.HookCandidate
     score: tuple[Any, ...]
     reason: str
+
+
+@dataclass(frozen=True)
+class CandidateEvaluation:
+    view: CandidateView
+    validation: physical.PhysicalValidation
+    probe: "Stage1Solver"
+    after_debt: dict[str, Any]
+    moving_nos: set[str]
+    downstream_quality: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DynamicContext:
+    mode: str
+    get_blockers: set[str]
+    get_blocked_nos: set[str]
+    put_blockers: set[str]
+
+
+@dataclass(frozen=True)
+class DynamicPick:
+    score: tuple[Any, ...]
+    evaluation: CandidateEvaluation
+    before_get_blockers: set[str]
+    after_get_blockers: set[str]
+    before_put_blockers: set[str]
+    after_put_blockers: set[str]
 
 
 class Stage1Solver:
@@ -168,6 +217,7 @@ class Stage1Solver:
         self.time_budget_seconds = time_budget_seconds
         self.validation_cache: dict[tuple[str, str], physical.PhysicalValidation] = {}
         self.profile = profile
+        self.config = PROFILE_CONFIGS[profile]
         self.downstream_quality_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self.initial_stage4_satisfied_nos = {
             physical.car_no(car)
@@ -294,6 +344,73 @@ class Stage1Solver:
             return True
         return self.try_first_valid_view(views, debt, rejected)
 
+    def reject_candidate(
+        self,
+        rejected: list[dict[str, Any]],
+        view: CandidateView,
+        violations: Iterable[str],
+        *,
+        limit: int | None = None,
+    ) -> None:
+        if limit is not None and len(rejected) >= limit:
+            return
+        rejected.append({
+            "candidate_id": view.candidate.candidate_id,
+            "reason": view.reason,
+            "violations": list(violations),
+        })
+
+    def evaluate_candidate(
+        self,
+        view: CandidateView,
+        debt: dict[str, Any],
+        rejected: list[dict[str, Any]],
+        *,
+        reject_limit: int | None = None,
+        reject_sideways: bool = False,
+        reject_large_rebound: bool = False,
+        reject_dead_end: bool = True,
+        include_put_blockers_for_dead_end: bool = True,
+        compute_downstream_quality: bool = False,
+    ) -> CandidateEvaluation | None:
+        validation = self.validate_candidate(view.candidate)
+        if not validation.accepted:
+            self.reject_candidate(rejected, view, validation.reasons, limit=reject_limit)
+            return None
+
+        probe = self.probe_after(view.candidate, validation)
+        after_signature = physical.state_signature(probe.cars, probe.loco)
+        if after_signature in self.seen_states:
+            self.reject_candidate(rejected, view, ["state_cycle"], limit=reject_limit)
+            return None
+
+        after_debt = probe.stage1_debt()
+        if reject_sideways and self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt):
+            self.reject_candidate(rejected, view, ["profile_sideways_stage1_move"], limit=reject_limit)
+            return None
+
+        if reject_large_rebound and self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
+            self.reject_candidate(rejected, view, ["large_assembly_debt_rebound"], limit=reject_limit)
+            return None
+
+        if (
+            reject_dead_end
+            and not after_debt["complete"]
+            and not probe.can_continue(depth=1, include_put_blockers=include_put_blockers_for_dead_end)
+        ):
+            self.reject_candidate(rejected, view, ["dead_end_after_candidate"], limit=reject_limit)
+            return None
+
+        downstream_quality = probe.downstream_quality_tuple() if compute_downstream_quality else ()
+        return CandidateEvaluation(
+            view=view,
+            validation=validation,
+            probe=probe,
+            after_debt=after_debt,
+            moving_nos=set(view.candidate.move_car_nos),
+            downstream_quality=downstream_quality,
+        )
+
     def try_first_valid_view(
         self,
         views: list[CandidateView],
@@ -303,46 +420,24 @@ class Stage1Solver:
         for view in views:
             if self.time_exhausted():
                 return False
-            validation = self.validate_candidate(view.candidate)
-            if not validation.accepted:
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": list(validation.reasons),
-                })
+            evaluation = self.evaluate_candidate(
+                view,
+                debt,
+                rejected,
+                reject_sideways=True,
+                reject_large_rebound=True,
+                reject_dead_end=True,
+                include_put_blockers_for_dead_end=True,
+            )
+            if evaluation is None:
                 continue
-            probe = self.probe_after(view.candidate, validation)
-            after_signature = physical.state_signature(probe.cars, probe.loco)
-            if after_signature in self.seen_states:
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["state_cycle"],
-                })
-                continue
-            after_debt = probe.stage1_debt()
-            if self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt):
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["profile_sideways_stage1_move"],
-                })
-                continue
-            if self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["large_assembly_debt_rebound"],
-                })
-                continue
-            if not after_debt["complete"] and not probe.can_continue(depth=1, include_put_blockers=True):
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["dead_end_after_candidate"],
-                })
-                continue
-            return self.accept_candidate(view, validation, after_debt, debt, rejected)
+            return self.accept_candidate(
+                evaluation.view,
+                evaluation.validation,
+                evaluation.after_debt,
+                debt,
+                rejected,
+            )
         return False
 
     def try_dynamic_views(
@@ -351,216 +446,237 @@ class Stage1Solver:
         debt: dict[str, Any],
         rejected: list[dict[str, Any]],
     ) -> bool:
-        if debt["pollution_nos"]:
+        context = self.dynamic_context(debt)
+        if context is None:
             return False
 
-        get_blockers, get_blocked_nos = self.pending_get_blocker_info(debt)
-        put_blockers, _put_blocked_nos = self.pending_put_blocker_info(debt)
-        use_get_unlock = bool(get_blockers & set(ASSEMBLY_DEPOT))
-        use_put_unlock = not get_blockers and bool(put_blockers & set(ASSEMBLY_DEPOT))
-        use_debt_window = not get_blockers
-        if not (use_get_unlock or use_put_unlock or use_debt_window):
-            return False
-
-        dynamic_views = views
-        if use_put_unlock:
-            dynamic_views = self.dynamic_release_first_views(views, debt)
-
-        viable: list[
-            tuple[
-                tuple[Any, ...],
-                CandidateView,
-                physical.PhysicalValidation,
-                dict[str, Any],
-                set[str],
-                set[str],
-                set[str],
-                set[str],
-            ]
-        ] = []
+        dynamic_views = self.dynamic_views_for_context(views, debt, context)
+        viable: list[DynamicPick] = []
         examined_count = 0
         valid_count = 0
+
+        def consume_dynamic_window() -> bool:
+            nonlocal valid_count
+            valid_count += 1
+            return valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW
+
         for view in dynamic_views:
             if self.time_exhausted():
                 return False
             examined_count += 1
-            validation = self.validate_candidate(view.candidate)
-            if not validation.accepted:
-                if len(rejected) < 80:
-                    rejected.append({
-                        "candidate_id": view.candidate.candidate_id,
-                        "reason": view.reason,
-                        "violations": list(validation.reasons),
-                    })
+            evaluation = self.evaluate_candidate(
+                view,
+                debt,
+                rejected,
+                reject_limit=80,
+                reject_dead_end=True,
+                include_put_blockers_for_dead_end=True,
+                compute_downstream_quality=True,
+            )
+            if evaluation is None:
                 continue
-            probe = self.probe_after(view.candidate, validation)
-            after_signature = physical.state_signature(probe.cars, probe.loco)
-            if after_signature in self.seen_states:
-                if len(rejected) < 80:
-                    rejected.append({
-                        "candidate_id": view.candidate.candidate_id,
-                        "reason": view.reason,
-                        "violations": ["state_cycle"],
-                    })
-                continue
-            after_debt = probe.stage1_debt()
-            if not after_debt["complete"] and not probe.can_continue(depth=1, include_put_blockers=True):
-                if len(rejected) < 80:
-                    rejected.append({
-                        "candidate_id": view.candidate.candidate_id,
-                        "reason": view.reason,
-                        "violations": ["dead_end_after_candidate"],
-                    })
-                continue
-            moving_nos = set(view.candidate.move_car_nos)
-            improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
-            downstream_quality = probe.downstream_quality_tuple()
-            if get_blockers:
-                after_get_blockers, _after_get_blocked_nos = probe.pending_get_blocker_info(after_debt)
-                if not use_get_unlock:
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                moves_get_blocked = bool(moving_nos & get_blocked_nos)
-                unlocks_get = len(after_get_blockers) < len(get_blockers)
-                if not moves_get_blocked and not unlocks_get and not after_debt["complete"]:
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                if (
-                    self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt)
-                    and not unlocks_get
-                ):
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                if (
-                    after_debt["debt_count"] > debt["debt_count"]
-                    and view.candidate.source_line in ASSEMBLY_DEPOT
-                    and view.candidate.target_line not in ASSEMBLY_DEPOT
-                    and not unlocks_get
-                ):
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                primary = (
-                    0
-                    if after_debt["complete"]
-                    else 1
-                    if unlocks_get and not moves_get_blocked
-                    else 2
-                    if moves_get_blocked and improves_debt
-                    else 3
-                    if improves_debt
-                    else 4
-                )
-                dynamic_score = (
-                    primary,
-                    self.dynamic_target_group(view.candidate),
-                    len(after_get_blockers),
-                    max(0, after_debt["debt_count"] - debt["debt_count"]),
-                    self.progress_tuple(after_debt),
-                    downstream_quality,
-                    self.real_target_dynamic_rank(view.candidate, debt, after_debt),
-                    view.score,
-                )
-                viable.append((
-                    dynamic_score,
-                    view,
-                    validation,
-                    after_debt,
-                    get_blockers,
-                    after_get_blockers,
-                    put_blockers,
-                    set(),
-                ))
-            else:
-                after_put_blockers: set[str] = set()
-                unlocks_put = False
-                if put_blockers:
-                    after_put_blockers, _after_put_blocked_nos = probe.pending_put_blocker_info(after_debt)
-                    unlocks_put = bool(put_blockers & set(ASSEMBLY_DEPOT)) and len(after_put_blockers) < len(put_blockers)
-                    if len(after_put_blockers) > len(put_blockers) and not after_debt["complete"]:
-                        valid_count += 1
-                        if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                            break
-                        continue
-                if unlocks_put and self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                direct_delivery_priority = (
-                    not put_blockers
-                    and self.direct_delivery_priority_candidate(view.candidate, debt, after_debt)
-                )
-                if (
-                    self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt)
-                    and not unlocks_put
-                ):
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                primary = (
-                    0
-                    if after_debt["complete"]
-                    else 1
-                    if direct_delivery_priority
-                    else 2
-                    if unlocks_put
-                    else 3
-                    if improves_debt
-                    else 5
-                )
-                if primary == 5 and use_put_unlock:
-                    valid_count += 1
-                    if valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
-                        break
-                    continue
-                dynamic_score = (
-                    primary,
-                    self.dynamic_target_group(view.candidate),
-                    len(after_put_blockers),
-                    max(0, after_debt["debt_count"] - debt["debt_count"]),
-                    self.progress_tuple(after_debt),
-                    downstream_quality,
-                    self.real_target_dynamic_rank(view.candidate, debt, after_debt),
-                    view.score,
-                )
-                viable.append((
-                    dynamic_score,
-                    view,
-                    validation,
-                    after_debt,
-                    set(),
-                    set(),
-                    put_blockers,
-                    after_put_blockers,
-                ))
+            probe = evaluation.probe
+            after_debt = evaluation.after_debt
+            pick = self.dynamic_pick_for_evaluation(context, evaluation, debt)
+            if pick is not None:
+                viable.append(pick)
 
-            valid_count += 1
-            if after_debt["complete"] or valid_count >= DYNAMIC_VALID_WINDOW or examined_count >= DYNAMIC_EXAMINED_WINDOW:
+            stop_window = consume_dynamic_window()
+            if after_debt["complete"] or stop_window:
                 break
 
         if not viable:
             return False
-        dynamic_score, view, validation, after_debt, before_get, after_get, before_put, after_put = min(
-            viable,
-            key=lambda item: item[0],
+        pick = min(viable, key=lambda item: item.score)
+        accepted = self.accept_candidate(
+            pick.evaluation.view,
+            pick.evaluation.validation,
+            pick.evaluation.after_debt,
+            debt,
+            rejected,
         )
-        accepted = self.accept_candidate(view, validation, after_debt, debt, rejected)
+        dynamic_score = pick.score
         self.trace[-1]["dynamic_score"] = list(dynamic_score[:4])
         self.trace[-1]["downstream_quality"] = list(dynamic_score[5]) if len(dynamic_score) > 5 else []
-        self.trace[-1]["route_blockers_before"] = sorted(before_get)
-        self.trace[-1]["route_blockers_after"] = sorted(after_get)
-        self.trace[-1]["put_blockers_before"] = sorted(before_put)
-        self.trace[-1]["put_blockers_after"] = sorted(after_put)
+        self.trace[-1]["route_blockers_before"] = sorted(pick.before_get_blockers)
+        self.trace[-1]["route_blockers_after"] = sorted(pick.after_get_blockers)
+        self.trace[-1]["put_blockers_before"] = sorted(pick.before_put_blockers)
+        self.trace[-1]["put_blockers_after"] = sorted(pick.after_put_blockers)
         return accepted
+
+    def dynamic_context(self, debt: dict[str, Any]) -> DynamicContext | None:
+        if debt["pollution_nos"]:
+            return None
+        get_blockers, get_blocked_nos = self.pending_get_blocker_info(debt)
+        put_blockers, _put_blocked_nos = self.pending_put_blocker_info(debt)
+        if get_blockers & set(ASSEMBLY_DEPOT):
+            mode = "get_unlock"
+        elif not get_blockers and put_blockers & set(ASSEMBLY_DEPOT):
+            mode = "put_unlock"
+        elif not get_blockers:
+            mode = "debt_window"
+        else:
+            return None
+        return DynamicContext(
+            mode=mode,
+            get_blockers=get_blockers,
+            get_blocked_nos=get_blocked_nos,
+            put_blockers=put_blockers,
+        )
+
+    def dynamic_views_for_context(
+        self,
+        views: list[CandidateView],
+        debt: dict[str, Any],
+        context: DynamicContext,
+    ) -> list[CandidateView]:
+        if context.mode == "put_unlock":
+            return self.dynamic_release_first_views(views, debt)
+        return views
+
+    def dynamic_pick_for_evaluation(
+        self,
+        context: DynamicContext,
+        evaluation: CandidateEvaluation,
+        debt: dict[str, Any],
+    ) -> DynamicPick | None:
+        if context.mode == "get_unlock":
+            return self.get_unlock_dynamic_pick(context, evaluation, debt)
+        return self.put_or_debt_dynamic_pick(context, evaluation, debt)
+
+    def get_unlock_dynamic_pick(
+        self,
+        context: DynamicContext,
+        evaluation: CandidateEvaluation,
+        debt: dict[str, Any],
+    ) -> DynamicPick | None:
+        after_debt = evaluation.after_debt
+        after_get_blockers, _after_get_blocked_nos = evaluation.probe.pending_get_blocker_info(after_debt)
+        moves_get_blocked = bool(evaluation.moving_nos & context.get_blocked_nos)
+        unlocks_get = len(after_get_blockers) < len(context.get_blockers)
+        improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
+        if not moves_get_blocked and not unlocks_get and not after_debt["complete"]:
+            return None
+        if (
+            self.disallow_profile_sideways_stage1_move(evaluation.view.candidate, debt, after_debt)
+            and not unlocks_get
+        ):
+            return None
+        if (
+            after_debt["debt_count"] > debt["debt_count"]
+            and evaluation.view.candidate.source_line in ASSEMBLY_DEPOT
+            and evaluation.view.candidate.target_line not in ASSEMBLY_DEPOT
+            and not unlocks_get
+        ):
+            return None
+        primary = (
+            0
+            if after_debt["complete"]
+            else 1
+            if unlocks_get and not moves_get_blocked
+            else 2
+            if moves_get_blocked and improves_debt
+            else 3
+            if improves_debt
+            else 4
+        )
+        return DynamicPick(
+            score=self.compose_dynamic_score(
+                primary=primary,
+                candidate=evaluation.view.candidate,
+                debt=debt,
+                after_debt=after_debt,
+                blocker_count=len(after_get_blockers),
+                downstream_quality=evaluation.downstream_quality,
+                view_score=evaluation.view.score,
+            ),
+            evaluation=evaluation,
+            before_get_blockers=context.get_blockers,
+            after_get_blockers=after_get_blockers,
+            before_put_blockers=context.put_blockers,
+            after_put_blockers=set(),
+        )
+
+    def put_or_debt_dynamic_pick(
+        self,
+        context: DynamicContext,
+        evaluation: CandidateEvaluation,
+        debt: dict[str, Any],
+    ) -> DynamicPick | None:
+        after_debt = evaluation.after_debt
+        after_put_blockers: set[str] = set()
+        unlocks_put = False
+        if context.put_blockers:
+            after_put_blockers, _after_put_blocked_nos = evaluation.probe.pending_put_blocker_info(after_debt)
+            unlocks_put = (
+                bool(context.put_blockers & set(ASSEMBLY_DEPOT))
+                and len(after_put_blockers) < len(context.put_blockers)
+            )
+            if len(after_put_blockers) > len(context.put_blockers) and not after_debt["complete"]:
+                return None
+        if unlocks_put and self.large_assembly_debt_rebound(evaluation.view.candidate, debt, after_debt):
+            return None
+        direct_delivery_priority = (
+            not context.put_blockers
+            and self.direct_delivery_priority_candidate(evaluation.view.candidate, debt, after_debt)
+        )
+        if (
+            self.disallow_profile_sideways_stage1_move(evaluation.view.candidate, debt, after_debt)
+            and not unlocks_put
+        ):
+            return None
+        improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
+        primary = (
+            0
+            if after_debt["complete"]
+            else 1
+            if direct_delivery_priority
+            else 2
+            if unlocks_put
+            else 3
+            if improves_debt
+            else 5
+        )
+        if primary == 5 and context.mode == "put_unlock":
+            return None
+        return DynamicPick(
+            score=self.compose_dynamic_score(
+                primary=primary,
+                candidate=evaluation.view.candidate,
+                debt=debt,
+                after_debt=after_debt,
+                blocker_count=len(after_put_blockers),
+                downstream_quality=evaluation.downstream_quality,
+                view_score=evaluation.view.score,
+            ),
+            evaluation=evaluation,
+            before_get_blockers=set(),
+            after_get_blockers=set(),
+            before_put_blockers=context.put_blockers,
+            after_put_blockers=after_put_blockers,
+        )
+
+    def compose_dynamic_score(
+        self,
+        *,
+        primary: int,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+        after_debt: dict[str, Any],
+        blocker_count: int,
+        downstream_quality: tuple[int, ...],
+        view_score: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        return (
+            primary,
+            self.dynamic_target_group(candidate),
+            blocker_count,
+            max(0, after_debt["debt_count"] - debt["debt_count"]),
+            self.progress_tuple(after_debt),
+            downstream_quality,
+            self.real_target_dynamic_rank(candidate, debt, after_debt),
+            view_score,
+        )
 
     def dynamic_target_group(self, candidate: physical.HookCandidate) -> int:
         if candidate.target_line == "存4线":
@@ -577,7 +693,7 @@ class Stage1Solver:
         debt: dict[str, Any],
         after_debt: dict[str, Any],
     ) -> int:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return 1
         if after_debt["debt_count"] > debt["debt_count"]:
             return 1
@@ -601,7 +717,7 @@ class Stage1Solver:
         debt: dict[str, Any],
         after_debt: dict[str, Any],
     ) -> bool:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return False
         if self.progress_tuple(after_debt) < self.progress_tuple(debt):
             return False
@@ -633,7 +749,7 @@ class Stage1Solver:
         return ordered
 
     def try_satisfied_return_cleanup(self, debt: dict[str, Any]) -> bool:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return False
         if debt["pollution_nos"]:
             return False
@@ -644,24 +760,25 @@ class Stage1Solver:
         for view in views:
             if self.time_exhausted():
                 return False
-            validation = self.validate_candidate(view.candidate)
-            if not validation.accepted:
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": list(validation.reasons),
-                })
+            evaluation = self.evaluate_candidate(
+                view,
+                debt,
+                rejected,
+                reject_dead_end=False,
+            )
+            if evaluation is None:
                 continue
-            probe = self.probe_after(view.candidate, validation)
-            after_debt = probe.stage1_debt()
+            after_debt = evaluation.after_debt
             if not after_debt["complete"]:
-                rejected.append({
-                    "candidate_id": view.candidate.candidate_id,
-                    "reason": view.reason,
-                    "violations": ["satisfied_return_reopens_stage1_debt"],
-                })
+                self.reject_candidate(rejected, view, ["satisfied_return_reopens_stage1_debt"])
                 continue
-            accepted = self.accept_candidate(view, validation, after_debt, debt, rejected)
+            accepted = self.accept_candidate(
+                evaluation.view,
+                evaluation.validation,
+                after_debt,
+                debt,
+                rejected,
+            )
             self.trace[-1]["post_stage1_cleanup"] = True
             return accepted
         return False
@@ -767,6 +884,7 @@ class Stage1Solver:
         clone.time_budget_seconds = self.time_budget_seconds
         clone.validation_cache = self.validation_cache
         clone.profile = self.profile
+        clone.config = self.config
         clone.downstream_quality_cache = self.downstream_quality_cache
         clone.initial_stage4_satisfied_nos = set(self.initial_stage4_satisfied_nos)
         return clone
@@ -809,7 +927,6 @@ class Stage1Solver:
             }
         candidates: list[CandidateView] = []
         candidates.extend(self.direct_assembly_candidates(debt))
-        candidates.extend(self.split_put_assembly_candidates(debt))
         candidates.extend(self.blocker_candidates(debt))
         candidates.extend(self.route_blocker_candidates(debt))
         candidates.extend(self.cleanup_candidates(debt))
@@ -821,32 +938,51 @@ class Stage1Solver:
             unique.setdefault(item.candidate.candidate_id, item)
         return list(unique.values())
 
+    def collect_homogeneous_north_prefix(
+        self,
+        ordered: list[dict[str, Any]],
+        key_for_car: Callable[[dict[str, Any]], str],
+        *,
+        stop_after_pending_weigh: bool,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        key = ""
+        prefix: list[dict[str, Any]] = []
+        pull_equivalent = 0
+        for car in ordered:
+            car_key = key_for_car(car)
+            if not car_key:
+                break
+            if key and car_key != key:
+                break
+            next_pull = pull_equivalent + (4 if bool(car.get("IsHeavy")) else 1)
+            if next_pull > physical.PULL_LIMIT_EQUIVALENT:
+                break
+            key = car_key
+            prefix.append(car)
+            pull_equivalent = next_pull
+            if stop_after_pending_weigh and self.pending_weigh(car):
+                break
+        return key, prefix
+
     def direct_assembly_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        by_no = self.by_no()
         for line in self.active_lines():
             if line in FORBIDDEN_LINES:
                 continue
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            ordered = self.line_ordered_cars(line)
             if not ordered:
                 continue
-            first = ordered[0]
-            first_goal = self.stage1_goal(first)
-            if not first_goal or self.stage1_car_complete(first):
-                continue
-            target_group = "unwheel" if first_goal == "存4线" else "depot"
-            max_batch: list[dict[str, Any]] = []
-            for car in ordered:
+
+            def direct_assembly_key(car: dict[str, Any]) -> str:
                 goal = self.stage1_goal(car)
                 if not goal or self.stage1_car_complete(car):
-                    break
-                if ("unwheel" if goal == "存4线" else "depot") != target_group:
-                    break
-                trial = [*max_batch, car]
-                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
-                    break
-                max_batch = trial
-                if car.get("IsWeigh") and not car.get("_Weighed"):
-                    break
+                    return ""
+                return "unwheel" if goal == "存4线" else "depot"
+
+            target_group, max_batch = self.collect_homogeneous_north_prefix(
+                ordered,
+                direct_assembly_key,
+                stop_after_pending_weigh=True,
+            )
             if not max_batch:
                 continue
             targets = (
@@ -858,163 +994,70 @@ class Stage1Solver:
                 for target in targets:
                     if self.disallow_stage1_temp_to_temp(line, target, batch):
                         continue
-                    if not self.target_allowed(target, batch):
-                        continue
-                    candidate = self.make_candidate(
+                    view = self.single_put_view(
                         source=line,
                         target=target,
                         batch=batch,
                         kind="vnext_depot_inbound_assembly_session",
                         reason="direct_assembly",
-                    )
-                    if not candidate:
-                        continue
-                    candidates_score = self.score_candidate(
-                        candidate,
                         debt=debt,
                         moved_g=sum(1 for car in batch if self.stage1_goal(car)),
                         moved_x=0,
                         reason_rank=0,
                     )
-                    yield CandidateView(candidate, candidates_score, "direct_assembly")
-
-    def split_put_assembly_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        if not PROFILE_CONFIGS[self.profile]["split_put"]:
-            return
-        if debt["pollution_nos"]:
-            return
-        by_no = self.by_no()
-        for line in self.active_lines():
-            if line in FORBIDDEN_LINES:
-                continue
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
-            if not ordered:
-                continue
-            max_batch: list[dict[str, Any]] = []
-            for car in ordered:
-                if self.stage1_goal(car) != "depot_assembly" or self.stage1_car_complete(car):
-                    break
-                trial = [*max_batch, car]
-                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
-                    break
-                max_batch = trial
-                if car.get("IsWeigh") and not car.get("_Weighed"):
-                    break
-            if len(max_batch) < 2:
-                continue
-
-            emitted = 0
-            for batch in self.prefix_options(max_batch):
-                source_limit_reached = False
-                if len(batch) < 2:
-                    continue
-                for cut in range(1, len(batch)):
-                    prefix = batch[:cut]
-                    suffix = batch[cut:]
-                    if not prefix or not suffix:
-                        continue
-                    for first_target in ASSEMBLY_DEPOT:
-                        if (
-                            first_target == line
-                            or self.line_has_cars(first_target, excluded_nos={physical.car_no(car) for car in suffix})
-                            or not self.target_allowed(first_target, suffix)
-                        ):
-                            continue
-                        for second_target in ASSEMBLY_DEPOT:
-                            if (
-                                second_target == first_target
-                                or self.line_has_cars(second_target, excluded_nos={physical.car_no(car) for car in prefix})
-                                or not self.target_allowed(second_target, prefix)
-                            ):
-                                continue
-                            candidate = self.make_split_put_candidate(
-                                source=line,
-                                first_target=first_target,
-                                first_batch=suffix,
-                                second_target=second_target,
-                                second_batch=prefix,
-                                kind="vnext_depot_inbound_split_put",
-                                reason="direct_assembly_split_put",
-                            )
-                            if not candidate:
-                                continue
-                            score = self.score_candidate(
-                                candidate,
-                                debt=debt,
-                                moved_g=sum(1 for car in batch if self.stage1_goal(car)),
-                                moved_x=0,
-                                reason_rank=0,
-                            )
-                            yield CandidateView(candidate, score, "direct_assembly_split_put")
-                            emitted += 1
-                            if emitted >= SPLIT_PUT_MAX_CANDIDATES_PER_SOURCE:
-                                source_limit_reached = True
-                                break
-                        if source_limit_reached:
-                            break
-                    if source_limit_reached:
-                        break
-                if source_limit_reached:
-                    break
+                    if view:
+                        yield view
 
     def direct_delivery_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        if not PROFILE_CONFIGS[self.profile]["direct_delivery"]:
+        if not self.config.direct_delivery:
             return
-        if self.direct_delivery_hooks_used() >= int(PROFILE_CONFIGS[self.profile]["direct_delivery_max_hooks"]):
+        if self.direct_delivery_hooks_used() >= self.config.direct_delivery_max_hooks:
             return
         if debt["pollution_nos"]:
             return
         ready_targets = {
-            target: self.direct_delivery_target_ready(target)
+            target: self.real_target_line_ready(target)
             for target in DIRECT_DELIVERY_TARGETS
         }
         if not any(ready_targets.values()):
             return
-        by_no = self.by_no()
         for line in self.active_lines():
             if line in FORBIDDEN_LINES:
                 continue
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            ordered = self.line_ordered_cars(line)
             if not ordered:
                 continue
-            target = ""
-            max_batch: list[dict[str, Any]] = []
-            for car in ordered:
+
+            def direct_delivery_key(car: dict[str, Any]) -> str:
                 car_target = self.direct_delivery_target_for_car(car)
                 if not car_target or car_target == line or not ready_targets.get(car_target):
-                    break
-                if target and car_target != target:
-                    break
-                trial = [*max_batch, car]
-                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
-                    break
-                target = car_target
-                max_batch = trial
-                if car.get("IsWeigh") and not car.get("_Weighed"):
-                    break
+                    return ""
+                return car_target
+
+            target, max_batch = self.collect_homogeneous_north_prefix(
+                ordered,
+                direct_delivery_key,
+                stop_after_pending_weigh=True,
+            )
             if not target or not max_batch:
                 continue
+            if not self.direct_delivery_route_low_cost(line, target):
+                continue
             for batch in self.prefix_options(max_batch):
-                if not self.direct_delivery_batch_allowed(target, batch):
-                    continue
-                if not self.target_allowed(target, batch):
-                    continue
-                if not self.direct_delivery_route_low_cost(line, target):
-                    continue
-                candidate = self.make_candidate(
+                reason = f"stage1_direct_delivery:{target}"
+                view = self.single_put_view(
                     source=line,
                     target=target,
                     batch=batch,
                     kind="vnext_stage1_direct_delivery",
-                    reason=f"stage1_direct_delivery:{target}",
+                    reason=reason,
+                    debt=debt,
+                    moved_g=0,
+                    moved_x=len(batch),
+                    reason_rank=4,
                 )
-                if not candidate:
-                    continue
-                yield CandidateView(
-                    candidate,
-                    self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=4),
-                    f"stage1_direct_delivery:{target}",
-                )
+                if view:
+                    yield view
 
     def blocker_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
         by_no = self.by_no()
@@ -1031,22 +1074,19 @@ class Stage1Solver:
             blockers = [by_no[no] for no in ordered_nos[:first_pending] if no in by_no]
             for batch in self.prefix_options(blockers):
                 for target in self.blocker_targets(batch, source=line, debt=debt):
-                    if not self.target_allowed(target, batch):
-                        continue
-                    candidate = self.make_candidate(
+                    view = self.single_put_view(
                         source=line,
                         target=target,
                         batch=batch,
                         kind="blocker_relocation",
                         reason="clear_prefix_blocker",
+                        debt=debt,
+                        moved_g=0,
+                        moved_x=len(batch),
+                        reason_rank=1,
                     )
-                    if not candidate:
-                        continue
-                    yield CandidateView(
-                        candidate,
-                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=1),
-                        "clear_prefix_blocker",
-                    )
+                    if view:
+                        yield view
 
     def route_blocker_candidates(
         self,
@@ -1054,36 +1094,31 @@ class Stage1Solver:
         *,
         include_put_blockers: bool = False,
     ) -> Iterable[CandidateView]:
-        by_no = self.by_no()
         for blocker_line, reason in self.route_blocker_requests(debt, include_put_blockers=include_put_blockers):
             if blocker_line in FORBIDDEN_LINES:
                 continue
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, blocker_line) if no in by_no]
+            ordered = self.line_ordered_cars(blocker_line)
             if not ordered:
                 continue
             for batch in self.prefix_options(ordered):
                 for target in self.blocker_targets(batch, source=blocker_line, debt=debt):
-                    if not self.target_allowed(target, batch):
-                        continue
-                    candidate = self.make_candidate(
+                    view = self.single_put_view(
                         source=blocker_line,
                         target=target,
                         batch=batch,
                         kind="blocker_relocation",
                         reason=reason,
+                        debt=debt,
+                        moved_g=0,
+                        moved_x=len(batch),
+                        reason_rank=1,
                     )
-                    if not candidate:
-                        continue
-                    yield CandidateView(
-                        candidate,
-                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=1),
-                        reason,
-                    )
+                    if view:
+                        yield view
 
     def cleanup_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        by_no = self.by_no()
         for line in ASSEMBLY_ALL:
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            ordered = self.line_ordered_cars(line)
             if not ordered:
                 continue
             polluted_prefixes = [
@@ -1095,22 +1130,19 @@ class Stage1Solver:
                 if physical.pull_equivalent(batch) > physical.PULL_LIMIT_EQUIVALENT:
                     continue
                 for target in self.blocker_targets(batch, source=line, debt=debt):
-                    if not self.target_allowed(target, batch):
-                        continue
-                    candidate = self.make_candidate(
+                    view = self.single_put_view(
                         source=line,
                         target=target,
                         batch=batch,
                         kind="blocker_relocation",
                         reason="stage_boundary_cleanup",
+                        debt=debt,
+                        moved_g=0,
+                        moved_x=len(batch),
+                        reason_rank=2,
                     )
-                    if not candidate:
-                        continue
-                    yield CandidateView(
-                        candidate,
-                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=2),
-                        "stage_boundary_cleanup",
-                    )
+                    if view:
+                        yield view
 
     def route_blocker_requests(
         self,
@@ -1264,9 +1296,8 @@ class Stage1Solver:
             for car in self.cars
         ):
             return
-        by_no = self.by_no()
         for line in ("洗油北", "机走棚", "机走北"):
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            ordered = self.line_ordered_cars(line)
             if not ordered:
                 continue
             movable = [car for car in ordered if self.stage1_goal(car)]
@@ -1276,75 +1307,65 @@ class Stage1Solver:
                 for target in ASSEMBLY_DEPOT:
                     if target == line:
                         continue
-                    if not self.target_allowed(target, batch):
-                        continue
-                    candidate = self.make_candidate(
+                    view = self.single_put_view(
                         source=line,
                         target=target,
                         batch=batch,
                         kind="blocker_relocation",
                         reason="release_gate_assembly",
+                        debt=debt,
+                        moved_g=0,
+                        moved_x=0,
+                        reason_rank=3,
                     )
-                    if not candidate:
-                        continue
-                    yield CandidateView(
-                        candidate,
-                        self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=0, reason_rank=3),
-                        "release_gate_assembly",
-                    )
+                    if view:
+                        yield view
 
     def satisfied_return_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return
         if debt["pollution_nos"]:
             return
-        by_no = self.by_no()
         for line in self.active_lines():
             if line in FORBIDDEN_LINES or line in ASSEMBLY_ALL:
                 continue
-            ordered = [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+            ordered = self.line_ordered_cars(line)
             if not ordered:
                 continue
-            target = ""
-            max_batch: list[dict[str, Any]] = []
-            for car in ordered:
+
+            def satisfied_return_key(car: dict[str, Any]) -> str:
                 car_target = self.satisfied_return_target_for_car(car)
                 if not car_target or car_target == line:
-                    break
-                if target and car_target != target:
-                    break
-                if not self.real_target_ready(car_target):
-                    break
-                trial = [*max_batch, car]
-                if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
-                    break
-                target = car_target
-                max_batch = trial
+                    return ""
+                if not self.real_target_line_ready(car_target):
+                    return ""
+                return car_target
+
+            target, max_batch = self.collect_homogeneous_north_prefix(
+                ordered,
+                satisfied_return_key,
+                stop_after_pending_weigh=False,
+            )
             if not target or not max_batch:
                 continue
             for batch in self.prefix_options(max_batch):
-                if not all(self.satisfied_return_target_for_car(car) == target for car in batch):
-                    continue
-                if not self.target_allowed(target, batch):
-                    continue
-                candidate = self.make_candidate(
+                reason = f"stage1_satisfied_return:{target}"
+                view = self.single_put_view(
                     source=line,
                     target=target,
                     batch=batch,
                     kind="vnext_stage1_satisfied_return",
-                    reason=f"stage1_satisfied_return:{target}",
+                    reason=reason,
+                    debt=debt,
+                    moved_g=0,
+                    moved_x=len(batch),
+                    reason_rank=3,
                 )
-                if not candidate:
-                    continue
-                yield CandidateView(
-                    candidate,
-                    self.score_candidate(candidate, debt=debt, moved_g=0, moved_x=len(batch), reason_rank=3),
-                    f"stage1_satisfied_return:{target}",
-                )
+                if view:
+                    yield view
 
     def blocker_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
         targets: list[str] = []
-        targets.extend(self.depot_assembly_targets_for_batch(batch, source=source))
         direct = self.common_current_target(batch)
         if (
             direct
@@ -1358,16 +1379,8 @@ class Stage1Solver:
         targets.extend(self.safe_temp_targets(source=source, debt=debt))
         return list(dict.fromkeys(targets))
 
-    def depot_assembly_targets_for_batch(self, batch: list[dict[str, Any]], *, source: str) -> list[str]:
-        del batch, source
-        return []
-
-    def line_has_cars(self, line: str, *, excluded_nos: set[str] | None = None) -> bool:
-        excluded_nos = excluded_nos or set()
-        return any(car["Line"] == line and physical.car_no(car) not in excluded_nos for car in self.cars)
-
     def grouped_cache_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return []
         target = self.common_stage4_cache_target(batch)
         if not target:
@@ -1400,11 +1413,12 @@ class Stage1Solver:
 
     def prefix_options(self, cars: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         prefix: list[dict[str, Any]] = []
+        pull_equivalent = 0
         for car in cars:
-            trial = [*prefix, car]
-            if physical.pull_equivalent(trial) > physical.PULL_LIMIT_EQUIVALENT:
+            pull_equivalent += 4 if bool(car.get("IsHeavy")) else 1
+            if pull_equivalent > physical.PULL_LIMIT_EQUIVALENT:
                 break
-            prefix = trial
+            prefix.append(car)
             if car.get("IsWeigh") and not car.get("_Weighed"):
                 break
         return [prefix[:size] for size in range(len(prefix), 0, -1)]
@@ -1448,6 +1462,42 @@ class Stage1Solver:
         storage_bias = STAGE4_CACHE_GROUP_LINES.index(line) if line in STAGE4_CACHE_GROUP_LINES else 99
         return (group_state, new_target_type, mixed_count, current_load, storage_bias)
 
+    def single_put_view(
+        self,
+        *,
+        source: str,
+        target: str,
+        batch: list[dict[str, Any]],
+        kind: str,
+        reason: str,
+        debt: dict[str, Any],
+        moved_g: int,
+        moved_x: int,
+        reason_rank: int,
+    ) -> CandidateView | None:
+        if not self.target_allowed(target, batch):
+            return None
+        candidate = self.make_candidate(
+            source=source,
+            target=target,
+            batch=batch,
+            kind=kind,
+            reason=reason,
+        )
+        if not candidate:
+            return None
+        return CandidateView(
+            candidate,
+            self.score_candidate(
+                candidate,
+                debt=debt,
+                moved_g=moved_g,
+                moved_x=moved_x,
+                reason_rank=reason_rank,
+            ),
+            reason,
+        )
+
     def make_candidate(
         self,
         *,
@@ -1472,39 +1522,6 @@ class Stage1Solver:
             hook_index=self.hook_index,
             source_line=source,
             target_line=target,
-            batch=batch,
-            steps=steps,
-            reason=reason,
-            candidate_kind=kind,
-        )
-
-    def make_split_put_candidate(
-        self,
-        *,
-        source: str,
-        first_target: str,
-        first_batch: list[dict[str, Any]],
-        second_target: str,
-        second_batch: list[dict[str, Any]],
-        kind: str,
-        reason: str,
-    ) -> physical.HookCandidate | None:
-        if source in FORBIDDEN_LINES or first_target in FORBIDDEN_LINES or second_target in FORBIDDEN_LINES:
-            return None
-        batch = [*second_batch, *first_batch]
-        all_nos = tuple(physical.car_no(car) for car in batch)
-        first_nos = tuple(physical.car_no(car) for car in first_batch)
-        second_nos = tuple(physical.car_no(car) for car in second_batch)
-        steps = (
-            physical.plan_step("Get", source, all_nos),
-            physical.plan_step("Put", first_target, first_nos),
-            physical.plan_step("Put", second_target, second_nos),
-        )
-        return physical.build_planlet_candidate(
-            case_id=self.case_id,
-            hook_index=self.hook_index,
-            source_line=source,
-            target_line=second_target,
             batch=batch,
             steps=steps,
             reason=reason,
@@ -1539,7 +1556,7 @@ class Stage1Solver:
         )
 
     def tail_target_rank(self, candidate: physical.HookCandidate) -> int:
-        if not PROFILE_CONFIGS[self.profile]["target_aware"]:
+        if not self.config.target_aware:
             return 1
         moved = [car for car in self.cars if physical.car_no(car) in set(candidate.move_car_nos)]
         if not moved:
@@ -1554,30 +1571,35 @@ class Stage1Solver:
         return 3
 
     def real_target_static_rank(self, candidate: physical.HookCandidate) -> int:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return 1
         return 0 if self.safe_static_real_target_put(candidate) else 1
+
+    def candidate_moved_cars(self, candidate: physical.HookCandidate) -> list[dict[str, Any]]:
+        by_no = self.by_no()
+        moved = [by_no[no] for no in candidate.move_car_nos if no in by_no]
+        return moved if len(moved) == len(candidate.move_car_nos) else []
 
     def clean_real_target_put(self, candidate: physical.HookCandidate) -> bool:
         moving_nos = set(candidate.move_car_nos)
         if not moving_nos:
             return False
-        if not self.stage1_real_target_available(candidate.target_line):
-            return False
-        by_no = self.by_no()
-        moved = [by_no[no] for no in candidate.move_car_nos if no in by_no]
-        if len(moved) != len(candidate.move_car_nos):
+        moved = self.candidate_moved_cars(candidate)
+        if not moved:
             return False
         if any(self.stage1_goal(car) for car in moved):
             return False
-        if any(not self.stage4_target_line_satisfied_by(car, candidate.target_line) for car in moved):
+        if any(
+            not self.car_can_use_real_target(
+                car,
+                candidate.target_line,
+                allow_pending_weigh=True,
+                require_unsatisfied=False,
+            )
+            for car in moved
+        ):
             return False
-        existing = [
-            car
-            for car in self.cars
-            if car["Line"] == candidate.target_line and physical.car_no(car) not in moving_nos
-        ]
-        return all(self.target_satisfied(car) and not physical.force_positions(car) for car in existing)
+        return self.real_target_line_ready(candidate.target_line, excluded_nos=moving_nos)
 
     def safe_static_real_target_put(self, candidate: physical.HookCandidate) -> bool:
         if candidate.candidate_kind not in {
@@ -1673,7 +1695,7 @@ class Stage1Solver:
         return len(static) + sum(3 for line in static if line in hot)
 
     def satisfied_break_penalty(self, candidate: physical.HookCandidate) -> int:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return 0
         by_no = self.by_no()
         penalty = 0
@@ -1692,7 +1714,7 @@ class Stage1Solver:
         return bool(self.stage4_target_key(car)) and self.target_satisfied(car)
 
     def cache_group_rank(self, candidate: physical.HookCandidate) -> tuple[int, int, int, int, int]:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return (0, 0, 0, 0, 0)
         if candidate.target_line not in CACHE_LINES:
             return (0, 0, 0, 0, 0)
@@ -1704,17 +1726,8 @@ class Stage1Solver:
         return self.cache_line_rank_for_target(candidate.target_line, target, set(candidate.move_car_nos))
 
     def direct_delivery_target_for_car(self, car: dict[str, Any]) -> str:
-        if self.stage1_goal(car) or self.target_satisfied(car):
-            return ""
-        if physical.force_positions(car):
-            return ""
-        if car.get("IsWeigh") and not car.get("_Weighed"):
-            return ""
-        targets = set(car.get("TargetLines") or ())
         for target in DIRECT_DELIVERY_TARGETS:
-            if not self.stage1_real_target_available(target):
-                continue
-            if target in targets and self.stage4_target_line_satisfied_by(car, target):
+            if self.car_can_use_real_target(car, target, allow_pending_weigh=False):
                 return target
         return ""
 
@@ -1722,29 +1735,39 @@ class Stage1Solver:
         no = physical.car_no(car)
         if no not in self.initial_stage4_satisfied_nos:
             return ""
-        if self.stage1_goal(car) or self.target_satisfied(car):
-            return ""
-        if physical.force_positions(car):
-            return ""
         target = self.stage4_target_key(car)
         if target not in REAL_TARGET_STATIC_LINES:
             return ""
-        if not self.stage1_real_target_available(target):
-            return ""
-        return target if self.stage4_target_line_satisfied_by(car, target) else ""
+        return target if self.car_can_use_real_target(car, target, allow_pending_weigh=True) else ""
 
-    def direct_delivery_target_ready(self, target: str) -> bool:
-        if target not in DIRECT_DELIVERY_TARGETS:
-            return False
+    def real_target_line_ready(self, target: str, *, excluded_nos: set[str] | None = None) -> bool:
         if not self.stage1_real_target_available(target):
             return False
-        return self.real_target_ready(target)
-
-    def real_target_ready(self, target: str) -> bool:
-        if not self.stage1_real_target_available(target):
-            return False
-        existing = [car for car in self.cars if car["Line"] == target]
+        excluded_nos = excluded_nos or set()
+        existing = [
+            car
+            for car in self.cars
+            if car["Line"] == target and physical.car_no(car) not in excluded_nos
+        ]
         return all(self.target_satisfied(car) and not physical.force_positions(car) for car in existing)
+
+    def car_can_use_real_target(
+        self,
+        car: dict[str, Any],
+        target: str,
+        *,
+        allow_pending_weigh: bool,
+        require_unsatisfied: bool = True,
+    ) -> bool:
+        if self.stage1_goal(car):
+            return False
+        if require_unsatisfied and self.target_satisfied(car):
+            return False
+        if not allow_pending_weigh and self.pending_weigh(car):
+            return False
+        if not self.stage1_real_target_available(target):
+            return False
+        return self.stage4_target_line_satisfied_by(car, target)
 
     def stage1_real_target_available(self, target: str) -> bool:
         if target != physical.WEIGH_LINE:
@@ -1760,17 +1783,9 @@ class Stage1Solver:
     def pending_weigh(self, car: dict[str, Any]) -> bool:
         return bool(car.get("IsWeigh")) and not bool(car.get("_Weighed"))
 
-    def direct_delivery_batch_allowed(self, target: str, batch: list[dict[str, Any]]) -> bool:
-        if not batch:
-            return False
-        return all(self.direct_delivery_target_for_car(car) == target for car in batch)
-
     def direct_delivery_route_low_cost(self, source: str, target: str) -> bool:
         route = self.graph.route(source, target)
         return bool(route and len(route) <= DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN)
-
-    def is_direct_delivery_candidate(self, candidate: physical.HookCandidate) -> bool:
-        return candidate.candidate_kind == "vnext_stage1_direct_delivery"
 
     def direct_delivery_priority_candidate(
         self,
@@ -1779,7 +1794,7 @@ class Stage1Solver:
         after_debt: dict[str, Any],
     ) -> bool:
         return (
-            self.is_direct_delivery_candidate(candidate)
+            candidate.candidate_kind == "vnext_stage1_direct_delivery"
             and len(candidate.move_car_nos) >= DIRECT_DELIVERY_PRIORITY_MIN_BATCH
             and self.progress_tuple(after_debt) <= self.progress_tuple(debt)
         )
@@ -1792,44 +1807,9 @@ class Stage1Solver:
         )
 
     def downstream_quality_tuple(self) -> tuple[int, ...]:
-        if not PROFILE_CONFIGS[self.profile]["downstream"]:
+        if not self.config.downstream:
             return ()
-        quality = self.downstream_quality()
-        order = PROFILE_CONFIGS[self.profile]["quality_order"]
-        layout = (
-            quality["stage4_extra_target_fragment_count"],
-            quality["stage4_target_run_count"],
-            -quality["stage4_south_settled_tail_count"],
-        )
-        if order == "stage3":
-            return (
-                quality["stage3_extra_fragment_count"],
-                quality["stage3_group_run_count"],
-                quality["stage3_prefix_blocked_count"],
-                quality["stage4_access_blocked_debt_count"],
-                quality["stage4_lower_bound"],
-                quality["stage4_tail_debt_count"],
-                *layout,
-            )
-        if order == "stage4":
-            return (
-                quality["stage4_access_blocked_debt_count"],
-                quality["stage4_lower_bound"],
-                quality["stage4_tail_debt_count"],
-                *layout,
-                quality["stage3_extra_fragment_count"],
-                quality["stage3_group_run_count"],
-                quality["stage3_prefix_blocked_count"],
-            )
-        return (
-            quality["stage3_extra_fragment_count"],
-            quality["stage3_group_run_count"],
-            quality["stage3_prefix_blocked_count"],
-            quality["stage4_access_blocked_debt_count"],
-            quality["stage4_lower_bound"],
-            quality["stage4_tail_debt_count"],
-            *layout,
-        )
+        return downstream_quality_vector(self.downstream_quality(), self.config.quality_order)
 
     def downstream_quality(self) -> dict[str, Any]:
         cache_key = physical.state_signature(self.cars, self.loco)
@@ -2241,6 +2221,10 @@ class Stage1Solver:
     def active_lines(self) -> list[str]:
         return sorted({car["Line"] for car in self.cars if car["Line"]}, key=lambda line: (self.source_rank(line), line))
 
+    def line_ordered_cars(self, line: str) -> list[dict[str, Any]]:
+        by_no = self.by_no()
+        return [by_no[no] for no in physical.line_access_order(self.cars, line) if no in by_no]
+
     def source_rank(self, line: str) -> int:
         return HOT_SOURCE_RANK.get(line, 50)
 
@@ -2372,58 +2356,11 @@ def portfolio_selection_key(result: dict[str, Any], objective: str = "balanced")
         int(debt.get("blocked_g_count") or 0),
         len(debt.get("pollution_nos") or ()),
     )
-    tail = int(quality.get("stage4_tail_debt_count") or 0)
-    lower_bound = int(quality.get("stage4_lower_bound") or 0)
-    access_blocked = int(quality.get("stage4_access_blocked_debt_count") or 0)
-    layout_fragments = int(quality.get("stage4_extra_target_fragment_count") or 0)
-    layout_runs = int(quality.get("stage4_target_run_count") or 0)
-    south_settled = int(quality.get("stage4_south_settled_tail_count") or 0)
-    fragments = int(quality.get("stage3_extra_fragment_count") or 0)
-    runs = int(quality.get("stage3_group_run_count") or 0)
-    prefix_blocked = int(quality.get("stage3_prefix_blocked_count") or 0)
     business_hooks = int(summary.get("business_hooks") or 0)
     profile_name = str(summary.get("profile") or "")
-    if objective == "stage4":
-        return (
-            *common,
-            access_blocked,
-            lower_bound,
-            tail,
-            layout_fragments,
-            layout_runs,
-            -south_settled,
-            fragments,
-            runs,
-            prefix_blocked,
-            business_hooks,
-            profile_name,
-        )
-    if objective == "stage3":
-        return (
-            *common,
-            fragments,
-            runs,
-            prefix_blocked,
-            access_blocked,
-            lower_bound,
-            tail,
-            layout_fragments,
-            layout_runs,
-            -south_settled,
-            business_hooks,
-            profile_name,
-        )
     return (
         *common,
-        fragments,
-        runs,
-        prefix_blocked,
-        access_blocked,
-        lower_bound,
-        tail,
-        layout_fragments,
-        layout_runs,
-        -south_settled,
+        *downstream_quality_vector(quality, objective),
         business_hooks,
         profile_name,
     )

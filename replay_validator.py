@@ -389,9 +389,96 @@ def forced_put_positions(cars: list[dict[str, Any]], line: str, move: list[str])
     return pos if not old_pos or max(pos.values()) < min(old_pos) else {}
 
 
-def apply_put(cars: list[dict[str, Any]], line: str, move: list[str]) -> None:
+def operation_positions(op: dict[str, Any]) -> dict[str, int]:
+    raw = op.get("Positions") or op.get("PositionMap") or {}
+    if isinstance(raw, dict):
+        out: dict[str, int] = {}
+        for no, position in raw.items():
+            try:
+                out[str(no)] = int(position)
+            except (TypeError, ValueError):
+                continue
+        return out
+    if isinstance(raw, list):
+        out: dict[str, int] = {}
+        for item in raw:
+            if isinstance(item, dict):
+                no = str(item.get("No") or item.get("no") or "")
+                try:
+                    position = int(item.get("Position") or item.get("position") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if no and position > 0:
+                    out[no] = position
+            elif isinstance(item, str) and ":" in item:
+                no, value = item.split(":", 1)
+                try:
+                    out[str(no)] = int(value)
+                except ValueError:
+                    continue
+        return out
+    return {}
+
+
+def explicit_put_position_errors(
+    index: int,
+    line: str,
+    move: list[str],
+    positions: dict[str, int],
+    cars: list[dict[str, Any]],
+) -> list[V]:
+    if not positions:
+        return []
+    bad: list[V] = []
+    ordered_positions = [
+        (no, int(positions[no]))
+        for no in move
+        if no in positions and int(positions[no]) > 0
+    ]
+    for (left_no, left_pos), (right_no, right_pos) in zip(ordered_positions, ordered_positions[1:]):
+        if right_pos > left_pos:
+            continue
+        bad.append(
+            V(
+                index,
+                "physical",
+                "put_position_order_violation",
+                f"{line}:{left_no}@{left_pos}->{right_no}@{right_pos}",
+            )
+        )
+    incoming_positions = [position for _no, position in ordered_positions]
+    if not incoming_positions:
+        return bad
+    existing_positions = [
+        int(c["Position"])
+        for c in cars
+        if c["Line"] == line and car_no(c) not in set(move) and int(c["Position"]) > 0
+    ]
+    if not existing_positions:
+        return bad
+    deepest_incoming = max(incoming_positions)
+    first_existing = min(existing_positions)
+    if deepest_incoming < first_existing:
+        return bad
+    bad.append(
+        V(
+            index,
+            "physical",
+            "put_position_blocked_by_access_end",
+            f"{line}:incoming_max={deepest_incoming}:first_existing={first_existing}",
+        )
+    )
+    return bad
+
+
+def apply_put(cars: list[dict[str, Any]], line: str, move: list[str], positions: dict[str, int] | None = None) -> None:
     old = [x for x in line_order(cars, line) if x not in set(move)]
-    pos = forced_put_positions(cars, line, move) or {no: i for i, no in enumerate(move + old, 1)}
+    explicit = positions or {}
+    pos = (
+        {no: int(explicit[no]) for no in move if no in explicit}
+        if explicit
+        else forced_put_positions(cars, line, move) or {no: i for i, no in enumerate(move + old, 1)}
+    )
     for c in cars:
         no = car_no(c)
         if no in pos:
@@ -447,16 +534,23 @@ def replay(req: dict[str, Any], resp: dict[str, Any]) -> tuple[list[dict[str, An
             loco = {line}
         elif action == "Put":
             mset = set(move)
+            positions = operation_positions(op)
             if not mset <= set(carried):
                 bad.append(V(idx, "physical", "put_without_carry", ",".join(sorted(mset - set(carried)))))
             if carried[-len(move):] != move if move else False:
                 bad.append(V(idx, "physical", "train_tail_put_order_violation", f"tail={carried[-len(move):]} move={move} train={carried}"))
+            if positions:
+                if set(positions) != mset:
+                    bad.append(V(idx, "physical", "put_positions_mismatch", f"positions={sorted(positions)} move={sorted(mset)}"))
+                if len(set(positions.values())) != len(positions):
+                    bad.append(V(idx, "physical", "put_position_collision", f"{positions}"))
+                bad += explicit_put_position_errors(idx, line, move, positions, cars)
             bad += route_errors(idx, action, op.get("PassbyPath") or [], loco, line, cars, set(carried), length(cars, set(carried)))
             after_len = sum(c["Length"] for c in cars if c["Line"] == line and car_no(c) not in mset) + length(cars, mset)
             if line in TRACK_LEN and after_len > TRACK_LEN[line] + TOL:
                 bad.append(V(idx, "physical", "target_line_length_violation", f"{line}:{after_len:.1f}>{TRACK_LEN[line]:.1f}"))
             bad += closed_door_put_errors(idx, line, [by[no] for no in carried if no in by], move, cars)
-            apply_put(cars, line, move)
+            apply_put(cars, line, move, positions)
             carried = [no for no in carried if no not in mset]
             loco = put_loco_positions(op.get("PassbyPath") or [], line)
         else:

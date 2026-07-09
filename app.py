@@ -1059,7 +1059,7 @@ def _p10_build_replay_frames(payload: dict, operation_rows, response: dict) -> l
             physical.apply_physical_put_order(cars, line, put_order)
             move_set = set(move_cars)
             carried_order = [car_no for car_no in carried_order if car_no not in move_set]
-            train_cars = []
+            train_cars = _p10_split_pipe(row.train_cars) or list(carried_order)
             target_line = line
         state = _p10_state_from_physical_cars(cars, physical)
 

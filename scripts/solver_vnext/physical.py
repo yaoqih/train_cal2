@@ -452,6 +452,7 @@ class OperationTraceRow:
     move_cars: str
     train_cars: str
     passby_path: str
+    positions: str = ""
 
 
 
@@ -1974,12 +1975,7 @@ def business_position_put_access_reasons(
     batch_nos: set[str],
     actual_positions: dict[str, int],
 ) -> list[str]:
-    if not put_uses_business_positions(
-        projected_cars,
-        candidate.target_line,
-        list(candidate.move_car_nos),
-        candidate.planned_positions,
-    ):
+    if not candidate.planned_positions:
         return []
     incoming_positions = [position for position in actual_positions.values() if position > 0]
     if not incoming_positions:
@@ -3428,6 +3424,17 @@ def operation_rows(
                 train_cars = "|".join(carried_order)
             else:
                 train_cars = "|".join(carried_order)
+            positions = ""
+            if (
+                step.action == "Put"
+                and step.planned_positions
+                and (step.line in DEPOT_TARGET_LINES or is_spotting_line(step.line))
+            ):
+                positions = "|".join(
+                    f"{no}:{int(step.planned_positions[no])}"
+                    for no in step.move_car_nos
+                    if no in step.planned_positions
+                )
             rows.append(
                 OperationTraceRow(
                     case_id=candidate.case_id,
@@ -3439,6 +3446,7 @@ def operation_rows(
                     move_cars="|".join(step.move_car_nos),
                     train_cars=train_cars,
                     passby_path="|".join(route_for_output(path)),
+                    positions=positions,
                 )
             )
         return rows
@@ -3483,6 +3491,15 @@ def operation_rows(
         move_cars="|".join(candidate.move_car_nos),
         train_cars="",
         passby_path="|".join(route_for_output(validation.put_path)),
+        positions=(
+            "|".join(
+                f"{no}:{int(candidate.planned_positions[no])}"
+                for no in candidate.move_car_nos
+                if no in candidate.planned_positions
+            )
+            if candidate.target_line in DEPOT_TARGET_LINES or is_spotting_line(candidate.target_line)
+            else ""
+        ),
     )
     )
     return rows
@@ -3499,7 +3516,7 @@ def last_weigh_car_no(move_car_nos: tuple[str, ...], cars: list[dict[str, Any]] 
 
 
 def response_operation(row: OperationTraceRow) -> dict[str, Any]:
-    return {
+    payload = {
         "Index": row.operation_index,
         "Line": row.line,
         "Action": row.action,
@@ -3507,6 +3524,14 @@ def response_operation(row: OperationTraceRow) -> dict[str, Any]:
         "TrainCars": row.train_cars.split("|") if row.train_cars else [],
         "PassbyPath": row.passby_path.split("|") if row.passby_path else [],
     }
+    if row.positions:
+        payload["Positions"] = {
+            no: int(position)
+            for item in row.positions.split("|")
+            if ":" in item
+            for no, position in [item.split(":", 1)]
+        }
+    return payload
 
 
 def apply_candidate(
