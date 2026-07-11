@@ -1,3 +1,7 @@
 *.pyc
 artifacts/
 .venv/
+build/
+dist/
+release-dist/
+packaging/windows/server.env.cmd

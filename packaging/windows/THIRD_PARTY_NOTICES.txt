@@ -1,0 +1,32 @@
+This distribution contains CPython and Python packages used by the API server.
+Their upstream projects and license information are listed below.
+
+CPython: PSF License 2.0
+https://www.python.org/psf/license/
+
+PyInstaller bootloader: GPL 2.0 or later with the PyInstaller Bootloader Exception
+https://pyinstaller.org/en/stable/license.html
+
+Starlette: BSD 3-Clause
+https://github.com/Kludex/starlette
+
+Uvicorn: BSD 3-Clause
+https://github.com/Kludex/uvicorn
+
+AnyIO: MIT
+https://github.com/agronholm/anyio
+
+Click: BSD 3-Clause
+https://github.com/pallets/click
+
+Colorama: BSD 3-Clause
+https://github.com/tartley/colorama
+
+h11: MIT
+https://github.com/python-hyper/h11
+
+idna: BSD 3-Clause
+https://github.com/kjd/idna
+
+typing_extensions: PSF License 2.0
+https://github.com/python/typing_extensions

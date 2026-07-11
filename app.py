@@ -15,10 +15,13 @@ import streamlit as st
 ROOT_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
 TRUTH2_DIR = ROOT_DIR / "data" / "truth2"
+TRUTH3_DIR = ROOT_DIR / "data" / "truth3"
 P10_SCHEMATIC_LAYOUT_PATH = ROOT_DIR / "data" / "map" / "schematic_layout.json"
 VNEXT_RUNTIME_SCRIPT_PATH = SCRIPTS_DIR / "generate_vnext_runtime_trace.py"
 VNEXT_SOLVER_DIR = SCRIPTS_DIR / "solver_vnext"
 APP_VNEXT_OUTPUT_DIR = ROOT_DIR / "artifacts" / "app_vnext_runtime"
+MANUAL_RESTORE_DIR = ROOT_DIR / "artifacts" / "manual_restored_interface"
+DEFAULT_FULLFLOW_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "fullflow_truth23_spotting_parallel_v1"
 DEFAULT_EVAL_ARTIFACT = (
     Path(__file__).resolve().parent
     / "artifacts"
@@ -147,11 +150,24 @@ def main():
     st.title("福州东调车 vNext Demo")
     st.caption("输入取送车计划，运行 vNext 求解演示，并查看评估统计。")
 
-    p10_tab, stage1_tab, stage2_tab, stage3_tab, stage4_tab, eval_tab = st.tabs(
-        ["vNext 求解演示", "第一阶段可视化", "第二阶段可视化", "第三阶段可视化", "第四阶段可视化", "评估统计"]
+    p10_tab, fullflow_tab, manual_tab, stage1_tab, stage2_tab, stage3_tab, stage4_tab, eval_tab = st.tabs(
+        [
+            "vNext 求解演示",
+            "全流程回放",
+            "人工计划回放",
+            "第一阶段可视化",
+            "第二阶段可视化",
+            "第三阶段可视化",
+            "第四阶段可视化",
+            "评估统计",
+        ]
     )
     with p10_tab:
         _render_p10_runtime_page()
+    with fullflow_tab:
+        _render_fullflow_replay_dashboard()
+    with manual_tab:
+        _render_manual_restored_dashboard()
     with stage1_tab:
         _render_stage1_simple_dashboard()
     with stage2_tab:
@@ -632,6 +648,131 @@ def _render_p10_result(
         _render_vnext_diagnostics(summary, candidate_rows, rejection_reasons, vehicle_display_labels)
 
 
+@st.cache_data(show_spinner=False)
+def _manual_restored_bundle_options() -> list[str]:
+    bundle_dir = MANUAL_RESTORE_DIR / "bundles"
+    if not bundle_dir.exists():
+        return []
+    paths = sorted(bundle_dir.glob("*.json"), key=lambda path: (_p10_try_case_id_from_text(path.name) or path.name, path.name))
+    return [str(path) for path in paths]
+
+
+def _render_manual_restored_dashboard() -> None:
+    st.subheader("人工计划回放")
+    st.caption("读取人工调车 Excel 还原出的接口响应 bundle，按 Operations 回放人工计划。")
+    options = _manual_restored_bundle_options()
+    if not options:
+        st.warning(
+            "还没有人工计划还原结果。先运行："
+            ".venv/bin/python scripts/restore_manual_interface_responses.py "
+            "--root . --output-dir artifacts/manual_restored_interface"
+        )
+        return
+
+    selected_path_text = st.selectbox(
+        "人工计划 bundle",
+        options=options,
+        format_func=_manual_restored_bundle_label,
+        key="manual-restored-bundle",
+    )
+    bundle_path = Path(selected_path_text)
+    try:
+        bundle = _p10_read_json(bundle_path)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"人工计划 bundle 读取失败：{exc}")
+        return
+
+    request_payload = bundle.get("Request") or {"StartStatus": [], "locoNode": {}}
+    response = bundle.get("Response") or {}
+    summary = bundle.get("Summary") or {}
+    trace_rows = bundle.get("Trace") or []
+    vehicle_display_labels = _p10_vehicle_display_labels(request_payload)
+    operation_rows = _manual_response_operation_rows(response)
+    success = bool(response.get("Success"))
+    if success:
+        st.success("人工计划响应已按人工同线口径完整还原。")
+    else:
+        st.warning(f"人工计划响应为部分还原：{response.get('Message') or summary.get('blocked_reason') or '未知原因'}")
+    st.caption("说明：该视图用于观察人工计划；人工同线组会跨越物理模型中的多段股道，因此不等同于 vNext 严格物理可执行结果。")
+
+    cols = st.columns(6)
+    cols[0].metric("案例", summary.get("case_id", _p10_try_case_id_from_text(bundle_path.name) or ""))
+    cols[1].metric("人工勾数", summary.get("manual_hook_count", 0))
+    cols[2].metric("接口操作", summary.get("operation_count", len(operation_rows)))
+    cols[3].metric("已还原", summary.get("restored_hook_count", 0))
+    cols[4].metric("无动车/跳过", summary.get("noop_hook_count", 0))
+    cols[5].metric("阻塞", summary.get("blocked_hook_count", 0))
+    st.caption(f"bundle：{bundle_path}")
+
+    view = st.radio(
+        "查看内容",
+        options=["可视化回放", "人工计划", "终态", "还原诊断", "原始 JSON"],
+        horizontal=True,
+        key="manual-restored-view",
+    )
+    if view == "可视化回放":
+        _render_p10_replay(request_payload, operation_rows, response, vehicle_display_labels, key_prefix="manual")
+    elif view == "人工计划":
+        st.markdown("**接口操作序列（ManualHook 为原人工勾号）**")
+        st.dataframe(_p10_operation_table_rows(operation_rows, vehicle_display_labels), width="stretch", hide_index=True)
+        if trace_rows:
+            st.markdown("**人工还原 Trace**")
+            st.dataframe(_manual_trace_table_rows(trace_rows, vehicle_display_labels), width="stretch", hide_index=True)
+    elif view == "终态":
+        _render_p10_end_status(response, vehicle_display_labels)
+    elif view == "还原诊断":
+        st.markdown("**summary**")
+        st.json(summary)
+        status_counts = Counter(str(row.get("status") or "") for row in trace_rows)
+        if status_counts:
+            st.markdown("**状态分布**")
+            st.dataframe(
+                [{"status": status, "count": count} for status, count in sorted(status_counts.items())],
+                width="stretch",
+                hide_index=True,
+            )
+        if trace_rows:
+            st.markdown("**Trace 明细**")
+            st.dataframe(_manual_trace_table_rows(trace_rows, vehicle_display_labels), width="stretch", hide_index=True)
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Request**")
+            st.json(_p10_response_for_display(request_payload, vehicle_display_labels))
+            st.markdown("**Summary**")
+            st.json(summary)
+        with right:
+            st.markdown("**Response**")
+            st.json(_p10_response_for_display(response, vehicle_display_labels))
+
+
+def _manual_restored_bundle_label(path_text: str) -> str:
+    path = Path(path_text)
+    case_id = _p10_try_case_id_from_text(path.name) or "未知案例"
+    return f"{case_id} | {path.name}"
+
+
+def _manual_trace_table_rows(trace_rows: list[dict], vehicle_display_labels: dict[str, str]) -> list[dict[str, object]]:
+    rows = []
+    for row in trace_rows:
+        rows.append(
+            {
+                "manualHook": row.get("manual_hook", ""),
+                "operationIndex": row.get("operation_index", ""),
+                "status": row.get("status", ""),
+                "raw": f"{row.get('line_raw', '')}{row.get('method', '')}{row.get('effective_count') or row.get('count') or ''}",
+                "note": row.get("note", ""),
+                "operation": row.get("operation_action", ""),
+                "line": row.get("operation_line", ""),
+                "moveCars": _p10_format_vehicle_pipe(row.get("move_cars", ""), vehicle_display_labels),
+                "trainCars": _p10_format_vehicle_pipe(row.get("train_cars", ""), vehicle_display_labels),
+                "candidate": row.get("candidate_validation", ""),
+                "detail": _p10_annotate_known_vehicle_text(row.get("detail", ""), vehicle_display_labels),
+            }
+        )
+    return rows
+
+
 def _p10_status_text(status: str) -> str:
     return {
         "completed": "完成",
@@ -906,11 +1047,24 @@ def _render_p10_replay(
     response: dict,
     vehicle_display_labels: dict[str, str],
     key_prefix: str = "p10",
+    operation_stage_labels: dict[int, str] | None = None,
 ) -> None:
     frames = _p10_build_replay_frames(payload, operation_rows, response)
     if not frames:
         st.info("当前没有可回放状态。")
         return
+    if operation_stage_labels:
+        for frame in frames:
+            operation_index = frame.get("operation")
+            if operation_index:
+                stage_label = operation_stage_labels.get(int(operation_index), "")
+            elif frame.get("action") == "Final":
+                stage_label = "全流程终态"
+            else:
+                stage_label = "原始起点"
+            frame["stage"] = stage_label
+            if stage_label and operation_index:
+                frame["title"] = f"{stage_label} | {frame['title']}"
     vehicle_target_tracks = _p10_vehicle_target_tracks(payload)
     max_frame_index = len(frames) - 1
     frame_key = f"{key_prefix}_replay_frame_index"
@@ -1129,6 +1283,8 @@ def _p10_replay_detail_html(
         ("移动车辆", frame["move_cars"], True),
         ("调车机后挂", frame["train_cars"], True),
     ]
+    if frame.get("stage"):
+        detail_rows.insert(1, ("阶段", frame["stage"], False))
     rows_html = []
     for label, value, multiline in detail_rows:
         value_html = (
@@ -1926,6 +2082,321 @@ def _render_stage_simple_io_paths(stage_no: int, output_path: Path) -> None:
         st.code(_stage_simple_run_command(stage_no), language="bash")
 
 
+_FULLFLOW_STAGE_LABELS = {
+    "stage1": "第一阶段",
+    "stage2": "第二阶段",
+    "stage3": "第三阶段",
+    "stage4": "第四阶段",
+}
+
+
+def _fullflow_case_rows(artifact_root: Path, dataset: str) -> list[dict[str, object]]:
+    dataset_root = artifact_root / dataset
+    case_ids = sorted(
+        path.name[: -len("_summary.json")]
+        for path in (dataset_root / "stage1").glob("*_summary.json")
+        if path.name != "aggregate_summary.json"
+    )
+    rows: list[dict[str, object]] = []
+    for case_id in case_ids:
+        summaries = {
+            stage: _stage1_read_json(dataset_root / stage / f"{case_id}_summary.json")
+            for stage in _FULLFLOW_STAGE_LABELS
+            if (dataset_root / stage / f"{case_id}_summary.json").exists()
+        }
+        responses = {
+            stage: _stage1_read_json(dataset_root / stage / f"{case_id}_response.json")
+            for stage in _FULLFLOW_STAGE_LABELS
+            if (dataset_root / stage / f"{case_id}_response.json").exists()
+        }
+        statuses = {
+            stage: str((summaries.get(stage) or {}).get("status") or "missing")
+            for stage in _FULLFLOW_STAGE_LABELS
+        }
+        stage_hooks = {
+            stage: _stage1_business_hook_count(responses.get(stage) or {})
+            for stage in _FULLFLOW_STAGE_LABELS
+        }
+        combined_path = dataset_root / "stage4" / f"{case_id}_combined_response.json"
+        combined_response = _stage1_read_json(combined_path) if combined_path.exists() else {}
+        full_status = "complete" if all(status == "complete" for status in statuses.values()) else "partial"
+        failed_stage = next(
+            (
+                _FULLFLOW_STAGE_LABELS[stage]
+                for stage, status in statuses.items()
+                if status != "complete"
+            ),
+            "",
+        )
+        stage4_summary = summaries.get("stage4") or {}
+        rows.append(
+            {
+                "caseId": case_id,
+                "status": full_status,
+                "failedStage": failed_stage,
+                "stage1": statuses["stage1"],
+                "stage2": statuses["stage2"],
+                "stage3": statuses["stage3"],
+                "stage4": statuses["stage4"],
+                "stage1Hooks": stage_hooks["stage1"],
+                "stage2Hooks": stage_hooks["stage2"],
+                "stage3Hooks": stage_hooks["stage3"],
+                "stage4Hooks": stage_hooks["stage4"],
+                "businessHooks": (
+                    _stage1_business_hook_count(combined_response)
+                    if combined_response
+                    else sum(stage_hooks.values())
+                ),
+                "finalUnsatisfied": int(stage4_summary.get("final_unsatisfied_count") or 0),
+                "combinedReplayOk": stage4_summary.get("combined_replay_physical_ok"),
+                "blockingReasons": " | ".join(stage4_summary.get("blocking_reasons") or []),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["status"] != "complete", str(row["caseId"])))
+
+
+def _fullflow_stage_boundaries(stage_responses: dict[str, dict]) -> tuple[list[dict[str, object]], list[str]]:
+    rows: list[dict[str, object]] = []
+    stage_sequence: list[str] = []
+    operation_offset = 0
+    hook_offset = 0
+    for stage, label in _FULLFLOW_STAGE_LABELS.items():
+        response = stage_responses.get(stage) or {}
+        operations = ((response.get("Data") or {}).get("Operations") or [])
+        operation_count = len(operations)
+        business_hook_count = _stage1_business_hook_count(response)
+        operation_start = operation_offset + 1 if operation_count else 0
+        operation_end = operation_offset + operation_count
+        hook_start = hook_offset + 1 if business_hook_count else 0
+        hook_end = hook_offset + business_hook_count
+        rows.append(
+            {
+                "stage": label,
+                "statusOperations": operation_count,
+                "operationRange": (
+                    f"{operation_start}-{operation_end}" if operation_count else "无"
+                ),
+                "businessHooks": business_hook_count,
+                "businessHookRange": f"{hook_start}-{hook_end}" if business_hook_count else "无",
+            }
+        )
+        stage_sequence.extend([label] * operation_count)
+        operation_offset = operation_end
+        hook_offset = hook_end
+    return rows, stage_sequence
+
+
+def _fullflow_operation_table_rows(
+    operation_rows,
+    vehicle_display_labels: dict[str, str],
+    stage_sequence: list[str],
+) -> list[dict[str, object]]:
+    rows = _p10_operation_table_rows(operation_rows, vehicle_display_labels)
+    return [
+        {"stage": stage_sequence[index] if index < len(stage_sequence) else "未知阶段", **row}
+        for index, row in enumerate(rows)
+    ]
+
+
+def _render_fullflow_replay_dashboard() -> None:
+    st.subheader("调车全流程回放")
+    st.caption("选择一个案例，从原始入段状态连续回放第一阶段至第四阶段的全部调车操作。")
+    artifact_text = st.text_input(
+        "全流程结果根目录",
+        value=str(DEFAULT_FULLFLOW_ARTIFACT_DIR),
+        key="fullflow-artifact-root",
+    )
+    artifact_root = Path(artifact_text).expanduser()
+    datasets = [
+        dataset
+        for dataset in ("truth2", "truth3")
+        if (artifact_root / dataset / "stage1").exists()
+        and (artifact_root / dataset / "stage4").exists()
+    ]
+    if not datasets:
+        st.warning("结果根目录中没有找到 truth2/truth3 的 stage1 至 stage4 输出。")
+        return
+    dataset = st.radio(
+        "数据集",
+        options=datasets,
+        horizontal=True,
+        key="fullflow-dataset",
+    )
+    dataset_root = artifact_root / dataset
+    case_rows = _fullflow_case_rows(artifact_root, dataset)
+    if not case_rows:
+        st.warning(f"{dataset} 中没有可用案例。")
+        return
+
+    complete_rows = [row for row in case_rows if row["status"] == "complete"]
+    complete_hooks = [int(row["businessHooks"] or 0) for row in complete_rows]
+    metrics = st.columns(5)
+    metrics[0].metric("案例数", len(case_rows))
+    metrics[1].metric("全流程完成", len(complete_rows))
+    metrics[2].metric("Partial", len(case_rows) - len(complete_rows))
+    metrics[3].metric("完成均勾", _stage1_average(complete_hooks))
+    metrics[4].metric("完成最大勾", max(complete_hooks) if complete_hooks else 0)
+
+    filters = st.columns([2, 2, 3])
+    status_filter = filters[0].selectbox(
+        "状态",
+        ["全部", "complete", "partial"],
+        key="fullflow-status-filter",
+    )
+    min_hooks = filters[1].number_input(
+        "最小总勾数",
+        min_value=0,
+        value=0,
+        step=1,
+        key="fullflow-min-hooks",
+    )
+    query = filters[2].text_input(
+        "案例/失败阶段/阻塞原因搜索",
+        value="",
+        key="fullflow-case-query",
+    )
+    filtered_rows = _stage1_filter_case_rows(
+        case_rows,
+        status_filter=status_filter,
+        min_hooks=int(min_hooks),
+        query=query,
+    )
+    st.dataframe(filtered_rows, width="stretch", hide_index=True)
+    if not filtered_rows:
+        return
+
+    selected_case = st.selectbox(
+        "选中案例",
+        options=[str(row["caseId"]) for row in filtered_rows],
+        format_func=lambda case_id: next(
+            (
+                f"{case_id} | {row['status']} | {row['businessHooks']} 勾"
+                f"{(' | 失败于' + str(row['failedStage'])) if row['failedStage'] else ''}"
+                for row in filtered_rows
+                if row["caseId"] == case_id
+            ),
+            case_id,
+        ),
+        key="fullflow-selected-case",
+    )
+    selected_row = next(row for row in case_rows if row["caseId"] == selected_case)
+    stage_summaries = {
+        stage: _stage1_read_json(dataset_root / stage / f"{selected_case}_summary.json")
+        for stage in _FULLFLOW_STAGE_LABELS
+        if (dataset_root / stage / f"{selected_case}_summary.json").exists()
+    }
+    stage_responses = {
+        stage: _stage1_read_json(dataset_root / stage / f"{selected_case}_response.json")
+        for stage in _FULLFLOW_STAGE_LABELS
+        if (dataset_root / stage / f"{selected_case}_response.json").exists()
+    }
+    combined_path = dataset_root / "stage4" / f"{selected_case}_combined_response.json"
+    combined_response = _stage1_read_json(combined_path) if combined_path.exists() else {}
+    request_payload = _stage1_load_truth_payload(selected_case)
+
+    selected_metrics = st.columns(7)
+    selected_metrics[0].metric("全流程状态", selected_row["status"])
+    selected_metrics[1].metric("总业务勾", selected_row["businessHooks"])
+    selected_metrics[2].metric("第一阶段", selected_row["stage1Hooks"])
+    selected_metrics[3].metric("第二阶段", selected_row["stage2Hooks"])
+    selected_metrics[4].metric("第三阶段", selected_row["stage3Hooks"])
+    selected_metrics[5].metric("第四阶段", selected_row["stage4Hooks"])
+    selected_metrics[6].metric("CombinedReplay", _stage_yes_no(selected_row["combinedReplayOk"]))
+    st.caption(
+        "阶段状态："
+        + " | ".join(
+            f"{label}={selected_row[stage]}"
+            for stage, label in _FULLFLOW_STAGE_LABELS.items()
+        )
+    )
+    if selected_row["blockingReasons"]:
+        st.info("阻塞原因：" + str(selected_row["blockingReasons"]))
+
+    boundary_rows, stage_sequence = _fullflow_stage_boundaries(stage_responses)
+    st.markdown("**阶段边界**")
+    st.dataframe(boundary_rows, width="stretch", hide_index=True)
+
+    view = st.radio(
+        "查看内容",
+        options=["可视化回放", "全流程勾计划", "阶段摘要", "终态", "原始 JSON"],
+        horizontal=True,
+        key="fullflow-view",
+    )
+    if view == "可视化回放":
+        if not request_payload:
+            st.warning(f"没有找到案例 {selected_case} 的原始 truth 请求。")
+        elif not combined_response:
+            st.warning("该案例没有 Stage4 combined_response，只能在对应阶段页签查看已完成片段。")
+        else:
+            operation_rows = _stage1_response_operation_rows(combined_response)
+            if len(operation_rows) != len(stage_sequence):
+                st.warning(
+                    f"阶段片段共 {len(stage_sequence)} 条操作，但 combined_response 有 "
+                    f"{len(operation_rows)} 条；阶段标签可能不完整。"
+                )
+            operation_stage_labels = {
+                row.operation_index: (
+                    stage_sequence[index] if index < len(stage_sequence) else "未知阶段"
+                )
+                for index, row in enumerate(operation_rows)
+            }
+            display_response = _stage_response_with_generated(request_payload, combined_response)
+            vehicle_labels = _p10_vehicle_display_labels(request_payload)
+            _render_p10_replay(
+                request_payload,
+                operation_rows,
+                display_response,
+                vehicle_labels,
+                key_prefix=f"fullflow-{dataset}",
+                operation_stage_labels=operation_stage_labels,
+            )
+    elif view == "全流程勾计划":
+        if not combined_response:
+            st.warning("该案例没有 Stage4 combined_response。")
+        else:
+            operation_rows = _stage1_response_operation_rows(combined_response)
+            vehicle_labels = _p10_vehicle_display_labels(request_payload or {})
+            st.dataframe(
+                _fullflow_operation_table_rows(operation_rows, vehicle_labels, stage_sequence),
+                width="stretch",
+                hide_index=True,
+            )
+    elif view == "阶段摘要":
+        st.dataframe(
+            [
+                {
+                    "stage": label,
+                    "status": (stage_summaries.get(stage) or {}).get("status", "missing"),
+                    "businessHooks": _stage1_business_hook_count(stage_responses.get(stage) or {}),
+                    "blockingReasons": " | ".join(
+                        (stage_summaries.get(stage) or {}).get("blocking_reasons") or []
+                    ),
+                }
+                for stage, label in _FULLFLOW_STAGE_LABELS.items()
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    elif view == "终态":
+        if combined_response:
+            _render_p10_end_status(
+                combined_response,
+                _p10_vehicle_display_labels(request_payload or {}),
+            )
+        else:
+            st.info("当前没有全流程终态。")
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**原始请求**")
+            st.json(request_payload or {})
+            st.markdown("**阶段 summaries**")
+            st.json(stage_summaries)
+        with right:
+            st.markdown("**Stage4 combined_response**")
+            st.json(combined_response)
+
+
 def _render_stage1_simple_dashboard() -> None:
     st.subheader("第一阶段可视化")
     st.caption("读取 scripts/stage1_simple 的输出，查看全量完成情况、单案例勾计划、线路回放和终态边界。")
@@ -2155,7 +2626,11 @@ def _stage1_read_json(path: Path):
 
 
 def _stage1_load_truth_payload(case_id: str) -> dict | None:
-    matches = sorted(TRUTH2_DIR.glob(f"*{case_id}.json"))
+    matches = sorted(
+        path
+        for truth_dir in (TRUTH2_DIR, TRUTH3_DIR)
+        for path in truth_dir.glob(f"*{case_id}.json")
+    )
     if not matches:
         return None
     try:
@@ -2179,6 +2654,25 @@ def _stage1_response_operation_rows(response: dict) -> list[Stage1OperationRow]:
                 hook_index=hook_index,
                 operation_index=int(op.get("Index") or fallback_index),
                 action=action,
+                line=str(op.get("Line") or ""),
+                move_cars=_stage1_operation_value_to_pipe(op.get("MoveCars")),
+                train_cars=_stage1_operation_value_to_pipe(op.get("TrainCars")),
+                passby_path=_stage1_operation_value_to_pipe(op.get("PassbyPath")),
+            )
+        )
+    return rows
+
+
+def _manual_response_operation_rows(response: dict) -> list[Stage1OperationRow]:
+    operations = ((response or {}).get("Data") or {}).get("Operations") or []
+    rows: list[Stage1OperationRow] = []
+    for fallback_index, op in enumerate(operations, start=1):
+        operation_index = int(op.get("Index") or fallback_index)
+        rows.append(
+            Stage1OperationRow(
+                hook_index=int(op.get("ManualHook") or operation_index),
+                operation_index=operation_index,
+                action=str(op.get("Action") or ""),
                 line=str(op.get("Line") or ""),
                 move_cars=_stage1_operation_value_to_pipe(op.get("MoveCars")),
                 train_cars=_stage1_operation_value_to_pipe(op.get("TrainCars")),

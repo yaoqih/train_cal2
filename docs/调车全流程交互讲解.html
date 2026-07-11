@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="基于109个人工作业案例的调车全过程讲解">
+  <title>调车全流程交互讲解</title>
+  <style>
+    :root {
+      --ink: #17201d;
+      --muted: #64706b;
+      --paper: #f4f6f3;
+      --surface: #ffffff;
+      --line: #d9dfdb;
+      --green: #147a5a;
+      --green-soft: #dff2e9;
+      --yellow: #f2b84b;
+      --yellow-soft: #fff2cf;
+      --red: #c84b3a;
+      --red-soft: #fde9e4;
+      --blue: #347aa3;
+      --blue-soft: #e2f0f7;
+      --target: #557f8b;
+      --target-soft: #e5eff1;
+      --charcoal: #26332e;
+      --shadow: 0 8px 24px rgba(26, 43, 36, .08);
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 15px/1.7 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+    button, select { font: inherit; letter-spacing: 0; }
+    button { cursor: pointer; }
+    a { color: inherit; }
+    :focus-visible { outline: 3px solid rgba(52,122,163,.35); outline-offset: 2px; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      height: 58px;
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid rgba(217,223,219,.9);
+      background: rgba(255,255,255,.94);
+      backdrop-filter: blur(12px);
+    }
+    .topbar-inner {
+      width: min(1440px, 100%);
+      margin: auto;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 220px; font-weight: 800; }
+    .brand-mark {
+      width: 32px; height: 32px; display: grid; place-items: center;
+      color: white; background: var(--charcoal); border-radius: 6px;
+    }
+    .brand-mark svg, .icon svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; }
+    .topnav { display: flex; align-items: center; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+    .topnav a { padding: 7px 10px; text-decoration: none; color: var(--muted); white-space: nowrap; border-radius: 5px; font-size: 13px; }
+    .topnav a:hover, .topnav a.active { color: var(--green); background: var(--green-soft); }
+    .progress { position: absolute; bottom: -1px; left: 0; height: 2px; background: var(--green); width: 0; }
+
+    .layout { width: min(1440px, 100%); margin: auto; display: grid; grid-template-columns: 228px minmax(0, 1fr); }
+    .sidebar { position: sticky; top: 58px; height: calc(100vh - 58px); padding: 28px 18px 28px 24px; border-right: 1px solid var(--line); overflow: auto; }
+    .sidebar small { color: var(--muted); font-weight: 700; }
+    .side-links { margin: 10px 0 26px; display: grid; gap: 3px; }
+    .side-links a { text-decoration: none; color: var(--muted); font-size: 13px; padding: 7px 9px; border-left: 2px solid transparent; }
+    .side-links a:hover, .side-links a.active { color: var(--ink); border-left-color: var(--green); background: white; }
+    .legend { display: grid; gap: 8px; font-size: 12px; color: var(--muted); }
+    .legend span { display: flex; align-items: center; gap: 8px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+
+    main { min-width: 0; }
+    section { scroll-margin-top: 76px; }
+    .band { padding: 76px clamp(24px,5vw,72px); border-bottom: 1px solid var(--line); }
+    .band.white { background: var(--surface); }
+    .section-head { max-width: 820px; margin-bottom: 34px; }
+    .eyebrow { display: flex; align-items: center; gap: 8px; color: var(--green); font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .eyebrow::before { content: ""; width: 22px; height: 2px; background: var(--green); }
+    h1, h2, h3, h4, p { margin-top: 0; }
+    h1 { margin-bottom: 18px; max-width: 800px; font-size: clamp(34px,5vw,64px); line-height: 1.08; letter-spacing: 0; }
+    h2 { margin-bottom: 12px; font-size: 30px; line-height: 1.25; letter-spacing: 0; }
+    h3 { margin-bottom: 8px; font-size: 19px; line-height: 1.35; letter-spacing: 0; }
+    h4 { margin-bottom: 6px; font-size: 15px; }
+    .lead { max-width: 760px; color: #46524d; font-size: 18px; }
+    .muted { color: var(--muted); }
+
+    .hero { min-height: calc(100vh - 58px); position: relative; display: grid; align-content: center; overflow: hidden; background: #eef2ef; }
+    .hero::before {
+      content: ""; position: absolute; inset: 0; opacity: .34;
+      background-image: linear-gradient(#cdd5d0 1px, transparent 1px), linear-gradient(90deg, #cdd5d0 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+    .hero-inner { position: relative; z-index: 2; width: min(1050px, 100%); padding: 70px clamp(24px,5vw,72px) 110px; }
+    .hero-tags { display: flex; flex-wrap: wrap; gap: 8px; margin: 28px 0 38px; }
+    .tag { padding: 5px 9px; border: 1px solid #b9c5bf; background: rgba(255,255,255,.74); border-radius: 4px; font-size: 12px; font-weight: 700; }
+    .hero-rail {
+      position: absolute; z-index: 1; right: -80px; bottom: 55px; width: 52%; height: 260px;
+      transform: rotate(-7deg); opacity: .92;
+    }
+    .rail-line { position: absolute; left: 0; right: 0; height: 5px; background: #75817c; }
+    .rail-line:nth-child(1) { top: 72px; }
+    .rail-line:nth-child(2) { top: 150px; }
+    .sleepers { position: absolute; inset: 47px 0 70px; background: repeating-linear-gradient(90deg, transparent 0 20px, #9d8f78 20px 29px, transparent 29px 54px); }
+    .train { position: absolute; top: 92px; left: 10%; display: flex; gap: 6px; }
+    .wagon { position: relative; width: 62px; height: 36px; border: 3px solid var(--charcoal); background: var(--yellow); }
+    .wagon:first-child { width: 78px; background: var(--green); }
+    .wagon::after, .wagon::before { content:""; position:absolute; bottom:-11px; width:10px; height:10px; border-radius:50%; background:var(--charcoal); }
+    .wagon::before { left:9px; } .wagon::after { right:9px; }
+    .scroll-hint { position: absolute; left: clamp(24px,5vw,72px); bottom: 28px; display: flex; gap: 9px; align-items: center; color: var(--muted); font-size: 12px; }
+    .scroll-hint span { width: 20px; height: 30px; border: 1px solid #7b8882; border-radius: 10px; position: relative; }
+    .scroll-hint span::after { content:""; position:absolute; left:8px; top:6px; width:3px; height:6px; background:var(--green); animation:scroll 1.6s infinite; }
+    @keyframes scroll { 0%{opacity:0;transform:translateY(0)} 35%{opacity:1} 100%{opacity:0;transform:translateY(9px)} }
+
+    .stats-grid { display: grid; grid-template-columns: repeat(5,minmax(120px,1fr)); border: 1px solid var(--line); background: var(--surface); }
+    .stat { min-height: 130px; padding: 22px; border-right: 1px solid var(--line); }
+    .stat:last-child { border-right: 0; }
+    .stat strong { display: block; font-size: 34px; line-height: 1.1; color: var(--green); }
+    .stat span { display: block; margin-top: 8px; color: var(--muted); font-size: 13px; }
+    .note { margin-top: 14px; padding: 13px 15px; border-left: 3px solid var(--yellow); background: var(--yellow-soft); color: #5e4b1e; font-size: 13px; }
+
+    .flow { display: grid; grid-template-columns: repeat(6,1fr); gap: 8px; align-items: stretch; }
+    .phase-btn { min-width: 0; padding: 18px 12px; border: 1px solid var(--line); background: white; text-align: left; border-radius: 6px; position: relative; transition: .18s ease; }
+    .phase-btn:not(:last-child)::after { content:"›"; position:absolute; right:-8px; top:42%; z-index:2; width:15px; height:24px; display:grid; place-items:center; color:#8c9892; background:var(--paper); }
+    .phase-btn:hover, .phase-btn.active { transform: translateY(-3px); border-color: var(--green); box-shadow: var(--shadow); }
+    .phase-btn .pnum { display:block; color:var(--green); font-size:12px; font-weight:900; }
+    .phase-btn b { display:block; margin:4px 0; font-size:15px; }
+    .phase-btn small { color:var(--muted); line-height:1.4; display:block; }
+    .phase-detail { margin-top: 14px; min-height: 205px; padding: 26px; border: 1px solid var(--line); background: var(--charcoal); color: white; display:grid; grid-template-columns: 1.1fr 1fr; gap: 32px; }
+    .phase-detail h3 { font-size: 25px; }
+    .phase-detail p, .phase-detail li { color: #d8e1dc; }
+    .phase-detail ul { margin: 10px 0 0; padding-left: 19px; }
+    .phase-metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; align-content:start; }
+    .phase-metric { padding:13px; border:1px solid #52615b; background:#314039; }
+    .phase-metric strong { display:block; font-size:22px; color:#ffe2a5; }
+    .phase-metric span { font-size:12px; color:#bfcbc5; }
+
+    .timeline { display: grid; grid-template-columns: 32% 28% 13% 9% 6% 12%; height: 50px; border: 1px solid var(--line); overflow: hidden; }
+    .timeline span { min-width:0; display:grid; place-items:center; border-right:1px solid rgba(255,255,255,.65); color:#17201d; font-size:11px; font-weight:800; text-align:center; line-height:1.2; }
+    .timeline span:nth-child(1){background:#dfe9e4}.timeline span:nth-child(2){background:#cde7db}.timeline span:nth-child(3){background:#ffe7b2}.timeline span:nth-child(4){background:#f3c56f}.timeline span:nth-child(5){background:#9bc9de}.timeline span:nth-child(6){background:#dfe3e1}
+    .milestones { position:relative; height:80px; margin:10px 0 0; border-top:1px solid var(--line); }
+    .mile { position:absolute; top:-5px; transform:translateX(-50%); width:120px; text-align:center; font-size:11px; color:var(--muted); }
+    .mile::before { content:""; display:block; width:9px; height:9px; margin:0 auto 7px; border-radius:50%; background:var(--green); box-shadow:0 0 0 4px var(--green-soft); }
+
+    .yard-layout { display:grid; grid-template-columns:minmax(0,1.55fr) minmax(260px,.45fr); gap:20px; }
+    .map-shell { border:1px solid var(--line); background:#f8faf8; overflow:hidden; }
+    .map-toolbar { padding:10px; display:flex; flex-wrap:wrap; gap:5px; border-bottom:1px solid var(--line); background:white; }
+    .map-view { padding:7px 11px; border:1px solid var(--line); border-radius:4px; background:white; color:var(--muted); font-size:12px; }
+    .map-view.active { color:white; border-color:var(--green); background:var(--green); }
+    .map-legend { padding:9px 12px; display:flex; flex-wrap:wrap; gap:8px 16px; border-bottom:1px solid var(--line); background:#fbfcfb; color:var(--muted); font-size:11px; }
+    .map-legend span { display:flex; align-items:center; gap:6px; white-space:nowrap; }
+    .line-swatch { width:25px; height:0; border-top:5px solid; border-radius:3px; }
+    .yard { min-height:520px; padding:10px; overflow:auto; }
+    .yard svg { display:block; width:100%; height:auto; min-height:470px; }
+    .topo-track { fill:none; stroke:#c7cfca; stroke-width:12; stroke-linecap:round; stroke-linejoin:round; cursor:pointer; transition:.15s; }
+    .topo-track.main { stroke:#8e9b95; }
+    .topo-track.target { stroke:var(--target); }
+    .topo-track.gate { stroke:var(--red); }
+    .topo-track.resource { stroke:var(--green); }
+    .topo-track.release { stroke:var(--yellow); }
+    .topo-track.source { stroke:var(--blue); }
+    .topo-track:hover,.topo-track.selected { stroke-width:20; filter:drop-shadow(0 2px 2px rgba(23,32,29,.32)); }
+    .topo-label { font-size:24px; font-weight:750; fill:#26332e; text-anchor:middle; paint-order:stroke; stroke:#f8faf8; stroke-width:7px; stroke-linejoin:round; pointer-events:none; }
+    .topo-label.junction { font-size:16px; fill:#7b8781; }
+    .map-caption { padding:9px 12px; border-top:1px solid var(--line); background:white; color:var(--muted); font-size:12px; }
+    .role-panel { border:1px solid var(--line); background:white; min-height:300px; padding:24px; }
+    .role-badge { display:inline-flex; padding:4px 8px; border-radius:3px; font-size:11px; font-weight:800; background:var(--red-soft); color:var(--red); }
+    .role-panel dl { display:grid; grid-template-columns:65px 1fr; gap:9px; font-size:13px; }
+    .role-panel dt { color:var(--muted); }.role-panel dd { margin:0; }
+
+    .tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); overflow-x:auto; }
+    .tab { padding:11px 14px; border:0; border-bottom:3px solid transparent; background:transparent; color:var(--muted); white-space:nowrap; }
+    .tab.active { color:var(--green); border-bottom-color:var(--green); font-weight:800; }
+    .tab-panel { padding:28px 0 0; display:none; }
+    .tab-panel.active { display:block; }
+    .detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+    .plain-panel { padding:22px; border:1px solid var(--line); background:white; }
+    .steps { counter-reset: step; display:grid; gap:10px; }
+    .step { position:relative; padding:12px 12px 12px 48px; border-left:2px solid var(--green); background:#f7faf8; }
+    .step::before { counter-increment:step; content:counter(step); position:absolute; left:13px; top:12px; width:23px; height:23px; display:grid; place-items:center; border-radius:50%; color:white; background:var(--green); font-size:12px; font-weight:800; }
+    .bars { display:grid; gap:10px; }
+    .bar-row { display:grid; grid-template-columns:100px 1fr 45px; gap:10px; align-items:center; font-size:12px; }
+    .bar-track { height:10px; background:#e7ece9; overflow:hidden; }
+    .bar-fill { width:var(--w); height:100%; background:var(--green); }
+    .evidence-grid { margin-top:18px; display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+    .data-panel { padding:22px; border:1px solid var(--line); background:white; }
+    .data-panel table { width:100%; border-collapse:collapse; font-size:12px; }
+    .data-panel td { padding:8px 0; border-bottom:1px solid #e5eae7; }
+    .data-panel td:last-child { text-align:right; font-weight:800; }
+
+    .simulator { display:grid; grid-template-columns:minmax(320px,.9fr) minmax(0,1.1fr); border:1px solid var(--line); background:white; }
+    .sim-controls { padding:26px; border-right:1px solid var(--line); }
+    .field { margin-bottom:18px; }
+    .field label { display:block; margin-bottom:6px; font-size:12px; font-weight:800; color:var(--muted); }
+    .field select { width:100%; padding:10px 34px 10px 10px; border:1px solid #bfc9c3; background:white; color:var(--ink); border-radius:4px; }
+    .choice-group { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
+    .choice { min-height:58px; padding:10px; border:1px solid var(--line); border-radius:4px; background:white; text-align:left; font-size:13px; line-height:1.35; }
+    .choice.active { border-color:var(--green); background:var(--green-soft); color:#0b5e44; font-weight:800; }
+    .sim-result { padding:28px; display:grid; align-content:center; }
+    .decision { display:flex; align-items:flex-start; gap:14px; }
+    .decision-icon { width:42px; height:42px; flex:none; display:grid; place-items:center; border-radius:50%; color:white; background:var(--green); }
+    .decision-icon svg { width:22px; height:22px; stroke:currentColor; fill:none; stroke-width:2.4; }
+    .decision strong { display:block; font-size:24px; line-height:1.3; }
+    .reason-list { margin:20px 0 0; padding:0; list-style:none; display:grid; gap:8px; }
+    .reason-list li { padding:9px 12px; background:#f5f7f5; border-left:3px solid var(--green); font-size:13px; }
+
+    .scenario-list { border-top:1px solid var(--line); }
+    .scenario { border-bottom:1px solid var(--line); }
+    .scenario button { width:100%; padding:18px 0; border:0; background:transparent; display:flex; align-items:center; justify-content:space-between; text-align:left; font-weight:800; }
+    .scenario button .plus { width:28px; height:28px; display:grid; place-items:center; border:1px solid var(--line); border-radius:50%; font-size:18px; font-weight:400; }
+    .scenario-content { display:none; grid-template-columns:1fr 1fr; gap:18px; padding:0 0 20px; }
+    .scenario.open .scenario-content { display:grid; }
+    .scenario.open .plus { transform:rotate(45deg); }
+    .wrong, .right { padding:16px; border-left:3px solid; }
+    .wrong { background:var(--red-soft); border-color:var(--red); }.right { background:var(--green-soft); border-color:var(--green); }
+    .wrong b { color:var(--red); }.right b { color:var(--green); }
+
+    .kpi-table { width:100%; border-collapse:collapse; background:white; font-size:13px; }
+    .kpi-table th, .kpi-table td { padding:13px 15px; border:1px solid var(--line); text-align:left; }
+    .kpi-table th { background:#edf2ef; }
+    .status-good { color:var(--green); font-weight:800; }
+    .checklist { margin-top:20px; display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }
+    .check { display:flex; align-items:flex-start; gap:10px; padding:12px; background:white; border:1px solid var(--line); }
+    .check input { margin-top:5px; accent-color:var(--green); }
+    .check.done span { color:var(--muted); text-decoration:line-through; }
+
+    .glossary { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+    .term { padding:16px; border-top:3px solid var(--green); background:white; }
+    .term b { display:block; margin-bottom:3px; }
+    .term span { color:var(--muted); font-size:13px; }
+    footer { padding:28px clamp(24px,5vw,72px); color:#cbd5d0; background:var(--charcoal); font-size:12px; display:flex; justify-content:space-between; gap:20px; }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns:1fr; }
+      .sidebar { display:none; }
+      .stats-grid { grid-template-columns:repeat(3,1fr); }
+      .stat:nth-child(3){border-right:0}.stat:nth-child(-n+3){border-bottom:1px solid var(--line)}
+      .flow { grid-template-columns:repeat(3,1fr); }
+      .phase-btn:nth-child(3)::after { display:none; }
+      .yard-layout { grid-template-columns:1fr; }
+    }
+    @media (max-width: 720px) {
+      .topbar { height:54px; }.topbar-inner{padding:0 14px}.brand{min-width:auto}.brand span:last-child{display:none}.topnav a{font-size:12px;padding:6px 8px}
+      .band { padding:52px 18px; }
+      .hero { min-height:calc(100svh - 54px); }.hero-inner{padding:58px 18px 110px}.hero-rail{width:90%;right:-180px;bottom:28px;opacity:.55}
+      h1{font-size:38px}.lead{font-size:16px}.stats-grid{grid-template-columns:repeat(2,1fr)}.stat{min-height:110px;padding:16px}.stat:nth-child(2n){border-right:0}.stat:nth-child(3){border-right:1px}.stat:nth-child(4){border-bottom:1px solid var(--line)}
+      .flow{grid-template-columns:1fr 1fr}.phase-btn:nth-child(3)::after{display:grid}.phase-btn:nth-child(2n)::after{display:none}.phase-detail{grid-template-columns:1fr;padding:20px}.timeline{height:75px}.timeline span{font-size:9px;writing-mode:vertical-rl}.milestones{display:none}
+      .yard{padding:4px;min-height:380px}.yard svg{min-height:360px}.topo-label{font-size:30px}.topo-label.junction{font-size:20px}
+      .detail-grid,.simulator{grid-template-columns:1fr}.sim-controls{border-right:0;border-bottom:1px solid var(--line)}
+      .scenario-content,.checklist,.glossary{grid-template-columns:1fr}.kpi-table{font-size:11px}.kpi-table th,.kpi-table td{padding:9px 7px}
+      footer{display:block}.footer-source{margin-top:8px}
+    }
+    @media (prefers-reduced-motion: reduce) { html{scroll-behavior:auto} *{animation:none!important;transition:none!important} }
+    @media print { .topbar,.sidebar,.scroll-hint{display:none}.layout{display:block}.band{padding:30px}.hero{min-height:auto}.phase-detail,.tab-panel{display:block!important}.tab-panel{page-break-inside:avoid} }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 17h16M6 17V8h12v9M8 8V5h8v3M8 21l2-4m6 4-2-4"/></svg></span><span>调车流程讲解</span></div>
+      <nav class="topnav" aria-label="主导航">
+        <a href="#overview">总览</a><a href="#flow">流程</a><a href="#yard">线路</a><a href="#details">阶段</a><a href="#decision">决策</a><a href="#scenarios">场景</a><a href="#quality">验收</a>
+      </nav>
+    </div>
+    <div class="progress" id="progress"></div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar" aria-label="页面目录">
+      <small>讲解目录</small>
+      <nav class="side-links">
+        <a href="#overview">01 数据与目标</a><a href="#flow">02 六阶段全景</a><a href="#yard">03 线路角色地图</a><a href="#details">04 阶段深入讲解</a><a href="#decision">05 决策模拟器</a><a href="#scenarios">06 典型场景</a><a href="#quality">07 质量验收</a><a href="#glossary">08 术语解释</a>
+      </nav>
+      <small>颜色含义</small>
+      <div class="legend">
+        <span><i class="dot" style="background:var(--green)"></i>临时编组 / 可直接送车</span>
+        <span><i class="dot" style="background:var(--red)"></i>关键门口 / 禁止占用</span>
+        <span><i class="dot" style="background:var(--yellow)"></i>正式释放口</span>
+        <span><i class="dot" style="background:var(--blue)"></i>主要源队列</span>
+      </div>
+    </aside>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-inner">
+          <div class="eyebrow">基于人工真实案例</div>
+          <h1 id="hero-title">一钩之后，后面的车是不是更容易走？</h1>
+          <p class="lead">这就是调车的核心。先打开通路，再按去向整理车辆，集中完成修库出入，最后处理仍未到位的车辆。这里用数据、真实线路连接图和现场场景把全过程讲清楚。</p>
+          <div class="hero-tags"><span class="tag">109 个案例</span><span class="tag">2740 条有效动作</span><span class="tag">P0-P5 六段作业</span><span class="tag">真实线路拓扑</span></div>
+        </div>
+        <div class="hero-rail" aria-hidden="true"><div class="sleepers"></div><div class="rail-line"></div><div class="rail-line"></div><div class="train"><i class="wagon"></i><i class="wagon"></i><i class="wagon"></i><i class="wagon"></i></div></div>
+        <div class="scroll-hint"><span></span>向下进入完整流程</div>
+      </section>
+
+      <section class="band white" id="overview">
+        <div class="section-head"><div class="eyebrow">01 数据与目标</div><h2>没有一张作业单适合所有现场</h2><p class="muted">数据给出常见顺序，现场车辆位置决定具体动作。有的案例不需要整理存车线，有的没有明显的修库出库，但任何时候都不能把后续必经线路提前占住。</p></div>
+        <div class="stats-grid">
+          <div class="stat"><strong>109</strong><span>人工调车案例总数</span></div>
+          <div class="stat"><strong>84</strong><span>完整还原成功案例，占 77.1%</span></div>
+          <div class="stat"><strong>2,740</strong><span>成功案例中的有效动作</span></div>
+          <div class="stat"><strong>31</strong><span>单案有效动作中位数</span></div>
+          <div class="stat"><strong>36</strong><span>人工计划钩数中位数</span></div>
+        </div>
+        <div class="note"><b>口径提醒：</b>阶段出现率和动作统计以 84 个完整成功案例为主。页面里的“3 辆、45 米”等属于建议阈值，用于辅助判断，不是统计事实。</div>
+        <div class="evidence-grid">
+          <div class="data-panel"><h3>成功案例实际走过的主要顺序</h3><table><tr><td>前场 → 存车 → 出库 → 入库 → 清理未到位车辆</td><td>47 案 · 56.0%</td></tr><tr><td>前场 → 出库 → 入库 → 清理未到位车辆</td><td>17 案 · 20.2%</td></tr><tr><td>前场 → 存车 → 入库 → 清理未到位车辆</td><td>4 案 · 4.8%</td></tr><tr><td>前场 → 存车 → 出库 → 入库</td><td>4 案 · 4.8%</td></tr><tr><td>前场 → 入库 → 清理未到位车辆</td><td>4 案 · 4.8%</td></tr><tr><td>其他顺序</td><td>8 案 · 9.5%</td></tr></table></div>
+          <div class="data-panel"><h3>一次放车前，人工会从几处连续取车</h3><div class="bars"><div class="bar-row"><span>1 个来源</span><div class="bar-track"><div class="bar-fill" style="--w:56.8%"></div></div><b>793</b></div><div class="bar-row"><span>2 个来源</span><div class="bar-track"><div class="bar-fill" style="--w:32.8%"></div></div><b>458</b></div><div class="bar-row"><span>3 个来源</span><div class="bar-track"><div class="bar-fill" style="--w:7.5%"></div></div><b>105</b></div><div class="bar-row"><span>4 个以上</span><div class="bar-track"><div class="bar-fill" style="--w:2.9%"></div></div><b>41</b></div></div><div class="note">43.2% 的放车动作前，人工会从两处以上连续挂车，先组成后续方向相近的小车列，再统一送车。</div></div>
+        </div>
+      </section>
+
+      <section class="band" id="flow">
+        <div class="section-head"><div class="eyebrow">02 六段作业全景</div><h2>先清通路，再按去向排车，最后集中完成修库作业</h2><p class="muted">点击任一段，查看它要做什么、做到什么程度可以结束，以及真实案例中出现了多少次。</p></div>
+        <div class="flow" id="phaseButtons"></div>
+        <div class="phase-detail" id="phaseDetail" aria-live="polite"></div>
+        <h3 style="margin-top:38px">典型案例的进度分布</h3>
+        <p class="muted">把一个案例的动作序列看成 100%，前约六成主要在整理前场和存车，真正的修库出入集中在后四成。</p>
+        <div class="timeline"><span>P1 前场<br>0-32%</span><span>P2 整理存车线<br>32-60%</span><span>P3 准备出库<br>60-73%</span><span>存4释放<br>73-82%</span><span>P4 入库<br>82-88%</span><span>P5 清理未到位车<br>88-100%</span></div>
+        <div class="milestones"><span class="mile" style="left:32%">首次取存车线<br>82 案</span><span class="mile" style="left:60%">首次取修库内<br>83 案</span><span class="mile" style="left:73%">首次放存4<br>81 案</span><span class="mile" style="left:82%">存4后首次入库<br>77 案</span><span class="mile" style="left:88%">最后一次入库<br>84 案</span></div>
+      </section>
+
+      <section class="band white" id="yard">
+        <div class="section-head"><div class="eyebrow">03 线路连接图</div><h2>先看车要经过哪里，再决定临时停在哪里</h2><p class="muted">下图使用与系统演示相同的线路坐标。灰色线表示真实连接关系，较深的线是主要通路。切换区域可以放大查看，点击任一线路会说明它的用途和占用风险。</p></div>
+        <div class="yard-layout">
+          <div class="map-shell">
+            <div class="map-toolbar"><button class="map-view active" data-view="all">全场</button><button class="map-view" data-view="depot">修库和卸轮</button><button class="map-view" data-view="storage">存车和机区</button><button class="map-view" data-view="front">前场服务线</button></div>
+            <div class="map-legend" aria-label="线路颜色图例"><span><i class="line-swatch" style="border-color:var(--target)"></i>车辆目标线路</span><span><i class="line-swatch" style="border-color:var(--red)"></i>后续作业必经线路</span><span><i class="line-swatch" style="border-color:var(--green)"></i>临时编组线路</span><span><i class="line-swatch" style="border-color:var(--yellow)"></i>集中释放位置</span><span><i class="line-swatch" style="border-color:var(--blue)"></i>主要取车来源</span><span><i class="line-swatch" style="border-color:#8e9b95"></i>普通连接线</span></div>
+            <div class="yard" id="yardMap" aria-label="线路拓扑连接图"></div>
+            <div class="map-caption">线路坐标来源：app.py 使用的 data/map/schematic_layout.json。颜色表示主要用途；点击线路可加粗高亮并查看说明。</div>
+          </div>
+          <aside class="role-panel" id="rolePanel" aria-live="polite"></aside>
+        </div>
+        <div class="evidence-grid">
+          <div class="data-panel"><h3>为什么机库线是主要临时编组位置</h3><div class="bars"><div class="bar-row"><span>最终去大库</span><div class="bar-track"><div class="bar-fill" style="--w:62.4%"></div></div><b>892</b></div><div class="bar-row"><span>去预修/机棚</span><div class="bar-track"><div class="bar-fill" style="--w:17.2%"></div></div><b>246</b></div><div class="bar-row"><span>去调梁</span><div class="bar-track"><div class="bar-fill" style="--w:8.2%"></div></div><b>117</b></div><div class="bar-row"><span>去洗油抛</span><div class="bar-track"><div class="bar-fill" style="--w:6.6%"></div></div><b>95</b></div><div class="bar-row"><span>真正去机库</span><div class="bar-track"><div class="bar-fill" style="--w:3.2%"></div></div><b>46</b></div><div class="bar-row"><span>去存4</span><div class="bar-track"><div class="bar-fill" style="--w:2.4%"></div></div><b>34</b></div></div><div class="note">人工向机库线放车 381 次，涉及 81/84 个成功案例。放入车辆中 62.4% 最终去大库，真正以机库为目标的只有 3.2%。</div></div>
+          <div class="data-panel"><h3>哪些必经线路最需要保护</h3><table><tr><td>机南</td><td>影响抛丸、机区和洗油方向</td></tr><tr><td>洗油北</td><td>影响洗罐站、洗罐线北和油漆线</td></tr><tr><td>调梁线北、机北2</td><td>影响调梁棚和机库方向</td></tr><tr><td>存4南</td><td>影响修库车辆向存4集中释放</td></tr><tr><td>修1至修4库外</td><td>直接影响对应库内进出</td></tr></table><div class="note">这些线路在图上是连接不同区域的窄口。后面还有车辆要经过时，即使空着，也不能当普通停车位置。</div></div>
+        </div>
+      </section>
+
+      <section class="band" id="details">
+        <div class="section-head"><div class="eyebrow">04 各段作业详解</div><h2>每一段都要说明白：什么时候开始，做哪些车，什么时候结束</h2><p class="muted">不是到点自动进入下一段。只有该清的通路已经清开、临时停放的车辆以后取得出来，才能继续后面的作业。</p></div>
+        <div class="tabs" role="tablist" id="tabs"></div>
+        <div id="tabPanels"></div>
+      </section>
+
+      <section class="band white" id="decision">
+        <div class="section-head"><div class="eyebrow">05 下一步怎么做</div><h2>按现场看到的情况直接选择</h2><p class="muted">依次点击最符合现场的选项，右侧会直接给出“现在做、先清路、还是暂时不动”的结论和原因。</p></div>
+        <div class="simulator">
+          <div class="sim-controls">
+            <div class="field"><label>1. 这辆车现在在哪里？</label><div class="choice-group" data-key="stage"><button class="choice active" data-value="front">洗罐、油漆、抛丸、调梁或预修区域</button><button class="choice" data-value="storage">存1、存2、存3或存5</button><button class="choice" data-value="depot">修1至修4、库外或卸轮线</button></div></div>
+            <div class="field"><label>2. 目标线路现在是什么情况？</label><div class="choice-group" data-key="target"><button class="choice active" data-value="clean">空着，或者线上车辆都已到位</button><button class="choice" data-value="shallow">入口只有少量挡路车</button><button class="choice" data-value="deep">挡路车很多，内部顺序也乱</button><button class="choice" data-value="spot">必须停到指定位置</button></div></div>
+            <div class="field"><label>3. 取车和送车的路是否畅通？</label><div class="choice-group" data-key="route"><button class="choice active" data-value="clear">车辆在外端，路线也没有被占</button><button class="choice" data-value="buried">目标车压在其他车后面</button><button class="choice" data-value="blocked">要经过的关键线路正被占用</button></div></div>
+          </div>
+          <div class="sim-result" id="simResult"></div>
+        </div>
+      </section>
+
+      <section class="band" id="scenarios">
+        <div class="section-head"><div class="eyebrow">06 典型场景</div><h2>最容易犯错的，不是不会走，而是停错地方</h2><p class="muted">展开场景，对比看似省事的动作为什么会制造后续阻塞。</p></div>
+        <div class="scenario-list" id="scenarioList"></div>
+      </section>
+
+      <section class="band white" id="quality">
+        <div class="section-head"><div class="eyebrow">07 作业结果检查</div><h2>不能只看总钩数</h2><p class="muted">少几钩却留下没到位的车或堵住线路，整体反而更差。车辆是否到位、通路是否畅通、车列顺序是否方便后续作业、是否违反线路容量，都要一起检查。</p></div>
+        <table class="kpi-table"><thead><tr><th>维度</th><th>重点指标</th><th>合格方向</th></tr></thead><tbody>
+          <tr><td>完成度</td><td>最终未到位车辆数</td><td class="status-good">持续下降，理想为零</td></tr><tr><td>通路健康</td><td>未解锁门口被占次数</td><td class="status-good">归零或显著下降</td></tr><tr><td>存4使用</td><td>非出段车辆污染存4次数</td><td class="status-good">归零</td></tr><tr><td>车列质量</td><td>机库线去大库车连续成段程度</td><td class="status-good">持续提升</td></tr><tr><td>作业效率</td><td>直送率、重复搬动、总钩数</td><td class="status-good">先保完成，再比较钩数</td></tr><tr><td>物理安全</td><td>容量、路径、固定台位违规</td><td class="status-good">不得增加，原则上为零</td></tr>
+        </tbody></table>
+        <h3 style="margin-top:30px">阶段交接检查</h3>
+        <div class="checklist" id="checklist"></div>
+      </section>
+
+      <section class="band" id="glossary">
+        <div class="section-head"><div class="eyebrow">08 页面用词说明</div><h2>这些词在页面里是什么意思</h2></div>
+        <div class="glossary">
+          <div class="term"><b>钩</b><span>一次相对完整的取车或放车作业记录。空钩可能只有机车定位，没有车辆位移。</span></div>
+          <div class="term"><b>入口挡路车</b><span>从线路可以接近的一端开始，挡在目标车辆前面的那一段车。</span></div>
+          <div class="term"><b>按去向排车</b><span>把最终去向相同或相近的车辆排在一起，后面可以连续放车。</span></div>
+          <div class="term"><b>临时编组线</b><span>暂时收集车辆、方便后续整列取出的线路，不是最终停车场。</span></div>
+          <div class="term"><b>必经线路</b><span>其他线路进出必须经过的位置。后面的车辆还要经过时不能随便占用。</span></div>
+          <div class="term"><b>成套完成</b><span>清路、移动、放车和恢复现场放在一套连续作业里，不留下新的挡路车辆。</span></div>
+          <div class="term"><b>从车列尾部直接放车</b><span>目标车辆正好排在车列最后面，可以直接分离并送入目标线。</span></div>
+          <div class="term"><b>集中重新排车</b><span>目标线内部顺序很乱时，集中取出、重排并重新放回。</span></div>
+          <div class="term"><b>固定台位</b><span>车辆不仅要进对线路，还必须停在指定位置，不能按普通放车处理。</span></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <footer><span>调车全过程交互讲解 · 数据与作业方法融合版</span><span class="footer-source">数据来源：109 个人工作业案例，其中 84 个完整成功案例用于过程统计</span></footer>
+
+  <script>
+    const phases = [
+      {id:'P0',name:'起机定位',short:'找到第一处有效作业点',rate:'84/84',median:'约 2 次空钩',max:'最多 4 次',goal:'先到能打开前场局面的源线。优先油漆、抛丸、洗罐、调棚、预修和机走棚，不机械地从存5或修库开局。',rules:['只定位，不产生真实车辆位移','成功案例第一条有效动作全部是取车','开局选择决定后续通路是否顺畅']},
+      {id:'P1',name:'前场整理',short:'先完成容易处理的服务线车辆',rate:'82/84 · 97.6%',median:'中位 6 动作',max:'最多 17 动作',goal:'完成能直接送达的洗罐、油漆和抛丸车辆，清开必经线路，并把前场里的去大库车排到以后能取出的临时编组线。',rules:['目标线能接车就直接送','入口只有少量挡路车时先清路','前场车辆不再进出后，必经线路才可临时停车']},
+      {id:'P2',name:'整理存车线',short:'按最终去向成段取车',rate:'61/84 · 72.6%',median:'中位 9 动作',max:'最多 29 动作',goal:'从存5北等线路外端，取出最终去向相同或相近的一段车，让后续放车时可以从车列尾部连续摘下。不是把存5全部清空。',rules:['连续去同一方向的车整段取出','前面超过 2 辆无关车就暂时不取','取出后必须能直送，或有明确的临时编组位置']},
+      {id:'P3',name:'修库车辆出库',short:'集中送到存4释放',rate:'72/84 · 85.7%',median:'中位 5 动作',max:'典型 14-16 辆/批',goal:'把修库内取车、库外清路、卸轮和存4放车放在同一套连续作业中完成。车辆形成大批次后，再集中送到存4。',rules:['先确认存4与存4南没有被占','库外清出的车必须放回或在本次作业中送走','不要提前零散占用存4']},
+      {id:'P4',name:'车辆送入大库',short:'从车列尾部按库别连续放车',rate:'77/84 · 91.7%',median:'中位 4 动作',max:'各库约 4-5 辆/次',goal:'从机库线等临时编组位置取出已经排好的大库车辆，看车列尾部是哪一个库的车，就先送哪个库，不固定从修1送到修4。',rules:['优先从机库线取已经排好的主车列','同一个库的连续车辆尽量一次放完','顺序不方便摘车时，先回临时编组线重新排']},
+      {id:'P5',name:'清理未到位车辆',short:'逐批处理仍未到位的车',rate:'80/84 · 95.2%',median:'中位 4 动作',max:'最多 16 动作',goal:'依次检查存5、机库、卸轮、调梁、预修、洗罐、油漆和抛丸区域，把前面暂时没有处理的车辆送到位，并清空临时占用的关键线路。',rules:['按车辆最终去向逐批处理','关键通路上不能留下临时停放车辆','已经到位的车如果为清路而移动，必须放回合适位置']}
+    ];
+
+    const phaseButtons = document.getElementById('phaseButtons');
+    const phaseDetail = document.getElementById('phaseDetail');
+    phases.forEach((p,i)=>{const b=document.createElement('button');b.className='phase-btn';b.innerHTML=`<span class="pnum">${p.id}</span><b>${p.name}</b><small>${p.short}</small>`;b.addEventListener('click',()=>showPhase(i));phaseButtons.appendChild(b)});
+    function showPhase(i){document.querySelectorAll('.phase-btn').forEach((b,n)=>b.classList.toggle('active',n===i));const p=phases[i];phaseDetail.innerHTML=`<div><span class="eyebrow" style="color:#91d8ba">${p.id} 本段工作</span><h3>${p.name}</h3><p>${p.goal}</p><ul>${p.rules.map(x=>`<li>${x}</li>`).join('')}</ul></div><div class="phase-metrics"><div class="phase-metric"><strong>${p.rate}</strong><span>案例出现情况</span></div><div class="phase-metric"><strong>${p.median}</strong><span>通常需要多少动作</span></div><div class="phase-metric"><strong>${p.max}</strong><span>补充统计</span></div><div class="phase-metric"><strong>${i<3?'准备':'集中作业'}</strong><span>${i<3?'让后面的车辆更容易走':'把互相影响的工作一起完成'}</span></div></div>`}
+    showPhase(1);
+
+    const topology={
+      '联6':[[2040,280],[2140,280]],'渡2':[[1980,370],[2040,280]],'渡1':[[1940,280],[2040,280]],'渡3':[[1900,370],[1980,370]],'机北1':[[1840,460],[1980,370]],'存1线':[[1520,460],[1840,460]],'机北2':[[1780,550],[1840,460]],'渡5':[[1580,550],[1780,550]],'渡4':[[1620,670],[1780,550]],'调梁棚':[[1268,670],[1468,670]],'机库线':[[1420,760],[1620,670]],'调梁线北':[[1460,670],[1620,670]],'机走棚':[[1240,550],[1420,550]],'渡6':[[1580,550],[1520,460]],'渡7':[[1480,370],[1520,460]],'存2线':[[1480,370],[1900,370]],'存3线':[[1500,280],[1900,370]],'存4线':[[1500,280],[1940,280]],'存5线北':[[1500,190],[1960,280]],'存4南':[[1200,280],[1500,280]],'存5线南':[[1200,280],[1500,190]],'预修线':[[1040,370],[1480,370]],'渡8':[[1040,370],[1200,280]],'机南':[[920,370],[1240,550]],'洗油北':[[1120,670],[1240,550]],'洗罐线北':[[980,820],[1120,670]],'洗罐站':[[860,940],[980,820]],'油漆线':[[920,1000],[1120,670]],'渡9':[[920,370],[1040,370]],'渡10':[[820,370],[920,370]],'抛丸线':[[740,490],[820,370]],'联7':[[620,370],[820,370]],'渡12':[[520,280],[620,370]],'修4库外':[[260,100],[420,190]],'修4库内':[[100,100],[260,100]],'渡13':[[420,190],[520,280]],'修3库外':[[260,190],[420,190]],'修3库内':[[100,190],[260,190]],'修2库内':[[200,280],[360,280]],'修2库外':[[360,280],[520,280]],'修1库内':[[140,370],[300,370]],'修1库外':[[300,370],[460,370]],'卸轮线':[[260,490],[460,370]],'渡11':[[460,370],[620,370]],'机走北':[[1420,550],[1600,550]]
+    };
+    const labelAnchors={'联6':[2090,266],'渡2':[2024,315],'渡1':[1990,266],'渡3':[1940,356],'机北1':[1924,405],'存1线':[1680,446],'机北2':[1824,495],'渡5':[1680,536],'渡4':[1714,600],'调梁棚':[1368,656],'机库线':[1534,705],'调梁线北':[1540,656],'机走棚':[1330,536],'渡6':[1564,495],'渡7':[1514,405],'存2线':[1690,356],'存3线':[1714,315],'存4线':[1720,266],'存5线北':[1744,225],'存4南':[1350,266],'存5线南':[1364,225],'预修线':[1260,356],'渡8':[1134,315],'机南':[1094,450],'洗油北':[1194,600],'洗罐线北':[1064,735],'洗罐站':[934,870],'油漆线':[1034,825],'渡9':[980,356],'渡10':[870,356],'抛丸线':[794,420],'联7':[720,356],'渡12':[584,315],'修4库外':[354,135],'修4库内':[180,86],'渡13':[484,225],'修3库外':[340,176],'修3库内':[180,176],'修2库内':[280,266],'修2库外':[440,266],'修1库内':[220,356],'修1库外':[380,356],'卸轮线':[374,420],'渡11':[540,356],'机走北':[1510,536]};
+    const mainTracks=new Set(['联6','渡2','机北1','机北2','渡5','渡6','渡7','预修线','渡9','渡10','联7','渡12','渡13']);
+    const trackInfo={
+      '机库线':['resource','主要临时编组线','人工计划中 81/84 个案例向这里放过车；共放车 381 次。','放进去之前必须确认后面取得出来，也不能挡住称重和真正去机库的车。'],
+      '存4线':['release','修库车辆集中释放位置','95 次放车，单次中位 14 辆，75% 的放车不超过 15 辆。','不能因为现在空着，就停放普通去大库车辆。'],
+      '存5线北':['source','主要取车来源','P2 中从这里取车 152 次；只取外端已经形成的同方向车段。','不要为了里面某辆车，反复倒动外面的无关车辆。'],
+      '存5线南':['source','存5较深处的取车来源','只有存5北外端已清、南端车辆成段时才取。','不要在前段作业中盲目向深处翻车。'],
+      '机南':['gate','抛丸、机区和洗油方向的必经线路','抛丸和洗油方向不再需要进出后，才可短时间停车。','外部还有车要进抛丸时不能占用。'],
+      '洗油北':['gate','洗罐和油漆区域的必经线路','洗罐、油漆任务结束后才可短时间使用。','相关车辆还要进出时，停一组无关车就可能封死整个区域。'],
+      '洗罐线北':['gate','进入洗罐站前的线路','先把这里的无关车送走，再向洗罐站送目标车。','洗罐工作未结束前不能压无关车。'],
+      '调梁线北':['gate','调梁棚的进出线路','调梁棚本轮不再进出时才可短时间使用。','调梁棚还有车辆要进出时不能停车。'],
+      '机北2':['gate','调梁和机库方向的必经线路','只用于通过或很短时间的停车。','调梁或机库还要作业时不能占用。'],
+      '存4南':['gate','进入存4的释放通道','只用于计划中的车辆通过。','任何普通临时停车都会影响后面的集中出库。'],
+      '预修线':['target','预修目标线兼通路','外端车辆容易处理时可先做；内部顺序很乱时留到后面集中整理。','不要把它当普通停车线。'],
+      '调梁棚':['target','调梁目标线','前段只处理外端容易取出的车辆。','内部顺序复杂时不要顺手把整条线重排。'],
+      '抛丸线':['target','抛丸作业目标线','外部还有车要进时先完成送车，再取出线上去其他地方的车。','不能先把线路上的车移到机南并堵住入口。'],
+      '油漆线':['target','油漆作业目标线','线路空或入口只有少量挡车时，直接送车。','不要长期用于临时编组。'],
+      '洗罐站':['target','洗罐作业目标线','洗罐线北清开后直接送入。','入口挡车很多时不要强行送。'],
+      '卸轮线':['target','卸轮作业线','可在修库车辆出库时顺带处理，或在最后清理未到位车辆时处理。','顺带处理不能打乱修库主车列。']
+    };
+    ['存1线','存2线','存3线'].forEach(n=>trackInfo[n]=['target','存车目标线，同时影响附近通路','车辆真实目标在这里时可以直接送入。','停车前要确认不会挡住预修、存4南或机北方向。']);
+    ['修1库内','修2库内','修3库内','修4库内'].forEach(n=>trackInfo[n]=['target','修库目标线和出库来源','P3 集中取出需要释放的车，P4 按车列尾部顺序送入。','不要在前场整理时零散进出。']);
+    ['修1库外','修2库外','修3库外','修4库外'].forEach(n=>trackInfo[n]=['gate','对应修库的入口','修库作业时清开，并在同一套作业中恢复或送走。','不能长期停放无关车辆。']);
+    const yard=document.getElementById('yardMap'), rolePanel=document.getElementById('rolePanel');
+    const roleNames={target:'车辆目标线路',gate:'后续作业必经线路',resource:'临时编组线路',release:'集中释放位置',source:'主要取车来源'};
+    const views={all:'0 40 2240 1020',depot:'0 40 740 500',storage:'1050 120 1140 680',front:'650 300 850 720'};
+    function drawTopology(view='all'){
+      const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox',views[view]);svg.setAttribute('role','img');svg.setAttribute('aria-label','调车场线路连接关系');
+      Object.entries(topology).forEach(([name,pts])=>{const info=trackInfo[name],path=document.createElementNS(ns,'path');path.setAttribute('d',`M ${pts[0][0]} ${pts[0][1]} L ${pts[1][0]} ${pts[1][1]}`);path.setAttribute('class',`topo-track ${mainTracks.has(name)?'main ':''}${info?info[0]:''}`);path.dataset.name=name;path.setAttribute('tabindex','0');path.addEventListener('click',()=>selectTrack(name,path));path.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();selectTrack(name,path)}});svg.appendChild(path)});
+      Object.entries(labelAnchors).forEach(([name,p])=>{const text=document.createElementNS(ns,'text'),junction=/^[渡联]/.test(name);text.setAttribute('x',p[0]);text.setAttribute('y',p[1]);text.setAttribute('class',`topo-label ${junction?'junction':''}`);text.textContent=name;svg.appendChild(text)});yard.replaceChildren(svg);
+    }
+    function selectTrack(name,path){document.querySelectorAll('.topo-track').forEach(x=>x.classList.remove('selected'));path.classList.add('selected');showTrack(name)}
+    function showTrack(name){const t=trackInfo[name]||['connection','线路或连接道岔','用于连接相邻作业区域，车辆通过这里到达下一条线。','有车占用时会影响连接方向，具体以当前作业路径为准。'];const colors={target:'var(--target-soft)',gate:'var(--red-soft)',resource:'var(--green-soft)',release:'var(--yellow-soft)',source:'var(--blue-soft)',connection:'#edf0ee'};rolePanel.innerHTML=`<span class="role-badge" style="background:${colors[t[0]]}">${roleNames[t[0]]||'普通连接线'}</span><h3 style="margin-top:12px">${name}</h3><dl><dt>它是什么</dt><dd>${t[1]}</dd><dt>怎么使用</dt><dd>${t[2]}</dd><dt>注意什么</dt><dd>${t[3]}</dd></dl><div class="note" style="margin-top:20px">一条线是否能临时停车，取决于后面还有没有车辆必须从这里经过。</div>`}
+    document.querySelectorAll('.map-view').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.map-view').forEach(x=>x.classList.remove('active'));b.classList.add('active');drawTopology(b.dataset.view)}));drawTopology();showTrack('机库线');
+
+    const detailData = [
+      {title:'P0 起机定位',steps:['识别当前最能打开局面的工作区域','机车到达第一处有效源线','以一次有效取车正式进入流程'],bars:[['油漆线',20,20],['抛丸线',19,20],['调梁棚',13,20],['洗罐站',11,20],['机走棚',9,20]],note:'84 个成功案例的第一条有效动作全部是取车。开局明显偏向前场功能线。'},
+      {title:'P1 前场整理',steps:['目标线能接车、路线畅通：直接送','入口只有少量挡路车：先送走挡路车','取出服务线里后面要去大库的车辆','调梁和预修内部顺序很乱时留到后面'],bars:[['放机库线',158,158],['取预修线',81,158],['取调梁棚',78,158],['取油漆线',56,158],['取抛丸线',36,158]],note:'出现于 82/84 个案例。机库线是这一段最常用的临时编组位置。'},
+      {title:'P2 整理存车线',steps:['从线路外端向里查看车辆去向','连续去同一方向的车整段取出','能直接到目标就直送，否则送到以后能取出的机库线','遇到已到位车辆或需要大量倒车时停止'],bars:[['取存5北',152,152],['放机库线',132,152],['放调梁棚',75,152],['放预修线',67,152],['放存2线',33,152]],note:'出现于 61/84 个案例。目的是把同方向车辆排在一起，不是清空存5。'},
+      {title:'P3 修库车辆出库',steps:['确认存4和存4南没有被占','按实际可取顺序集中取修库车辆','库外清路和卸轮车辆在同一套作业中处理','形成约 14-16 辆批次后放入存4'],bars:[['放存4线',95,95],['取修3库',71,95],['取修4库',63,95],['取修1库',59,95],['取修2库',54,95]],note:'单次放存4中位 14 辆，75 分位 15 辆，最大 20 辆。'},
+      {title:'P4 大库入库',steps:['优先从机库线取已编主列','看列尾当前可摘哪个库别','同库连续段尽量一次放完','库外挡路时清障并在同链恢复'],bars:[['取机库线',78,78],['放修4库',59,78],['放修3库',54,78],['放修2库',49,78],['放修1库',46,78]],note:'入库顺序由列尾可摘性决定，不机械固定修1到修4。'},
+      {title:'P5 清理未到位车辆',steps:['处理存5剩余的可直送车辆','处理机库线仍未到目标的车辆','处理卸轮完成后的下一去向','最后检查调梁、预修、洗罐、油漆和抛丸'],bars:[['取存5北',89,89],['放机库线',73,89],['放油漆线',45,89],['放调梁棚',43,89],['放预修线',40,89]],note:'80/84 个案例有这段清理。58 个案例最后放到机库线，19 个最后放到油漆线。'}
+    ];
+    const tabs=document.getElementById('tabs'),panels=document.getElementById('tabPanels');
+    detailData.forEach((d,i)=>{const t=document.createElement('button');t.className='tab';t.setAttribute('role','tab');t.textContent=d.title;t.onclick=()=>showTab(i);tabs.appendChild(t);const p=document.createElement('div');p.className='tab-panel';p.innerHTML=`<div class="detail-grid"><div class="plain-panel"><h3>怎么做</h3><div class="steps">${d.steps.map(s=>`<div class="step">${s}</div>`).join('')}</div></div><div class="plain-panel"><h3>高频动作对比</h3><div class="bars">${d.bars.map(b=>`<div class="bar-row"><span>${b[0]}</span><div class="bar-track"><div class="bar-fill" style="--w:${b[1]/b[2]*100}%"></div></div><b>${b[1]}</b></div>`).join('')}</div><div class="note">${d.note}</div></div></div>`;panels.appendChild(p)});
+    function showTab(i){document.querySelectorAll('.tab').forEach((x,n)=>x.classList.toggle('active',n===i));document.querySelectorAll('.tab-panel').forEach((x,n)=>x.classList.toggle('active',n===i))}showTab(1);
+
+    const decisionState={stage:'front',target:'clean',route:'clear'};
+    document.querySelectorAll('.choice-group').forEach(group=>group.querySelectorAll('.choice').forEach(button=>button.addEventListener('click',()=>{group.querySelectorAll('.choice').forEach(x=>x.classList.remove('active'));button.classList.add('active');decisionState[group.dataset.key]=button.dataset.value;decide()})));
+    function decide(){const {target,route,stage}=decisionState;let title='',reasons=[],type='go';if(stage==='depot'||target==='spot'){title='暂时不要按普通方式送车';reasons=['修库车辆或指定停车位置，需要把清路、送车和恢复线路一起安排','应放到修库集中作业时处理，避免送进去以后其他车无法进出'];type='stop'}else if(route==='blocked'){title='先把必经线路清开';reasons=['现在送车会经过已经被占用的关键线路','先处理挡路车辆，确认这条线路后面不再需要进出，再考虑临时停车'];type='stop'}else if(route==='buried'){title=stage==='storage'?'先不取这辆车，改做外端车辆':'先处理挡在外面的车辆';reasons=['目标车现在压在其他车辆后面，强行取车会增加多次倒车','存车线外端超过 2 辆无关车时，建议停止向里找车'];type='wait'}else if(target==='clean'){title='现在可以直接送到目标线路';reasons=['目标线路能接车，取车和送车路线也畅通','直接送达比先放到其他线路少一次搬动，也少一次堵路风险'];type='go'}else if(target==='shallow'){title='先送走入口的少量挡路车，再送目标车';reasons=[stage==='front'?'前场可参考：入口不超过 3 辆或 45 米':'存车线可参考：入口不超过 6 辆或 90 米','挡路车辆必须有明确去处，不能从这里挪到另一个关键通路上'];type='wait'}else{title='这条目标线先不动，后面集中重新排车';reasons=['入口挡车多，内部车辆顺序也乱','现在零散处理容易反复取放，应等条件具备后整段取出、重新排序、再放回'];type='stop'}const colors={go:'var(--green)',wait:'var(--yellow)',stop:'var(--red)'};document.getElementById('simResult').innerHTML=`<div class="decision"><span class="decision-icon" style="background:${colors[type]}"><svg viewBox="0 0 24 24">${type==='go'?'<path d="m5 12 4 4L19 6"/>':type==='wait'?'<path d="M12 3v10m0 4v.01"/><circle cx="12" cy="12" r="9"/>':'<path d="M6 6l12 12M18 6 6 18"/><circle cx="12" cy="12" r="9"/>'}</svg></span><div><small class="muted">现在应该怎么做</small><strong>${title}</strong></div></div><ul class="reason-list">${reasons.map(r=>`<li>${r}</li>`).join('')}</ul>`}decide();
+
+    const scenarios=[
+      ['抛丸线有去大库车，外面还有车要进抛丸','先把抛丸车甩到机南，觉得离得近、少走一步。','先把外部去抛丸车辆送到位，再抽出去大库车并优先送机库线。','机南是外部车辆进入抛丸的通路。提前占线会把简单任务变成绕行或阻塞。'],
+      ['洗罐站要进车，洗罐线北有无关车','把无关车顺手甩到洗油北。','先把无关车送到真实目标或短时间停车后马上送走；入口清开后再送洗罐车。','洗油北同时是洗罐、油漆区域的必经线路，不是随手可用的空线。'],
+      ['油漆线干净，存5外端正好有油漆车','先送机库线编组，等后面统一处理。','直接从存5北取车并送油漆线。','目标干净时，中转只会增加一次搬动和一次占线风险。'],
+      ['调梁棚内部很乱，外端有去油漆或大库车','顺手把整个调梁棚重新整理一遍。','只取外端能直接摘下的小段：油漆车直送，大库车送机库线临时编组。','P1 的任务是先清开通路，不是在此时重排整个调梁棚。'],
+      ['机库线已经形成连续去大库主列','在前段立即零散送入修1到修4。','前段到此结束，P4 整列取出并按车列尾部可摘顺序连续入库。','把入库集中完成，能减少库外清路次数并保持车列顺序。'],
+      ['存4空着，手上正好有去大库车','先放存4，空线不用可惜。','只有车辆目标就是存4，或者放进去后马上取走时，才允许放入。','存4是修库车辆集中释放的位置。现在空着，是为后面约 14-16 辆的大批次留出能力。']
+    ];
+    const scenarioList=document.getElementById('scenarioList');scenarios.forEach((s,i)=>{const d=document.createElement('div');d.className='scenario';d.innerHTML=`<button aria-expanded="false"><span>${String(i+1).padStart(2,'0')} · ${s[0]}</span><span class="plus">+</span></button><div class="scenario-content"><div class="wrong"><b>看似省事</b><p>${s[1]}</p></div><div class="right"><b>正确处理</b><p>${s[2]}</p><small>${s[3]}</small></div></div>`;const b=d.querySelector('button');b.onclick=()=>{d.classList.toggle('open');b.setAttribute('aria-expanded',d.classList.contains('open'))};scenarioList.appendChild(d)});
+
+    const checks=['外部还有去抛丸车时，机南保持可用','洗罐或油漆未结束时，洗油北保持可用','调棚或机库还要进出时，调梁线北和机北2保持可用','存4没有长期停放去大库的车辆','机库线上的车辆有明确取出路线和顺序','存5外端已无可以直接按去向送走的小段车辆','已经到位的车辆没有被破坏，或移动后已经恢复','当前车列支持从最后面开始，按下一个目标连续放车'];
+    const checklist=document.getElementById('checklist');checks.forEach((x,i)=>{const l=document.createElement('label');l.className='check';l.innerHTML=`<input type="checkbox" aria-label="完成检查项${i+1}"><span>${x}</span>`;l.querySelector('input').onchange=e=>l.classList.toggle('done',e.target.checked);checklist.appendChild(l)});
+
+    const sections=[...document.querySelectorAll('main section[id]')],navLinks=[...document.querySelectorAll('.topnav a,.side-links a')];
+    const observer=new IntersectionObserver(entries=>{entries.forEach(e=>{if(e.isIntersecting)navLinks.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+e.target.id))})},{rootMargin:'-25% 0px -65%'});sections.forEach(s=>observer.observe(s));
+    window.addEventListener('scroll',()=>{const max=document.documentElement.scrollHeight-innerHeight;document.getElementById('progress').style.width=(max?scrollY/max*100:0)+'%'},{passive:true});
+  </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
+from itertools import permutations, product
 from typing import Any
 
 from . import physical
@@ -344,6 +344,28 @@ def build_spotting_same_line_repack_planlet(
                 )
                 if plan is not None:
                     return plan
+            plan = _same_line_repack_plan_with_chunk_staging(
+                case_id=case_id,
+                hook_index=hook_index,
+                line=line,
+                placement=placement,
+                current_order=current_order,
+                current_nos=current_nos,
+                blocker_pre_steps=blocker_pre_steps,
+                blocker_post_steps=blocker_post_steps,
+                blocker_cars=blocker_cars,
+                blocker_staging_line=blocker_staging_line,
+                cars=cars,
+                depot_assignment=depot_assignment,
+                reason=reason,
+                candidate_kind=candidate_kind,
+                frontier=frontier,
+                graph=graph,
+                loco_location=loco_location,
+                serial_gate_leases=serial_gate_leases,
+            )
+            if plan is not None:
+                return plan
     return None
 
 
@@ -418,6 +440,176 @@ def _same_line_repack_plan_with_staging(
         progressed_nos=current_nos,
         source_return_nos=(),
     )
+
+
+def _same_line_repack_plan_with_chunk_staging(
+    *,
+    case_id: str,
+    hook_index: int,
+    line: str,
+    placement: _SameLinePlacement,
+    current_order: tuple[dict[str, Any], ...],
+    current_nos: tuple[str, ...],
+    blocker_pre_steps: tuple[Any, ...],
+    blocker_post_steps: tuple[Any, ...],
+    blocker_cars: tuple[dict[str, Any], ...],
+    blocker_staging_line: str,
+    cars: list[dict[str, Any]],
+    depot_assignment: Any,
+    reason: str,
+    candidate_kind: str,
+    frontier: Any,
+    graph: Any,
+    loco_location: Any,
+    serial_gate_leases: dict[str, Any],
+) -> SpottingRepackPlan | None:
+    chunks = _same_line_reorder_chunks(current_order, placement.move_order)
+    if len(chunks) <= 1 or len(chunks) > 6:
+        return None
+    chunk_by_no = {
+        physical.car_no(car): index
+        for index, chunk in enumerate(chunks)
+        for car in chunk
+    }
+    final_chunk_order: list[int] = []
+    for car in placement.move_order:
+        index = chunk_by_no[physical.car_no(car)]
+        if not final_chunk_order or final_chunk_order[-1] != index:
+            final_chunk_order.append(index)
+    if set(final_chunk_order) != set(range(len(chunks))):
+        return None
+
+    blocked_lines = {
+        step.line
+        for step in blocker_pre_steps
+        if step.action == "Get"
+    }
+    staging_lines = _same_line_candidate_staging_lines(
+        line=line,
+        excluded_lines={blocker_staging_line, *blocked_lines},
+    )
+    if len(staging_lines) < len(chunks):
+        return None
+
+    by_no = {physical.car_no(car): car for car in cars}
+    all_batch_nos = set(current_nos) | set(_nos(blocker_cars))
+    for assigned_lines in permutations(staging_lines, len(chunks)):
+        planning = [dict(car) for car in cars]
+        steps = list(blocker_pre_steps)
+        _apply_plan_steps_for_projection(planning, blocker_pre_steps)
+        steps.append(physical.plan_step("Get", line, current_nos))
+        physical.apply_physical_get_order(planning, line, current_nos)
+
+        feasible = True
+        for index in reversed(range(len(chunks))):
+            chunk = chunks[index]
+            chunk_nos = _nos(chunk)
+            staging_line = assigned_lines[index]
+            positions = planned_positions_for_batch(
+                batch=list(chunk),
+                target_line=staging_line,
+                cars=planning,
+                depot_assignment=depot_assignment,
+                batch_nos=all_batch_nos,
+            )
+            if len(positions) != len(chunk):
+                feasible = False
+                break
+            steps.append(physical.plan_step("Put", staging_line, chunk_nos, positions))
+            physical.apply_physical_put_order(planning, staging_line, list(chunk_nos), positions)
+        if not feasible:
+            continue
+
+        for index in reversed(final_chunk_order):
+            chunk = chunks[index]
+            chunk_nos = _nos(chunk)
+            staging_line = assigned_lines[index]
+            steps.append(physical.plan_step("Get", staging_line, chunk_nos))
+            physical.apply_physical_get_order(planning, staging_line, chunk_nos)
+            positions = {
+                no: placement.final_positions[no]
+                for no in chunk_nos
+            }
+            steps.append(physical.plan_step("Put", line, chunk_nos, positions))
+            physical.apply_physical_put_order(planning, line, list(chunk_nos), positions)
+
+        steps.extend(blocker_post_steps)
+        if not frontier.plan_steps_are_reachable(
+            steps=tuple(steps),
+            cars=cars,
+            depot_assignment=depot_assignment,
+            graph=graph,
+            loco_location=loco_location,
+            serial_gate_leases=serial_gate_leases,
+            candidate_kind=candidate_kind,
+        ):
+            continue
+        candidate = physical.build_planlet_candidate(
+            case_id=case_id,
+            hook_index=hook_index,
+            source_line=line,
+            target_line=line,
+            batch=[*(by_no[no] for no in current_nos), *blocker_cars],
+            steps=tuple(steps),
+            reason=(
+                f"{reason};spotting_repack=same_line_chunks;"
+                f"chunks={len(chunks)};staging={','.join(assigned_lines)}"
+            ),
+            candidate_kind=candidate_kind,
+        )
+        return SpottingRepackPlan(
+            candidate=candidate,
+            progressed_nos=current_nos,
+            source_return_nos=(),
+        )
+    return None
+
+
+def _same_line_reorder_chunks(
+    current_order: tuple[dict[str, Any], ...],
+    final_order: tuple[dict[str, Any], ...],
+) -> tuple[tuple[dict[str, Any], ...], ...]:
+    current_index = {
+        physical.car_no(car): index
+        for index, car in enumerate(current_order)
+    }
+    chunks_in_final_order: list[list[dict[str, Any]]] = []
+    for car in final_order:
+        no = physical.car_no(car)
+        if no not in current_index:
+            return ()
+        if (
+            chunks_in_final_order
+            and current_index[no]
+            == current_index[physical.car_no(chunks_in_final_order[-1][-1])] + 1
+        ):
+            chunks_in_final_order[-1].append(car)
+        else:
+            chunks_in_final_order.append([car])
+    chunks = sorted(
+        (tuple(chunk) for chunk in chunks_in_final_order),
+        key=lambda chunk: current_index[physical.car_no(chunk[0])],
+    )
+    flattened = tuple(physical.car_no(car) for chunk in chunks for car in chunk)
+    if flattened != _nos(current_order):
+        return ()
+    return tuple(chunks)
+
+
+def _apply_plan_steps_for_projection(
+    cars: list[dict[str, Any]],
+    steps: tuple[Any, ...],
+) -> None:
+    for step in steps:
+        if step.action == "Get":
+            physical.apply_physical_get_order(cars, step.line, step.move_car_nos)
+        elif step.action == "Put":
+            physical.apply_physical_put_order(
+                cars,
+                step.line,
+                list(step.move_car_nos),
+                step.planned_positions,
+            )
 
 
 def _build_general_spotting_planlet(
@@ -755,31 +947,35 @@ def _same_line_final_placements(
             ]
             if not forced_indexes:
                 continue
-            before_cars = tuple(
+            original_before_cars = tuple(
                 car
                 for car in line_cars[: forced_indexes[0]]
                 if physical.car_no(car) not in forced_nos
             )
-            after_cars = tuple(
-                car
-                for car in line_cars[forced_indexes[-1] + 1 :]
-                if physical.car_no(car) not in forced_nos
+            before_counts = sorted(
+                range(len(other_cars) + 1),
+                key=lambda count: (abs(count - len(original_before_cars)), count),
             )
-            for car, position in zip(forced_cars, slots):
-                if position < 1 or position > len(final_slots):
-                    break
-                final_slots[position - 1] = car
-            else:
-                before_positions = [index for index in range(0, slots[0] - 1) if final_slots[index] is None]
-                after_positions = [index for index in range(slots[-1], total) if final_slots[index] is None]
-                if len(before_cars) > len(before_positions) or len(after_cars) > len(after_positions):
-                    continue
-                for car, index in zip(before_cars, before_positions):
-                    final_slots[index] = car
-                for car, index in zip(after_cars, after_positions):
-                    final_slots[index] = car
-                order = tuple(car for car in final_slots if car is not None)
-                if set(_nos(order)) == set(original_nos):
+            for before_count in before_counts:
+                final_slots = [None] * total
+                before_cars = other_cars[:before_count]
+                after_cars = other_cars[before_count:]
+                for car, position in zip(forced_cars, slots):
+                    if position < 1 or position > len(final_slots):
+                        break
+                    final_slots[position - 1] = car
+                else:
+                    before_positions = [index for index in range(0, slots[0] - 1) if final_slots[index] is None]
+                    after_positions = [index for index in range(slots[-1], total) if final_slots[index] is None]
+                    if len(before_cars) > len(before_positions) or len(after_cars) > len(after_positions):
+                        continue
+                    for car, index in zip(before_cars, before_positions):
+                        final_slots[index] = car
+                    for car, index in zip(after_cars, after_positions):
+                        final_slots[index] = car
+                    order = tuple(car for car in final_slots if car is not None)
+                    if set(_nos(order)) != set(original_nos):
+                        continue
                     final_positions = {
                         physical.car_no(car): position
                         for position, car in enumerate(final_slots, start=1)

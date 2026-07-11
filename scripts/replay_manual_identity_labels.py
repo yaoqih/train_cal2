@@ -283,8 +283,12 @@ def allowed_couple_endpoints(label: dict[str, str]) -> tuple[str, ...]:
 
 
 def detach_target_line(label: dict[str, str], line: str) -> str:
-    if label.get("line_raw") == "存2" and "叉线" in str(label.get("note") or ""):
+    raw = str(label.get("line_raw") or "")
+    note = str(label.get("note") or "")
+    if raw == "存2" and "叉线" in note:
         return "预修线"
+    if raw in {"机", "注意机"}:
+        return "机南" if "南" in note else "机走棚"
     return line
 
 
@@ -325,19 +329,32 @@ def replay_line_scopes(label: dict[str, str]) -> tuple[tuple[str, ...], ...]:
     scopes: list[tuple[str, ...]] = []
     if raw == "存2" and label.get("method") == "+" and "叉线" in note:
         return dedupe_line_scopes([("预修线",)])
-    if line:
+    if line and raw not in {"机", "注意机"}:
         scopes.append((line,))
-    if raw in {"洗", "留道口洗"}:
+    if raw in {"洗", "留道口洗", "洗南", "洗北"} or line in {"洗罐站", "洗罐线北"}:
+        scopes.append(("洗罐站", "洗罐线北"))
         scopes.append(("洗罐站", "洗罐线北", "洗油北"))
-    if raw == "调":
+    if raw in {"调", "调棚", "调北"} or line in {"调梁棚", "调梁线北"}:
         scopes.append(("调梁棚", "调梁线北"))
+    if raw in {"存5", "注意存5", "存5线", "存5南", "存5北"} or line in {"存5线南", "存5线北"}:
+        scopes.append(("存5线北", "存5线南"))
     if raw == "存2" and "叉线" in note:
         scopes.append(("预修线",))
-    if raw == "机":
-        scopes.append(("机库线", "机走棚", "机走北", "机北2", "机北1"))
+    if raw in {"机", "注意机"}:
+        scopes.append(("机南", "机走棚", "机走北"))
+    elif raw in {"机南", "机棚", "机北3", "机走"} or line in {"机南", "机走棚", "机走北"}:
+        scopes.append(("机南", "机走棚", "机走北"))
     depot_match = DEPOT_RAW_PATTERN.fullmatch(raw)
     if depot_match:
         index = depot_match.group(1)
+        scopes.append((f"修{index}库外", f"修{index}库内"))
+    elif line in {
+        "修1库外", "修1库内",
+        "修2库外", "修2库内",
+        "修3库外", "修3库内",
+        "修4库外", "修4库内",
+    }:
+        index = line[1]
         scopes.append((f"修{index}库外", f"修{index}库内"))
     return dedupe_line_scopes(scopes)
 
@@ -636,7 +653,7 @@ def identity_noop_reason(label: dict[str, str], states: set[IdentityState]) -> s
         method == "+"
         and count_value == 1
         and line == "机库线"
-        and raw in {"机", "库", "注意机", "注意库"}
+        and raw in {"库", "注意库"}
         and note in {"", "接"}
         and not car_numbers
     ):
