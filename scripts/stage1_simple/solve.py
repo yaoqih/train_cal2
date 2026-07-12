@@ -8,7 +8,8 @@ import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from itertools import combinations, permutations, product
+from fractions import Fraction
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -18,7 +19,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from solver_vnext import physical
+from solver_vnext import physical  # noqa: E402
 
 
 ASSEMBLY_DEPOT = ("机南", "洗油北", "机走棚", "机走北")
@@ -78,38 +79,30 @@ NON_SERVICE_TARGETS = set(physical.DEPOT_TARGET_LINES) | {"卸轮线"}
 DIRECT_DELIVERY_MAX_STATIC_ROUTE_LEN = 10
 DIRECT_DELIVERY_PRIORITY_MIN_BATCH = 2
 SERVICE_FINISH_MAX_PLANLETS = 4
-SERVICE_FINISH_MAX_BUSINESS_HOOKS = 16
+SERVICE_FINISH_MAX_BUSINESS_HOOKS = 12
 SERVICE_FINISH_EXAMINED_WINDOW = 240
 SERVICE_FINISH_VALID_WINDOW = 48
 SERVICE_FINISH_LOOKAHEAD_WIDTH = 8
 SERVICE_FINISH_LOOKAHEAD_EXAMINED = 80
 SERVICE_FINISH_LOOKAHEAD_VALID = 8
+DEEP_CONTINUATION_DEBT_THRESHOLD = 5
+STACK_ACCESS_GAIN_THRESHOLD = 2
 SERVICE_FINISH_MONOTONE_KEYS = (
     "service_satisfied_count",
     "service_forced_position_satisfied_count",
     "service_south_contiguous_count",
 )
-SESSION_MAX_SEGMENTS = 6
-SESSION_MAX_BUSINESS_HOOKS = 10
-SESSION_MAX_CANDIDATES_PER_SOURCE = 24
-SESSION_MAX_TARGET_ASSIGNMENTS = 64
-SESSION_GATHER_MAX_SOURCES = 3
-SESSION_GATHER_MAX_SOURCE_ORDERS = 16
-SESSION_GATHER_PREFIX_OPTIONS_PER_ORDER = 8
-SESSION_GATHER_ASSIGNMENTS_PER_PUT_COUNT = 8
-SESSION_GATHER_MAX_CANDIDATES = 48
 ROLLING_SESSION_MAX_STEPS = 12
+ROLLING_SUPPORT_MAX_STEPS = 6
 ROLLING_SESSION_BEAM_WIDTH = 24
 ROLLING_SESSION_STATES_PER_SHAPE = 4
 ROLLING_SESSION_GET_BRANCH = 8
 ROLLING_SESSION_PUT_BRANCH = 6
-ROLLING_SESSION_PREFIXES_PER_LINE = 2
+ROLLING_SESSION_PREFIXES_PER_LINE = 5
 ROLLING_SESSION_MAX_CANDIDATES = 64
 ROLLING_SESSION_ENDPOINTS_PER_SHAPE = 48
+ROLLING_SESSION_MAX_REGET_STEPS = 1
 STAGE1_COMPOUND_SESSION_REASONS = {
-    "stage1_mixed_split_put",
-    "stage1_source_session",
-    "stage1_session_gather",
     "stage1_rolling_session",
 }
 TARGET_REBUILD_MAX_CANDIDATES = 48
@@ -142,40 +135,6 @@ STAGE4_CACHE_GROUP_TARGETS = {
 STAGE4_CACHE_GROUP_LINES = ("存5线北", "存3线", "存2线", "存1线", "存5线南")
 
 
-@dataclass(frozen=True)
-class ProfileConfig:
-    downstream: bool = False
-    target_aware: bool = False
-    direct_delivery: bool = False
-    direct_delivery_max_hooks: int = 0
-    quality_order: str = "none"
-
-
-PROFILE_CONFIGS: dict[str, ProfileConfig] = {
-    "baseline": ProfileConfig(),
-    "balanced": ProfileConfig(
-        downstream=True,
-        target_aware=True,
-        direct_delivery=True,
-        direct_delivery_max_hooks=5,
-        quality_order="balanced",
-    ),
-    "stage3": ProfileConfig(
-        downstream=True,
-        target_aware=True,
-        direct_delivery=True,
-        direct_delivery_max_hooks=5,
-        quality_order="stage3",
-    ),
-    "stage4": ProfileConfig(
-        downstream=True,
-        target_aware=True,
-        direct_delivery=True,
-        direct_delivery_max_hooks=5,
-        quality_order="stage4",
-    ),
-}
-DEFAULT_PROFILE = "balanced"
 MAX_HOOKS = 80
 # hook_index counts move batches. business_hooks in the summary counts Get/Put rows.
 MAX_NO_PROGRESS_STREAK = 30
@@ -186,9 +145,10 @@ CONTEXTUAL_VALID_WINDOW = 20
 CONTEXTUAL_EXAMINED_WINDOW = 140
 CONTEXTUAL_COMPLETE_VALID_WINDOW = 8
 DEBT_REBOUND_PRIMARY = 7
+DIRECT_DELIVERY_MAX_HOOKS = 5
 
 
-def downstream_quality_vector(quality: dict[str, Any], objective: str) -> tuple[int, ...]:
+def downstream_quality_vector(quality: dict[str, Any]) -> tuple[int, ...]:
     service = (
         -int(quality.get("service_forced_position_satisfied_count") or 0),
         -int(quality.get("service_south_contiguous_count") or 0),
@@ -211,8 +171,6 @@ def downstream_quality_vector(quality: dict[str, Any], objective: str) -> tuple[
         int(quality.get("stage4_lower_bound") or 0),
         int(quality.get("stage4_tail_debt_count") or 0),
     )
-    if objective == "stage4":
-        return (*stage4, *layout, *stage3, *service)
     return (*stage3, *stage4, *layout, *service)
 
 
@@ -224,19 +182,10 @@ class CandidateView:
 
 
 @dataclass(frozen=True)
-class SessionSegment:
-    token: str
-    cars: tuple[dict[str, Any], ...]
-
-    @property
-    def car_nos(self) -> tuple[str, ...]:
-        return tuple(physical.car_no(car) for car in self.cars)
-
-
-@dataclass(frozen=True)
 class SessionMetrics:
     business_hooks: int
     flow_count: int
+    redundant_put_count: int
     retains_across_put_then_get: bool
     stack_valid: bool
 
@@ -253,11 +202,24 @@ class OpenSessionState:
     touched_lines: frozenset[str]
     loco: physical.LocoLocation
     route_cost: int
+    reget_steps: int
     service_count: int
     forced_count: int
     completed_g_count: int
     carried_g_count: int
     carried_service_count: int
+
+
+@dataclass(frozen=True)
+class RollingGetOption:
+    rank: tuple[Any, ...]
+    source: str
+    batch: tuple[dict[str, Any], ...]
+    stage1_gain: int
+    service_gain: int
+    support_gain: int
+    minimum_puts: int
+    shared_put_targets: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -271,10 +233,16 @@ class CandidateEvaluation:
 
 
 @dataclass(frozen=True)
+class GetBlockerInfo:
+    lines: frozenset[str]
+    blocked_nos: frozenset[str]
+    pressure: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
 class SelectionContext:
     mode: str
-    get_blockers: set[str]
-    get_blocked_nos: set[str]
+    get_blockers: GetBlockerInfo
     put_blockers: set[str]
 
 
@@ -282,8 +250,8 @@ class SelectionContext:
 class RankedCandidate:
     score: tuple[Any, ...]
     evaluation: CandidateEvaluation
-    before_get_blockers: set[str]
-    after_get_blockers: set[str]
+    before_get_blockers: GetBlockerInfo
+    after_get_blockers: GetBlockerInfo
     before_put_blockers: set[str]
     after_put_blockers: set[str]
 
@@ -295,10 +263,7 @@ class Stage1Solver:
         *,
         max_hooks: int = MAX_HOOKS,
         time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
-        profile: str = DEFAULT_PROFILE,
     ) -> None:
-        if profile not in PROFILE_CONFIGS:
-            raise ValueError(f"unknown_stage1_profile:{profile}")
         self.case_id, self.request, self.cars, self.depot_assignment, self.loco = physical.read_case(path)
         nos = [physical.car_no(car) for car in self.cars]
         duplicates = [no for no, count in Counter(nos).items() if not no or count > 1]
@@ -315,10 +280,10 @@ class Stage1Solver:
         self.started_at = time.monotonic()
         self.time_budget_seconds = time_budget_seconds
         self.validation_cache: dict[tuple[str, str], physical.PhysicalValidation] = {}
-        self.profile = profile
-        self.config = PROFILE_CONFIGS[profile]
+        self.continuation_cache: dict[tuple[Any, ...], bool] = {}
         self.downstream_quality_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self.rolling_session_cache: dict[tuple[Any, ...], tuple[CandidateView, ...]] = {}
+        self.service_support_cache: dict[str, set[str]] = {}
         self.initial_service_quality = self.service_quality()
 
     def solve(self) -> dict[str, Any]:
@@ -504,8 +469,14 @@ class Stage1Solver:
         self.trace[-1]["selection_primary"] = pick.score[0]
         self.trace[-1]["selection_score"] = list(pick.score[:5])
         self.trace[-1]["downstream_quality"] = list(pick.evaluation.downstream_quality)
-        self.trace[-1]["route_blockers_before"] = sorted(pick.before_get_blockers)
-        self.trace[-1]["route_blockers_after"] = sorted(pick.after_get_blockers)
+        self.trace[-1]["route_blockers_before"] = sorted(pick.before_get_blockers.lines)
+        self.trace[-1]["route_blockers_after"] = sorted(pick.after_get_blockers.lines)
+        self.trace[-1]["route_blocker_pressure_before"] = list(
+            pick.before_get_blockers.pressure
+        )
+        self.trace[-1]["route_blocker_pressure_after"] = list(
+            pick.after_get_blockers.pressure
+        )
         self.trace[-1]["put_blockers_before"] = sorted(pick.before_put_blockers)
         self.trace[-1]["put_blockers_after"] = sorted(pick.after_put_blockers)
         return accepted
@@ -554,7 +525,6 @@ class Stage1Solver:
         if (
             reject_uncontextualized_compound
             and self.is_compound_stage1_session(view.candidate)
-            and view.candidate.generation_reason != "stage1_mixed_split_put"
             and not after_debt["complete"]
         ):
             self.reject_candidate(
@@ -565,17 +535,16 @@ class Stage1Solver:
             )
             return None
         if self.is_compound_stage1_session(view.candidate) and not after_debt["complete"]:
-            before_get_blockers, _ = self.pending_get_blocker_info(debt)
+            before_get_blockers = self.pending_get_blocker_info(debt)
             before_put_blockers, _ = self.pending_put_blocker_info(debt)
-            after_get_blockers, _ = probe.pending_get_blocker_info(after_debt)
+            after_get_blockers = probe.pending_get_blocker_info(after_debt)
             after_put_blockers, _ = probe.pending_put_blocker_info(after_debt)
             unlocks = (
-                len(after_get_blockers) < len(before_get_blockers)
+                after_get_blockers.pressure < before_get_blockers.pressure
                 or len(after_put_blockers) < len(before_put_blockers)
             )
             improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
             if not self.compound_progress_allowed(
-                view.candidate,
                 improves_debt=improves_debt,
                 unlocks=unlocks,
             ):
@@ -586,8 +555,8 @@ class Stage1Solver:
                     limit=reject_limit,
                 )
                 return None
-        if reject_sideways and self.disallow_profile_sideways_stage1_move(view.candidate, debt, after_debt):
-            self.reject_candidate(rejected, view, ["profile_sideways_stage1_move"], limit=reject_limit)
+        if reject_sideways and self.disallow_sideways_stage1_move(view.candidate, debt, after_debt):
+            self.reject_candidate(rejected, view, ["sideways_stage1_move"], limit=reject_limit)
             return None
 
         if reject_large_rebound and self.large_assembly_debt_rebound(view.candidate, debt, after_debt):
@@ -597,7 +566,17 @@ class Stage1Solver:
         if (
             reject_dead_end
             and not after_debt["complete"]
-            and not probe.can_continue(depth=1)
+            and not probe.can_continue(
+                depth=(
+                    2
+                    if (
+                        self.is_compound_stage1_session(view.candidate)
+                        or after_debt["debt_count"] <= DEEP_CONTINUATION_DEBT_THRESHOLD
+                    )
+                    else 1
+                ),
+                avoid_new_get_blockers=self.is_compound_stage1_session(view.candidate),
+            )
         ):
             self.reject_candidate(rejected, view, ["dead_end_after_candidate"], limit=reject_limit)
             return None
@@ -615,20 +594,19 @@ class Stage1Solver:
     def selection_context(self, debt: dict[str, Any]) -> SelectionContext | None:
         if debt["pollution_nos"]:
             return None
-        get_blockers, get_blocked_nos = self.pending_get_blocker_info(debt)
+        get_blockers = self.pending_get_blocker_info(debt)
         put_blockers, _put_blocked_nos = self.pending_put_blocker_info(debt)
-        if get_blockers & set(ASSEMBLY_DEPOT):
+        if get_blockers.lines & set(ASSEMBLY_DEPOT):
             mode = "get_unlock"
-        elif not get_blockers and put_blockers & set(ASSEMBLY_DEPOT):
+        elif not get_blockers.lines and put_blockers & set(ASSEMBLY_DEPOT):
             mode = "put_unlock"
-        elif not get_blockers:
+        elif not get_blockers.lines:
             mode = "debt_window"
         else:
             return None
         return SelectionContext(
             mode=mode,
             get_blockers=get_blockers,
-            get_blocked_nos=get_blocked_nos,
             put_blockers=put_blockers,
         )
 
@@ -661,21 +639,32 @@ class Stage1Solver:
         debt: dict[str, Any],
     ) -> tuple[RankedCandidate | None, tuple[str, ...]]:
         after_debt = evaluation.after_debt
-        after_get_blockers, _after_get_blocked_nos = evaluation.probe.pending_get_blocker_info(after_debt)
+        after_get_blockers = evaluation.probe.pending_get_blocker_info(after_debt)
         after_put_blockers, _after_put_blocked_nos = evaluation.probe.pending_put_blocker_info(after_debt)
-        moves_get_blocked = bool(evaluation.moving_nos & context.get_blocked_nos)
-        unlocks_get = len(after_get_blockers) < len(context.get_blockers)
+        moves_get_blocked = bool(
+            evaluation.moving_nos & context.get_blockers.blocked_nos
+        )
+        unlocks_get = after_get_blockers.pressure < context.get_blockers.pressure
         worsens_get_blockers = (
-            len(after_get_blockers) > len(context.get_blockers)
+            after_get_blockers.pressure > context.get_blockers.pressure
+            and not after_debt["complete"]
+        )
+        worsens_put_blockers = (
+            len(after_put_blockers) > len(context.put_blockers)
             and not after_debt["complete"]
         )
         debt_rebound = after_debt["debt_count"] > debt["debt_count"]
         improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
+        improves_stack_access = (
+            debt["blocked_g_count"] - after_debt["blocked_g_count"]
+            >= STACK_ACCESS_GAIN_THRESHOLD
+            and not debt_rebound
+        )
         if (
-            self.disallow_profile_sideways_stage1_move(evaluation.view.candidate, debt, after_debt)
+            self.disallow_sideways_stage1_move(evaluation.view.candidate, debt, after_debt)
             and not unlocks_get
         ):
-            return None, ("profile_sideways_stage1_move",)
+            return None, ("sideways_stage1_move",)
         if (
             self.large_assembly_debt_rebound(evaluation.view.candidate, debt, after_debt)
             and not unlocks_get
@@ -683,11 +672,12 @@ class Stage1Solver:
             return None, ("large_assembly_debt_rebound",)
         if worsens_get_blockers:
             return None, ("worsens_get_route_blockers",)
+        if worsens_put_blockers and (not improves_debt or not context.put_blockers):
+            return None, ("worsens_put_route_blockers",)
         if (
             self.is_compound_stage1_session(evaluation.view.candidate)
             and not after_debt["complete"]
             and not self.compound_progress_allowed(
-                evaluation.view.candidate,
                 improves_debt=improves_debt,
                 unlocks=unlocks_get,
             )
@@ -698,6 +688,8 @@ class Stage1Solver:
         elif unlocks_get and not moves_get_blocked and not debt_rebound:
             primary = 1
         elif moves_get_blocked and improves_debt:
+            primary = 2
+        elif improves_stack_access:
             primary = 2
         elif improves_debt:
             primary = 3
@@ -713,8 +705,11 @@ class Stage1Solver:
                 candidate=evaluation.view.candidate,
                 debt=debt,
                 after_debt=after_debt,
-                blocker_count=len(after_get_blockers) + len(after_put_blockers),
+                blocker_count=len(after_get_blockers.lines) + len(after_put_blockers),
                 service_regression=self.service_regression_rank(evaluation.probe),
+                service_quality=self.service_quality_vector(
+                    evaluation.probe.service_quality()
+                ),
                 downstream_quality=evaluation.downstream_quality,
                 view_score=evaluation.view.score,
             ),
@@ -732,7 +727,12 @@ class Stage1Solver:
         debt: dict[str, Any],
     ) -> tuple[RankedCandidate | None, tuple[str, ...]]:
         after_debt = evaluation.after_debt
+        after_get_blockers = evaluation.probe.pending_get_blocker_info(after_debt)
         after_put_blockers, _after_put_blocked_nos = evaluation.probe.pending_put_blocker_info(after_debt)
+        worsens_get_blockers = (
+            after_get_blockers.pressure > context.get_blockers.pressure
+            and not after_debt["complete"]
+        )
         unlocks_put = (
             bool(context.put_blockers & set(ASSEMBLY_DEPOT))
             and len(after_put_blockers) < len(context.put_blockers)
@@ -751,15 +751,21 @@ class Stage1Solver:
             after_debt,
         )
         improves_debt = self.progress_tuple(after_debt) < self.progress_tuple(debt)
+        improves_stack_access = (
+            debt["blocked_g_count"] - after_debt["blocked_g_count"]
+            >= STACK_ACCESS_GAIN_THRESHOLD
+            and after_debt["debt_count"] <= debt["debt_count"]
+        )
+        if worsens_get_blockers:
+            return None, ("worsens_get_route_blockers",)
         if unlocks_put and large_rebound:
             return None, ("large_assembly_debt_rebound",)
-        if worsens_put_blockers:
+        if worsens_put_blockers and (not improves_debt or not context.put_blockers):
             return None, ("worsens_put_route_blockers",)
         if (
             self.is_compound_stage1_session(evaluation.view.candidate)
             and not after_debt["complete"]
             and not self.compound_progress_allowed(
-                evaluation.view.candidate,
                 improves_debt=improves_debt,
                 unlocks=unlocks_put,
             )
@@ -767,19 +773,28 @@ class Stage1Solver:
             return None, ("compound_assembly_requires_unlock_or_completion",)
         direct_delivery_priority = (
             not context.put_blockers
-            and self.direct_delivery_priority_candidate(evaluation.view.candidate, debt, after_debt)
+            and (
+                self.direct_delivery_priority_candidate(
+                    evaluation.view.candidate,
+                    debt,
+                    after_debt,
+                )
+                or self.forced_position_gain(evaluation.probe)
+            )
         )
         if (
-            self.disallow_profile_sideways_stage1_move(evaluation.view.candidate, debt, after_debt)
+            self.disallow_sideways_stage1_move(evaluation.view.candidate, debt, after_debt)
             and not unlocks_put
         ):
-            return None, ("profile_sideways_stage1_move",)
+            return None, ("sideways_stage1_move",)
         debt_rebound = after_debt["debt_count"] > debt["debt_count"]
         if after_debt["complete"]:
             primary = 0
         elif direct_delivery_priority:
             primary = 1
         elif unlocks_put and not debt_rebound:
+            primary = 2
+        elif improves_stack_access:
             primary = 2
         elif improves_debt:
             primary = 3
@@ -801,12 +816,15 @@ class Stage1Solver:
                 after_debt=after_debt,
                 blocker_count=len(after_put_blockers),
                 service_regression=self.service_regression_rank(evaluation.probe),
+                service_quality=self.service_quality_vector(
+                    evaluation.probe.service_quality()
+                ),
                 downstream_quality=evaluation.downstream_quality,
                 view_score=evaluation.view.score,
             ),
             evaluation=evaluation,
-            before_get_blockers=set(),
-            after_get_blockers=set(),
+            before_get_blockers=context.get_blockers,
+            after_get_blockers=after_get_blockers,
             before_put_blockers=context.put_blockers,
             after_put_blockers=after_put_blockers,
         ), ()
@@ -820,22 +838,25 @@ class Stage1Solver:
         after_debt: dict[str, Any],
         blocker_count: int,
         service_regression: tuple[int, int, int],
+        service_quality: tuple[int, ...],
         downstream_quality: tuple[int, ...],
         view_score: tuple[Any, ...],
     ) -> tuple[Any, ...]:
         return (
             primary,
+            service_regression,
+            self.contextual_target_group(candidate, debt),
+            self.assembly_landing_rank(candidate),
+            self.candidate_source_phase_gap(candidate, debt),
             blocker_count,
             max(0, after_debt["debt_count"] - debt["debt_count"]),
             self.progress_tuple(after_debt),
-            service_regression,
+            service_quality,
             downstream_quality,
             (
                 -self.candidate_closure_savings(candidate),
                 self.candidate_business_hook_count(candidate),
             ),
-            self.contextual_target_group(candidate),
-            self.assembly_landing_rank(candidate),
             self.real_target_contextual_rank(candidate, debt, after_debt),
             view_score,
         )
@@ -845,13 +866,10 @@ class Stage1Solver:
 
     def compound_progress_allowed(
         self,
-        candidate: physical.HookCandidate,
         *,
         improves_debt: bool,
         unlocks: bool,
     ) -> bool:
-        if candidate.generation_reason == "stage1_mixed_split_put":
-            return unlocks
         return improves_debt or unlocks
 
     def service_regression_rank(self, probe: "Stage1Solver") -> tuple[int, int, int]:
@@ -866,6 +884,13 @@ class Stage1Solver:
             )
         )
 
+    def forced_position_gain(self, probe: "Stage1Solver") -> bool:
+        before = self.downstream_quality()
+        after = probe.downstream_quality()
+        return int(after["service_forced_position_satisfied_count"]) > int(
+            before["service_forced_position_satisfied_count"]
+        )
+
     def assembly_landing_rank(self, candidate: physical.HookCandidate) -> int:
         by_no = self.by_no()
         destinations = self.candidate_put_line_by_no(candidate)
@@ -878,15 +903,45 @@ class Stage1Solver:
         ]
         return max(ranks, default=0)
 
-    def contextual_target_group(self, candidate: physical.HookCandidate) -> int:
+    def contextual_target_group(
+        self,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+    ) -> int:
         put_lines = set(self.candidate_put_line_by_no(candidate).values())
         if "存4线" in put_lines:
             return 0
         if put_lines & {"机南", "洗油北"}:
             return 0
         if put_lines & {"机走棚", "机走北"}:
-            return 1
+            remaining = set(debt["pending_stage1_nos"]) - set(candidate.move_car_nos)
+            return 3 if remaining else 1
         return 2
+
+    def candidate_source_phase_gap(
+        self,
+        candidate: physical.HookCandidate,
+        debt: dict[str, Any],
+    ) -> int:
+        pending_nos = set(debt["pending_stage1_nos"])
+        pending_lines = {
+            car["Line"]
+            for car in self.cars
+            if physical.car_no(car) in pending_nos
+        }
+        source_lines = {
+            step.line
+            for step in physical.candidate_plan_steps(candidate)
+            if step.action == "Get" and step.line in pending_lines
+        }
+        source_ranks = [self.source_rank(line) for line in source_lines]
+        if len(source_ranks) < 2:
+            return 0
+        low, high = min(source_ranks), max(source_ranks)
+        return sum(
+            low < self.source_rank(line) < high
+            for line in pending_lines - source_lines
+        )
 
     def real_target_contextual_rank(
         self,
@@ -894,8 +949,6 @@ class Stage1Solver:
         debt: dict[str, Any],
         after_debt: dict[str, Any],
     ) -> int:
-        if not self.config.downstream:
-            return 1
         if after_debt["debt_count"] > debt["debt_count"]:
             return 1
         return 0 if self.clean_real_target_put(candidate) else 1
@@ -917,14 +970,12 @@ class Stage1Solver:
             and after_debt["debt_count"] > debt["debt_count"] + 1
         )
 
-    def disallow_profile_sideways_stage1_move(
+    def disallow_sideways_stage1_move(
         self,
         candidate: physical.HookCandidate,
         debt: dict[str, Any],
         after_debt: dict[str, Any],
     ) -> bool:
-        if not self.config.downstream:
-            return False
         if self.progress_tuple(after_debt) < self.progress_tuple(debt):
             return False
         by_no = self.by_no()
@@ -938,8 +989,6 @@ class Stage1Solver:
         return False
 
     def try_service_finish_step(self, debt: dict[str, Any]) -> bool:
-        if not self.config.downstream:
-            return False
         if debt["pollution_nos"]:
             return False
         if self.service_finish_planlets_used() >= SERVICE_FINISH_MAX_PLANLETS:
@@ -995,9 +1044,22 @@ class Stage1Solver:
             if after_vector >= before_vector:
                 self.reject_candidate(rejected, view, ["service_quality_not_improved"], limit=80)
                 continue
+            weighted_gain = self.service_finish_weighted_gain(
+                before_quality,
+                after_quality,
+            )
+            if 2 * weighted_gain < candidate_business_hooks:
+                self.reject_candidate(
+                    rejected,
+                    view,
+                    ["service_finish_marginal_gain_too_low"],
+                    limit=80,
+                )
+                continue
             valid += 1
             ranked.append((
                 (
+                    Fraction(candidate_business_hooks, weighted_gain),
                     after_vector,
                     candidate_business_hooks,
                     self.route_price(view.candidate),
@@ -1010,18 +1072,44 @@ class Stage1Solver:
                 break
         if not ranked:
             return False
-        shortlist = sorted(ranked, key=lambda item: item[0])[:SERVICE_FINISH_LOOKAHEAD_WIDTH]
-        _score, evaluation, after_quality = min(
-            shortlist,
+        shortlist_by_efficiency = sorted(
+            ranked,
+            key=lambda item: item[0],
+        )[:SERVICE_FINISH_LOOKAHEAD_WIDTH]
+        shortlist_by_quality = sorted(
+            ranked,
             key=lambda item: (
-                item[1].probe.best_service_continuation_vector(
+                item[0][1],
+                self.candidate_business_hook_count(item[1].view.candidate),
+                item[0],
+            ),
+        )[:SERVICE_FINISH_LOOKAHEAD_WIDTH]
+        shortlist = list({
+            item[1].view.candidate.candidate_id: item
+            for item in (*shortlist_by_efficiency, *shortlist_by_quality)
+        }.values())
+
+        def continuation_rank(
+            item: tuple[tuple[Any, ...], CandidateEvaluation, dict[str, int]],
+        ) -> tuple[Any, ...]:
+            candidate_hooks = self.candidate_business_hook_count(item[1].view.candidate)
+            continuation_vector, continuation_hooks = (
+                item[1].probe.best_service_continuation_score(
                     item[2],
                     SERVICE_FINISH_MAX_BUSINESS_HOOKS
                     - used_business_hooks
-                    - self.candidate_business_hook_count(item[1].view.candidate),
-                ),
+                    - candidate_hooks,
+                )
+            )
+            return (
+                continuation_vector,
+                candidate_hooks + continuation_hooks,
                 item[0],
-            ),
+            )
+
+        _score, evaluation, after_quality = min(
+            shortlist,
+            key=continuation_rank,
         )
         accepted = self.accept_candidate(
             evaluation.view,
@@ -1038,12 +1126,28 @@ class Stage1Solver:
         })
         return accepted
 
-    def best_service_continuation_vector(
+    @staticmethod
+    def service_finish_weighted_gain(
+        before: dict[str, int],
+        after: dict[str, int],
+    ) -> int:
+        return (
+            after["service_satisfied_count"]
+            - before["service_satisfied_count"]
+            + after["service_south_contiguous_count"]
+            - before["service_south_contiguous_count"]
+            + 2 * (
+                after["service_forced_position_satisfied_count"]
+                - before["service_forced_position_satisfied_count"]
+            )
+        )
+
+    def best_service_continuation_score(
         self,
         before_quality: dict[str, int],
         hook_budget: int,
-    ) -> tuple[int, ...]:
-        best = self.service_quality_vector(before_quality)
+    ) -> tuple[tuple[int, ...], int]:
+        best = (self.service_quality_vector(before_quality), 0)
         if hook_budget < 2 or self.time_exhausted():
             return best
         debt = self.stage1_debt()
@@ -1072,7 +1176,14 @@ class Stage1Solver:
             after_vector = self.service_quality_vector(after_quality)
             if after_vector >= self.service_quality_vector(before_quality):
                 continue
-            best = min(best, after_vector)
+            candidate_hooks = self.candidate_business_hook_count(view.candidate)
+            weighted_gain = self.service_finish_weighted_gain(
+                before_quality,
+                after_quality,
+            )
+            if 2 * weighted_gain < candidate_hooks:
+                continue
+            best = min(best, (after_vector, candidate_hooks))
             valid += 1
             if valid >= SERVICE_FINISH_LOOKAHEAD_VALID:
                 break
@@ -1091,6 +1202,7 @@ class Stage1Solver:
     def service_finish_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
         yield from self.forced_position_rebuild_candidates(debt)
         yield from self.spotting_repack_candidates(debt)
+        yield from self.service_prefix_cleanup_candidates(debt)
         yield from self.target_rebuild_candidates(debt)
         yield from self.rolling_session_candidates(debt, service_only=True)
         yield from self.direct_delivery_candidates(
@@ -1103,7 +1215,7 @@ class Stage1Solver:
         self,
         debt: dict[str, Any],
     ) -> Iterable[CandidateView]:
-        if not self.config.downstream or not debt["complete"] or debt["pollution_nos"]:
+        if not debt["complete"] or debt["pollution_nos"]:
             return
         views: list[tuple[tuple[Any, ...], CandidateView]] = []
         for target in SERVICE_LINES:
@@ -1182,10 +1294,393 @@ class Stage1Solver:
                     ),
                     view,
                 ))
+            for candidate in self.segmented_forced_position_rebuild_candidates(
+                target=target,
+                existing=existing,
+                pending_forced_nos=pending_forced_nos,
+                debt=debt,
+            ):
+                service_gain = self.candidate_service_delivery_count(candidate)
+                if service_gain <= len(existing):
+                    continue
+                view = CandidateView(
+                    candidate,
+                    self.score_candidate(
+                        candidate,
+                        debt=debt,
+                        moved_g=0,
+                        moved_x=len(candidate.move_car_nos),
+                        reason_rank=1,
+                    ),
+                    "stage1_service_forced_rebuild",
+                )
+                views.append((
+                    (
+                        -len(pending_forced_nos),
+                        -service_gain,
+                        self.candidate_business_hook_count(candidate),
+                        self.route_price(candidate),
+                    ),
+                    view,
+                ))
         for _rank, view in sorted(views, key=lambda item: item[0])[
             :FORCED_REBUILD_MAX_CANDIDATES
         ]:
             yield view
+
+    def segmented_forced_position_rebuild_candidates(
+        self,
+        *,
+        target: str,
+        existing: list[dict[str, Any]],
+        pending_forced_nos: set[str],
+        debt: dict[str, Any],
+    ) -> Iterable[physical.HookCandidate]:
+        pending = [car for car in self.cars if physical.car_no(car) in pending_forced_nos]
+        source_lines = {str(car.get("Line") or "") for car in pending}
+        if len(source_lines) != 1:
+            return
+        source = next(iter(source_lines))
+        ordered = self.line_ordered_cars(source)
+        forced_indexes = [
+            index
+            for index, car in enumerate(ordered)
+            if physical.car_no(car) in pending_forced_nos
+        ]
+        if not forced_indexes:
+            return
+
+        target_start = min(forced_indexes)
+        while target_start > 0 and self.pending_service_car_for_target(
+            ordered[target_start - 1],
+            target,
+        ):
+            target_start -= 1
+        target_end = max(forced_indexes)
+        while target_end + 1 < len(ordered) and self.pending_service_car_for_target(
+            ordered[target_end + 1],
+            target,
+        ):
+            target_end += 1
+
+        source_batch = ordered[: target_end + 1]
+        target_batch = source_batch[target_start:]
+        foreign_prefix = source_batch[:target_start]
+        if (
+            any(self.pending_weigh(car) for car in source_batch)
+            or physical.pull_equivalent(source_batch) > physical.PULL_LIMIT_EQUIVALENT
+            or any(not self.pending_service_car_for_target(car, target) for car in target_batch)
+        ):
+            return
+        foreign_puts = self.service_prefix_put_groups(foreign_prefix)
+        if foreign_prefix and not foreign_puts:
+            return
+        target_route_blockers = self.retainable_service_route_blockers(
+            target,
+            {physical.car_no(car) for car in existing},
+        )
+        source_route_blockers = self.retainable_service_route_blockers(
+            source,
+            {physical.car_no(car) for car in source_batch},
+        )
+        if target_route_blockers is None or source_route_blockers is None:
+            return
+        route_blockers = list(dict(
+            (*target_route_blockers, *source_route_blockers)
+        ).items())
+        retained_blocker_cars = [
+            car
+            for _line, cars in route_blockers
+            for car in cars
+        ]
+        if (
+            physical.pull_equivalent([*retained_blocker_cars, *source_batch])
+            > physical.PULL_LIMIT_EQUIVALENT
+            or physical.pull_equivalent([*retained_blocker_cars, *existing])
+            > physical.PULL_LIMIT_EQUIVALENT
+        ):
+            return
+
+        planned_positions = self.segmented_forced_positions(target, target_batch)
+        if planned_positions is None:
+            return
+        forced_runs = self.forced_position_runs(source_batch, target_start, target_end + 1)
+        early_forced_runs = forced_runs[:-1]
+        early_forced_nos = {
+            physical.car_no(car)
+            for start, end in early_forced_runs
+            for car in source_batch[start:end]
+        }
+        existing_nos = tuple(physical.car_no(car) for car in existing)
+        staging_lines = [
+            line
+            for line in self.safe_temp_targets(source=target, debt=debt)
+            if line in STORAGE_CACHE_LINES and self.target_allowed(line, existing)
+        ]
+        for staging in staging_lines:
+            working_cars = [self.clone_car(car) for car in self.cars]
+            steps: list[physical.PlanStep] = []
+            for blocker_line, blocker_cars in route_blockers:
+                blocker_nos = tuple(physical.car_no(car) for car in blocker_cars)
+                physical.apply_physical_get_order(
+                    working_cars,
+                    blocker_line,
+                    blocker_nos,
+                )
+                steps.append(physical.plan_step("Get", blocker_line, blocker_nos))
+            physical.apply_physical_get_order(working_cars, target, existing_nos)
+            steps.append(physical.plan_step("Get", target, existing_nos))
+            staging_put = self.planned_session_put_step(
+                working_cars,
+                staging,
+                existing_nos,
+            )
+            if staging_put is None:
+                continue
+            steps.append(staging_put)
+
+            cursor = 0
+            for _run_start, run_end in early_forced_runs:
+                get_nos = tuple(
+                    physical.car_no(car)
+                    for car in source_batch[cursor:run_end]
+                )
+                physical.apply_physical_get_order(working_cars, source, get_nos)
+                steps.append(physical.plan_step("Get", source, get_nos))
+                run_nos = tuple(
+                    physical.car_no(car)
+                    for car in source_batch[_run_start:run_end]
+                )
+                run_positions = {no: planned_positions[no] for no in run_nos}
+                physical.apply_physical_put_order(
+                    working_cars,
+                    target,
+                    list(run_nos),
+                    run_positions,
+                )
+                steps.append(physical.plan_step("Put", target, run_nos, run_positions))
+                cursor = run_end
+
+            if cursor < len(source_batch):
+                get_nos = tuple(
+                    physical.car_no(car)
+                    for car in source_batch[cursor:]
+                )
+                physical.apply_physical_get_order(working_cars, source, get_nos)
+                steps.append(physical.plan_step("Get", source, get_nos))
+
+            remaining_target_nos = tuple(
+                physical.car_no(car)
+                for car in target_batch
+                if physical.car_no(car) not in early_forced_nos
+            )
+            remaining_positions = {
+                no: planned_positions[no]
+                for no in remaining_target_nos
+            }
+            physical.apply_physical_put_order(
+                working_cars,
+                target,
+                list(remaining_target_nos),
+                remaining_positions,
+            )
+            steps.append(physical.plan_step(
+                "Put",
+                target,
+                remaining_target_nos,
+                remaining_positions,
+            ))
+
+            valid = True
+            for put_target, group in foreign_puts:
+                put_nos = tuple(physical.car_no(car) for car in group)
+                put_step = self.planned_session_put_step(
+                    working_cars,
+                    put_target,
+                    put_nos,
+                )
+                if put_step is None:
+                    valid = False
+                    break
+                steps.append(put_step)
+            if not valid:
+                continue
+            for blocker_line, blocker_cars in reversed(route_blockers):
+                blocker_nos = tuple(physical.car_no(car) for car in blocker_cars)
+                put_step = self.planned_session_put_step(
+                    working_cars,
+                    blocker_line,
+                    blocker_nos,
+                )
+                if put_step is None:
+                    valid = False
+                    break
+                steps.append(put_step)
+            if not valid:
+                continue
+            candidate = self.make_planlet_candidate(
+                source=steps[0].line,
+                target=steps[-1].line,
+                batch=[*retained_blocker_cars, *existing, *source_batch],
+                steps=tuple(steps),
+                kind="vnext_depot_inbound_mixed_extraction_session",
+                reason="stage1_service_forced_rebuild",
+            )
+            if candidate is not None:
+                yield candidate
+
+    def retainable_service_route_blockers(
+        self,
+        source: str,
+        moving_nos: set[str],
+    ) -> list[tuple[str, list[dict[str, Any]]]] | None:
+        blocker_lines = self.route_blockers_for_get(source, moving_nos)
+        if not blocker_lines:
+            return []
+        retainable: list[tuple[str, list[dict[str, Any]]]] = []
+        for line in blocker_lines:
+            if line in FORBIDDEN_LINES or line in ASSEMBLY_ALL or line == source:
+                continue
+            cars = self.line_ordered_cars(line)
+            if (
+                not cars
+                or any(
+                    self.pending_weigh(car)
+                    or not (
+                        self.target_satisfied(car)
+                        or self.service_eligible(car)
+                    )
+                    for car in cars
+                )
+                or physical.pull_equivalent(cars) > physical.PULL_LIMIT_EQUIVALENT
+            ):
+                continue
+            retainable.append((line, cars))
+        for size in range(1, len(retainable) + 1):
+            for selected in combinations(retainable, size):
+                selected_cars = [car for _line, cars in selected for car in cars]
+                if physical.pull_equivalent(selected_cars) > physical.PULL_LIMIT_EQUIVALENT:
+                    continue
+                selected_nos = {physical.car_no(car) for car in selected_cars}
+                route_moving_nos = moving_nos | selected_nos
+                occupied = physical.occupied_lines_for_get_route(
+                    self.cars,
+                    route_moving_nos,
+                    source,
+                )
+                route = self.graph.route_avoiding_occupied(
+                    self.loco.line,
+                    source,
+                    occupied,
+                    source_departure_lines=physical.route_departure_lines_for_source(
+                        self.loco.line,
+                        self.cars,
+                        route_moving_nos,
+                    ),
+                    target_approach_lines=physical.route_approach_lines_for_get(source),
+                    cars=self.cars,
+                    moving_nos=route_moving_nos,
+                    train_length_m=physical.train_length_for_nos(
+                        self.cars,
+                        selected_nos,
+                    ),
+                )
+                if route:
+                    return list(selected)
+        return None
+
+    def pending_service_car_for_target(self, car: dict[str, Any], target: str) -> bool:
+        return (
+            self.service_eligible(car)
+            and not self.target_satisfied(car)
+            and target in set(car.get("TargetLines") or ())
+        )
+
+    def forced_position_runs(
+        self,
+        cars: list[dict[str, Any]],
+        start: int,
+        end: int,
+    ) -> list[tuple[int, int]]:
+        runs: list[tuple[int, int]] = []
+        index = start
+        while index < end:
+            if not physical.force_positions(cars[index]):
+                index += 1
+                continue
+            run_start = index
+            forced = physical.force_positions(cars[index])
+            index += 1
+            while index < end and physical.force_positions(cars[index]) == forced:
+                index += 1
+            runs.append((run_start, index))
+        return runs
+
+    def segmented_forced_positions(
+        self,
+        target: str,
+        cars: list[dict[str, Any]],
+    ) -> dict[str, int] | None:
+        capacity = physical.SPOTTING_LINE_TOTAL_POSITIONS.get(target, 0)
+        if not capacity or len(cars) > capacity:
+            return None
+        runs = self.forced_position_runs(cars, 0, len(cars))
+        planned: dict[str, int] = {}
+        signatures = dict.fromkeys(
+            physical.force_positions(car)
+            for car in cars
+            if physical.force_positions(car)
+        )
+        for forced in signatures:
+            matching_runs = [
+                (start, end)
+                for start, end in runs
+                if physical.force_positions(cars[start]) == forced
+            ]
+            needed = sum(end - start for start, end in matching_runs)
+            available = sorted(forced)[-needed:]
+            if len(available) != needed:
+                return None
+            cursor = 0
+            for start, end in reversed(matching_runs):
+                size = end - start
+                slots = available[cursor : cursor + size]
+                for car, position in zip(cars[start:end], slots):
+                    planned[physical.car_no(car)] = position
+                cursor += size
+        free_positions = [
+            position
+            for position in range(1, capacity + 1)
+            if position not in set(planned.values())
+        ]
+        non_forced = [car for car in cars if not physical.force_positions(car)]
+        if len(non_forced) > len(free_positions):
+            return None
+        for car, position in zip(non_forced, free_positions):
+            planned[physical.car_no(car)] = position
+        return planned
+
+    def service_prefix_put_groups(
+        self,
+        cars: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        groups: list[tuple[str, list[dict[str, Any]]]] = []
+        end = len(cars)
+        while end > 0:
+            common = set(self.service_target_options(cars[end - 1]))
+            if not common:
+                return []
+            start = end - 1
+            while start > 0:
+                overlap = common & set(self.service_target_options(cars[start - 1]))
+                if not overlap:
+                    break
+                common = overlap
+                start -= 1
+            target = min(common, key=lambda line: (self.target_rank(line), line))
+            groups.append((target, cars[start:end]))
+            end = start
+        return groups
 
     def candidate_business_hook_count(self, candidate: physical.HookCandidate) -> int:
         return sum(
@@ -1200,14 +1695,21 @@ class Stage1Solver:
     ) -> SessionMetrics:
         carried: list[str] = []
         get_step_by_no: dict[str, int] = {}
+        get_line_by_no: dict[str, str] = {}
         flows: set[tuple[int, int]] = set()
         business_hooks = 0
+        put_group = -1
+        previous_action = ""
+        previous_put_line = ""
+        redundant_put_count = 0
         retained_after_put = False
         put_then_get = False
         stack_valid = True
 
         for step_index, step in enumerate(steps):
             if step.action == "Weigh":
+                previous_action = step.action
+                previous_put_line = ""
                 continue
             if step.action == "Get":
                 business_hooks += 1
@@ -1218,14 +1720,23 @@ class Stage1Solver:
                         stack_valid = False
                         continue
                     get_step_by_no[no] = step_index
+                    get_line_by_no[no] = step.line
                     carried.append(no)
                 retained_after_put = False
+                previous_action = step.action
+                previous_put_line = ""
                 continue
             if step.action != "Put":
                 stack_valid = False
+                previous_action = step.action
+                previous_put_line = ""
                 continue
 
             business_hooks += 1
+            if previous_action == "Put" and previous_put_line == step.line:
+                redundant_put_count += 1
+            else:
+                put_group += 1
             move_nos = list(step.move_car_nos)
             if (
                 not move_nos
@@ -1236,27 +1747,30 @@ class Stage1Solver:
                 continue
             for no in move_nos:
                 get_step = get_step_by_no.pop(no, None)
+                get_line = get_line_by_no.pop(no, "")
                 if get_step is None:
                     stack_valid = False
                     continue
-                flows.add((get_step, step_index))
+                if get_line != step.line:
+                    flows.add((get_step, put_group))
             del carried[-len(move_nos):]
             retained_after_put = bool(carried)
+            previous_action = step.action
+            previous_put_line = step.line
 
-        stack_valid = stack_valid and not carried and not get_step_by_no
+        stack_valid = (
+            stack_valid
+            and not carried
+            and not get_step_by_no
+            and not get_line_by_no
+        )
         return SessionMetrics(
             business_hooks=business_hooks,
             flow_count=len(flows),
+            redundant_put_count=redundant_put_count,
             retains_across_put_then_get=put_then_get,
             stack_valid=stack_valid,
         )
-
-    def steps_retain_cars_across_put_then_get(
-        self,
-        steps: Iterable[physical.PlanStep],
-    ) -> bool:
-        metrics = self.session_metrics(steps)
-        return metrics.stack_valid and metrics.retains_across_put_then_get
 
     def candidate_closure_savings(self, candidate: physical.HookCandidate) -> int:
         metrics = self.session_metrics(physical.candidate_plan_steps(candidate))
@@ -1268,6 +1782,10 @@ class Stage1Solver:
         quality = quality or self.service_quality()
         return (
             -quality["service_forced_position_satisfied_count"],
+            -(
+                quality["service_south_contiguous_count"]
+                + quality["service_satisfied_count"]
+            ),
             -quality["service_south_contiguous_count"],
             -quality["service_satisfied_count"],
             quality["service_prefix_blocked_count"],
@@ -1290,6 +1808,7 @@ class Stage1Solver:
         self.operation_index += len(rows)
         physical.apply_candidate(view.candidate, self.cars, validation)
         self.loco = physical.next_loco_location(view.candidate, validation)
+        self.service_support_cache.clear()
         self.seen_states.add(physical.state_signature(self.cars, self.loco))
         self.trace.append({
             "hook": self.hook_index,
@@ -1334,24 +1853,44 @@ class Stage1Solver:
         probe.loco = physical.next_loco_location(candidate, validation)
         return probe
 
-    def can_continue(self, depth: int) -> bool:
+    def can_continue(
+        self,
+        depth: int,
+        *,
+        avoid_new_get_blockers: bool = False,
+    ) -> bool:
         debt = self.stage1_debt()
         if debt["complete"] or depth <= 0:
             return True
+        cache_key = (
+            physical.state_signature(self.cars, self.loco),
+            self.hook_index,
+            depth,
+            avoid_new_get_blockers,
+        )
+        cached = self.continuation_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if "priority_route_blocker_lines" not in debt:
             debt = {
                 **debt,
                 "priority_route_blocker_lines": self.priority_route_blocker_lines(debt),
             }
-        candidate_groups = (
+        candidate_groups: tuple[Iterable[CandidateView], ...] = (
             self.direct_assembly_candidates(debt),
             self.blocker_candidates(debt),
             self.route_blocker_candidates(debt),
             self.cleanup_candidates(debt),
             self.release_gate_candidates(debt),
             self.direct_delivery_candidates(debt),
-            self.rolling_session_candidates(debt, service_only=False),
         )
+        if not avoid_new_get_blockers:
+            candidate_groups = (
+                *candidate_groups,
+                self.rolling_session_candidates(debt, service_only=False),
+            )
+        continuation_context = self.selection_context(debt)
+        before_get_blockers = self.pending_get_blocker_info(debt)
         seen: set[str] = set()
         for group in candidate_groups:
             for view in sorted(group, key=lambda item: item.score):
@@ -1365,8 +1904,34 @@ class Stage1Solver:
                 probe = self.probe_after(view.candidate, next_validation)
                 if physical.state_signature(probe.cars, probe.loco) in self.seen_states:
                     continue
-                if depth <= 1 or probe.can_continue(depth - 1):
+                after_debt = probe.stage1_debt()
+                if avoid_new_get_blockers and not after_debt["complete"]:
+                    after_get_blockers = probe.pending_get_blocker_info(after_debt)
+                    if after_get_blockers.pressure > before_get_blockers.pressure:
+                        continue
+                if continuation_context is not None:
+                    continuation = CandidateEvaluation(
+                        view=view,
+                        validation=next_validation,
+                        probe=probe,
+                        after_debt=after_debt,
+                        moving_nos=set(view.candidate.move_car_nos),
+                        downstream_quality=(),
+                    )
+                    ranked, _violations = self.rank_contextual_candidate(
+                        continuation_context,
+                        continuation,
+                        debt,
+                    )
+                    if ranked is None:
+                        continue
+                if depth <= 1 or probe.can_continue(
+                    depth - 1,
+                    avoid_new_get_blockers=avoid_new_get_blockers,
+                ):
+                    self.continuation_cache[cache_key] = True
                     return True
+        self.continuation_cache[cache_key] = False
         return False
 
     def fork(self) -> "Stage1Solver":
@@ -1387,10 +1952,10 @@ class Stage1Solver:
         clone.started_at = self.started_at
         clone.time_budget_seconds = self.time_budget_seconds
         clone.validation_cache = self.validation_cache
-        clone.profile = self.profile
-        clone.config = self.config
+        clone.continuation_cache = self.continuation_cache
         clone.downstream_quality_cache = self.downstream_quality_cache
         clone.rolling_session_cache = self.rolling_session_cache
+        clone.service_support_cache = {}
         clone.initial_service_quality = dict(self.initial_service_quality)
         return clone
 
@@ -1506,9 +2071,7 @@ class Stage1Solver:
         enforce_hook_limit: bool = True,
         enforce_route_limit: bool = True,
     ) -> Iterable[CandidateView]:
-        if not self.config.direct_delivery:
-            return
-        if enforce_hook_limit and self.direct_delivery_hooks_used() >= self.config.direct_delivery_max_hooks:
+        if enforce_hook_limit and self.direct_delivery_hooks_used() >= DIRECT_DELIVERY_MAX_HOOKS:
             return
         if debt["pollution_nos"]:
             return
@@ -1570,7 +2133,7 @@ class Stage1Solver:
         *,
         service_only: bool,
     ) -> Iterable[CandidateView]:
-        if not self.config.downstream or debt["pollution_nos"]:
+        if debt["pollution_nos"]:
             return
         if service_only and not debt["complete"]:
             return
@@ -1578,7 +2141,6 @@ class Stage1Solver:
         cache_key = (
             physical.state_signature(self.cars, self.loco),
             self.hook_index,
-            self.profile,
             service_only,
         )
         cached = self.rolling_session_cache.get(cache_key)
@@ -1586,51 +2148,94 @@ class Stage1Solver:
             yield from cached
             return
 
-        initial_service, initial_forced = self.rolling_service_counts(self.cars)
-        initial = OpenSessionState(
-            cars=[dict(car) for car in self.cars],
-            carried=(),
-            carried_origins=(),
-            carried_targets=(),
-            steps=(),
-            moved_order=(),
-            source_lines=frozenset(),
-            touched_lines=frozenset(),
-            loco=self.loco,
-            route_cost=0,
-            service_count=initial_service,
-            forced_count=initial_forced,
-            completed_g_count=0,
-            carried_g_count=0,
-            carried_service_count=0,
-        )
-        frontier = [initial]
         endpoints: list[tuple[tuple[Any, ...], CandidateView]] = []
-        for _depth in range(ROLLING_SESSION_MAX_STEPS):
-            open_states: list[OpenSessionState] = []
-            for state in frontier:
-                successors = (
-                    self.rolling_get_successors(state, service_only=service_only)
-                    if not state.carried
-                    else [
-                        *self.rolling_put_successors(state, service_only=service_only),
-                        *self.rolling_get_successors(state, service_only=service_only),
-                    ]
-                )
-                for successor in successors:
-                    if successor.carried:
-                        open_states.append(successor)
-                        continue
-                    endpoint = self.rolling_endpoint_view(
-                        successor,
-                        debt=debt,
-                        service_only=service_only,
+        support_lanes = (False,)
+        if not service_only and any(
+            self.stage1_route_support_nos(line)
+            for line in ASSEMBLY_ALL
+        ):
+            support_lanes = (False, True)
+        initial_service, initial_forced = self.rolling_service_counts(self.cars)
+        for allow_stage1_support in support_lanes:
+            frontier = [OpenSessionState(
+                cars=[dict(car) for car in self.cars],
+                carried=(),
+                carried_origins=(),
+                carried_targets=(),
+                steps=(),
+                moved_order=(),
+                source_lines=frozenset(),
+                touched_lines=frozenset(),
+                loco=self.loco,
+                route_cost=0,
+                reget_steps=0,
+                service_count=initial_service,
+                forced_count=initial_forced,
+                completed_g_count=0,
+                carried_g_count=0,
+                carried_service_count=0,
+            )]
+            max_steps = (
+                ROLLING_SUPPORT_MAX_STEPS
+                if allow_stage1_support
+                else ROLLING_SESSION_MAX_STEPS
+            )
+            for _depth in range(max_steps):
+                open_states: list[OpenSessionState] = []
+                for state in frontier:
+                    successors = (
+                        self.rolling_get_successors(
+                            state,
+                            service_only=service_only,
+                            allow_stage1_support=allow_stage1_support,
+                        )
+                        if not state.carried
+                        else [
+                            *self.rolling_put_successors(
+                                state,
+                                service_only=service_only,
+                            ),
+                            *self.rolling_get_successors(
+                                state,
+                                service_only=service_only,
+                                allow_stage1_support=allow_stage1_support,
+                            ),
+                        ]
                     )
-                    if endpoint is not None:
-                        endpoints.append(endpoint)
-            if not open_states:
-                break
-            frontier = self.prune_rolling_states(open_states, service_only=service_only)
+                    for successor in successors:
+                        uses_stage1_support = bool(
+                            successor.source_lines & set(ASSEMBLY_ALL)
+                        )
+                        if (
+                            allow_stage1_support
+                            and len(successor.source_lines) >= 2
+                            and not uses_stage1_support
+                        ):
+                            continue
+                        if successor.carried:
+                            if (
+                                len(successor.steps)
+                                + self.rolling_minimum_puts(successor)
+                                > max_steps
+                            ):
+                                continue
+                            open_states.append(successor)
+                            continue
+                        if allow_stage1_support and not uses_stage1_support:
+                            continue
+                        endpoint = self.rolling_endpoint_view(
+                            successor,
+                            debt=debt,
+                            service_only=service_only,
+                        )
+                        if endpoint is not None:
+                            endpoints.append(endpoint)
+                if not open_states:
+                    break
+                frontier = self.prune_rolling_states(
+                    open_states,
+                    service_only=service_only,
+                )
 
         unique: dict[str, tuple[tuple[Any, ...], CandidateView]] = {}
         for ranked in sorted(endpoints, key=lambda item: item[0]):
@@ -1677,15 +2282,44 @@ class Stage1Solver:
         state: OpenSessionState,
         *,
         service_only: bool,
+        allow_stage1_support: bool,
     ) -> list[OpenSessionState]:
         if len(state.steps) >= ROLLING_SESSION_MAX_STEPS - 1:
             return []
         successors: list[OpenSessionState] = []
-        for option_rank, source, batch in self.rolling_get_options(
+        options = self.rolling_get_options(
             state,
             service_only=service_only,
-        )[:ROLLING_SESSION_GET_BRANCH]:
+            allow_stage1_support=allow_stage1_support,
+        )
+        option_groups: dict[tuple[bool, int], list[RollingGetOption]] = {}
+        for option in options:
+            has_stage1 = any(
+                self.stage1_goal(car)
+                for car in option.batch
+            )
+            option_groups.setdefault(
+                (bool(has_stage1), option.minimum_puts),
+                [],
+            ).append(option)
+        selected_options = sorted(
+            (
+                (group_index, option.rank, option)
+                for group in option_groups.values()
+                for group_index, option in enumerate(group)
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        moved_nos = set(state.moved_order)
+        for _group_index, _option_rank, option in selected_options:
+            if len(successors) >= ROLLING_SESSION_GET_BRANCH:
+                break
+            source = option.source
+            batch = list(option.batch)
             move_nos = tuple(physical.car_no(car) for car in batch)
+            reget_step = any(no in moved_nos for no in move_nos)
+            if reget_step and state.reget_steps >= ROLLING_SESSION_MAX_REGET_STEPS:
+                continue
             transition = self.rolling_route_transition(
                 state,
                 action="Get",
@@ -1701,6 +2335,7 @@ class Stage1Solver:
                     car,
                     source=source,
                     service_only=service_only,
+                    allow_stage1_support=allow_stage1_support,
                 )
                 for car in batch
             )
@@ -1708,7 +2343,7 @@ class Stage1Solver:
                 continue
             physical.apply_physical_get_order(working_cars, source, move_nos)
             moved_order = (*state.moved_order, *(
-                no for no in move_nos if no not in set(state.moved_order)
+                no for no in move_nos if no not in moved_nos
             ))
             carried = (*state.carried, *move_nos)
             (
@@ -1731,13 +2366,13 @@ class Stage1Solver:
                 touched_lines=state.touched_lines | {source},
                 loco=next_loco,
                 route_cost=state.route_cost + route_cost,
+                reget_steps=state.reget_steps + int(reget_step),
                 service_count=service_count,
                 forced_count=forced_count,
                 completed_g_count=completed_g_count,
                 carried_g_count=carried_g_count,
                 carried_service_count=carried_service_count,
             )
-            del option_rank
             successors.append(successor)
         return successors
 
@@ -1746,25 +2381,52 @@ class Stage1Solver:
         state: OpenSessionState,
         *,
         service_only: bool,
-    ) -> list[tuple[tuple[Any, ...], str, list[dict[str, Any]]]]:
+        allow_stage1_support: bool,
+    ) -> list[RollingGetOption]:
         by_no = {physical.car_no(car): car for car in state.cars}
-        options: list[tuple[tuple[Any, ...], str, list[dict[str, Any]]]] = []
+        options: list[RollingGetOption] = []
         active_lines = sorted({str(car.get("Line") or "") for car in state.cars if car.get("Line")})
+        unresolved_sources = {
+            str(car.get("Line") or "")
+            for car in state.cars
+            if self.stage1_goal(car) and not self.stage1_car_complete(car)
+        }
         last_get_line = (
             state.steps[-1].line
             if state.steps and state.steps[-1].action == "Get"
             else ""
         )
         for source in active_lines:
-            if source in FORBIDDEN_LINES or source in ASSEMBLY_ALL or source == last_get_line:
+            if (
+                source in FORBIDDEN_LINES
+                or source == last_get_line
+                or (
+                    source in ASSEMBLY_ALL
+                    and not (
+                        allow_stage1_support
+                        and self.stage1_route_support_nos(source)
+                    )
+                )
+            ):
                 continue
             prefix: list[dict[str, Any]] = []
             for no in physical.line_access_order(state.cars, source):
                 car = by_no.get(no)
                 if car is None or self.pending_weigh(car):
                     break
+                if self.rolling_crosses_source_dependency(
+                    car,
+                    source=source,
+                    unresolved_sources=unresolved_sources,
+                ):
+                    break
                 if not (
-                    self.rolling_car_actionable(car, service_only=service_only)
+                    self.rolling_car_actionable(
+                        car,
+                        source=source,
+                        service_only=service_only,
+                        allow_stage1_support=allow_stage1_support,
+                    )
                     or self.protected_satisfied_car(car)
                 ):
                     break
@@ -1772,12 +2434,17 @@ class Stage1Solver:
             if not prefix:
                 continue
 
-            line_options: list[tuple[tuple[Any, ...], str, list[dict[str, Any]]]] = []
+            line_options: list[RollingGetOption] = []
             for batch in self.prefix_options(prefix):
                 actionable = [
                     car
                     for car in batch
-                    if self.rolling_car_actionable(car, service_only=service_only)
+                    if self.rolling_car_actionable(
+                        car,
+                        source=source,
+                        service_only=service_only,
+                        allow_stage1_support=allow_stage1_support,
+                    )
                 ]
                 if not actionable:
                     continue
@@ -1795,32 +2462,254 @@ class Stage1Solver:
                     self.service_eligible(car) and not self.target_satisfied(car)
                     for car in batch
                 )
+                support_nos = (
+                    self.service_support_nos(source)
+                    if service_only
+                    else self.stage1_route_support_nos(source)
+                )
+                if service_only:
+                    support_count = sum(
+                        physical.car_no(car) in support_nos
+                        and not (
+                            self.service_eligible(car)
+                            and not self.target_satisfied(car)
+                        )
+                        for car in batch
+                    )
+                else:
+                    support_count = sum(
+                        physical.car_no(car) in support_nos
+                        for car in batch
+                    )
+                minimum_puts = self.rolling_batch_minimum_puts(
+                    batch,
+                    source=source,
+                    service_only=service_only,
+                    allow_stage1_support=allow_stage1_support,
+                )
+                if minimum_puts <= 0:
+                    continue
+                direct_targets = self.rolling_combined_put_targets(
+                    state,
+                    batch,
+                    source=source,
+                    service_only=service_only,
+                    allow_stage1_support=allow_stage1_support,
+                )
                 blocker_count = len(batch) - len(actionable)
                 static_route = self.graph.route(state.loco.line, source)
                 rank = (
                     -service_count if service_only else -stage1_count,
                     -service_count,
+                    -support_count,
                     blocker_count,
                     -len(batch),
                     len(static_route),
                     self.source_rank(source),
                     tuple(physical.car_no(car) for car in batch),
                 )
-                line_options.append((rank, source, batch))
-            options.extend(sorted(line_options, key=lambda item: item[0])[
-                :ROLLING_SESSION_PREFIXES_PER_LINE
-            ])
-        return sorted(options, key=lambda item: item[0])
+                line_options.append(RollingGetOption(
+                    rank=rank,
+                    source=source,
+                    batch=tuple(batch),
+                    stage1_gain=stage1_count,
+                    service_gain=service_count,
+                    support_gain=support_count,
+                    minimum_puts=minimum_puts,
+                    shared_put_targets=direct_targets,
+                ))
+            structural_lengths = self.rolling_structural_prefix_lengths(
+                prefix,
+                source=source,
+                service_only=service_only,
+                allow_stage1_support=allow_stage1_support,
+            )
+            frontier = [
+                option
+                for option in line_options
+                if not any(
+                    self.rolling_prefix_dominates(other, option)
+                    for other in line_options
+                )
+            ]
+            structural = [
+                option
+                for option in line_options
+                if len(option.batch) in structural_lengths
+            ]
+            preferred = {
+                tuple(physical.car_no(car) for car in option.batch): option
+                for option in (*frontier, *structural)
+            }
+            options.extend(sorted(
+                preferred.values(),
+                key=lambda item: item.rank,
+            )[:ROLLING_SESSION_PREFIXES_PER_LINE])
+        return sorted(options, key=lambda item: item.rank)
+
+    def rolling_structural_prefix_lengths(
+        self,
+        cars: list[dict[str, Any]],
+        *,
+        source: str,
+        service_only: bool,
+        allow_stage1_support: bool,
+    ) -> set[int]:
+        lengths = {len(cars)}
+        signatures = [
+            (
+                self.rolling_car_put_targets(
+                    car,
+                    source=source,
+                    service_only=service_only,
+                    allow_stage1_support=allow_stage1_support,
+                ),
+                bool(physical.force_positions(car)),
+                self.target_satisfied(car),
+            )
+            for car in cars
+        ]
+        lengths.update(
+            index
+            for index in range(1, len(signatures))
+            if signatures[index - 1] != signatures[index]
+        )
+        return lengths
+
+    @staticmethod
+    def rolling_prefix_dominates(
+        other: RollingGetOption,
+        option: RollingGetOption,
+    ) -> bool:
+        other_targets = set(other.shared_put_targets)
+        option_targets = set(option.shared_put_targets)
+        if not other_targets >= option_targets:
+            return False
+        other_value = (
+            other.stage1_gain,
+            other.service_gain,
+            other.support_gain,
+            -other.minimum_puts,
+        )
+        option_value = (
+            option.stage1_gain,
+            option.service_gain,
+            option.support_gain,
+            -option.minimum_puts,
+        )
+        no_worse = all(left >= right for left, right in zip(other_value, option_value))
+        return no_worse and (
+            other_targets != option_targets
+            or other_value != option_value
+            or other.rank < option.rank
+        )
+
+    def rolling_combined_put_targets(
+        self,
+        state: OpenSessionState,
+        batch: list[dict[str, Any]],
+        *,
+        source: str,
+        service_only: bool,
+        allow_stage1_support: bool,
+    ) -> tuple[str, ...]:
+        target_options = [*state.carried_targets]
+        target_options.extend(
+            self.rolling_car_put_targets(
+                car,
+                source=source,
+                service_only=service_only,
+                allow_stage1_support=allow_stage1_support,
+            )
+            for car in batch
+        )
+        by_no = {physical.car_no(car): car for car in state.cars}
+        carried_cars = [by_no[no] for no in state.carried if no in by_no]
+        train = [*carried_cars, *batch]
+        return self.rolling_feasible_shared_put_targets(
+            state.cars,
+            tuple(target_options),
+            train,
+        )
+
+    def rolling_feasible_shared_put_targets(
+        self,
+        cars: list[dict[str, Any]],
+        target_options: tuple[tuple[str, ...], ...],
+        train: list[dict[str, Any]],
+    ) -> tuple[str, ...]:
+        if not target_options:
+            return ()
+        common = set(target_options[0])
+        for targets in target_options[1:]:
+            common &= set(targets)
+        moving_nos = {physical.car_no(car) for car in train}
+        return tuple(
+            target
+            for target in sorted(common, key=lambda line: (self.target_rank(line), line))
+            if physical.line_has_length_capacity(
+                target,
+                cars,
+                train,
+                moving_nos,
+            )
+        )
+
+    def rolling_crosses_source_dependency(
+        self,
+        car: dict[str, Any],
+        *,
+        source: str,
+        unresolved_sources: set[str],
+    ) -> bool:
+        if self.stage1_goal(car):
+            return False
+        targets = set(car.get("TargetLines") or ())
+        return bool((targets - {source}) & unresolved_sources)
+
+    def rolling_batch_minimum_puts(
+        self,
+        batch: list[dict[str, Any]],
+        *,
+        source: str,
+        service_only: bool,
+        allow_stage1_support: bool,
+    ) -> int:
+        targets = tuple(
+            self.rolling_car_put_targets(
+                car,
+                source=source,
+                service_only=service_only,
+                allow_stage1_support=allow_stage1_support,
+            )
+            for car in batch
+        )
+        if any(not options for options in targets):
+            return 0
+        return self.rolling_target_group_count(targets)
 
     def rolling_car_actionable(
         self,
         car: dict[str, Any],
         *,
+        source: str,
         service_only: bool,
+        allow_stage1_support: bool,
     ) -> bool:
         if not service_only and self.stage1_goal(car) and not self.stage1_car_complete(car):
             return True
-        return self.service_eligible(car) and not self.target_satisfied(car)
+        if (
+            allow_stage1_support
+            and not service_only
+            and physical.car_no(car) in self.stage1_route_support_nos(source)
+        ):
+            return True
+        if self.service_eligible(car) and not self.target_satisfied(car):
+            return True
+        return (
+            service_only
+            and physical.car_no(car) in self.service_support_nos(source)
+        )
 
     def rolling_car_put_targets(
         self,
@@ -1828,16 +2717,192 @@ class Stage1Solver:
         *,
         source: str,
         service_only: bool,
+        allow_stage1_support: bool,
     ) -> tuple[str, ...]:
         if not service_only and self.stage1_goal(car) and not self.stage1_car_complete(car):
+            return self.official_stage1_targets(car)
+        if (
+            allow_stage1_support
+            and not service_only
+            and physical.car_no(car) in self.stage1_route_support_nos(source)
+        ):
             return self.official_stage1_targets(car)
         if self.service_eligible(car):
             if self.target_satisfied(car):
                 return (source,)
-            return self.service_target_options(car)
+            targets = list(self.service_target_options(car))
+            if (
+                service_only
+                and physical.car_no(car) in self.service_peel_support_nos(source)
+                and source not in targets
+            ):
+                targets.append(source)
+            real_target_ready = any(
+                self.real_target_line_ready(
+                    target,
+                    respect_forced_reservation=False,
+                )
+                for target in targets
+            )
+            if (
+                physical.car_no(car) in self.service_support_nos(source)
+                and (not service_only or not real_target_ready)
+            ):
+                targets.extend(
+                    line
+                    for line in STORAGE_CACHE_LINES
+                    if line != source and line not in targets
+                )
+            if (
+                allow_stage1_support
+                and not service_only
+                and physical.car_no(car) in self.stage1_prefix_support_nos(source)
+            ):
+                targets.extend(
+                    line
+                    for line in STORAGE_CACHE_LINES
+                    if line != source and line not in targets
+                )
+            return tuple(targets)
         if self.protected_satisfied_car(car):
             return (source,)
+        if (
+            service_only
+            and physical.car_no(car) in self.service_support_nos(source)
+        ):
+            return tuple(
+                line
+                for line in STORAGE_CACHE_LINES
+                if line != source
+            )
         return ()
+
+    def stage1_route_support_nos(self, source: str) -> set[str]:
+        cache_key = f"stage1-route:{source}"
+        cached = self.service_support_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        blocker_key = "stage1-route:lines"
+        blockers = self.service_support_cache.get(blocker_key)
+        if blockers is None:
+            blockers = set(self.pending_get_blocker_info(self.stage1_debt()).lines)
+            self.service_support_cache[blocker_key] = blockers
+        result = {
+            physical.car_no(car)
+            for car in self.cars
+            if car.get("Line") == source
+            and source in blockers
+            and bool(self.stage1_goal(car))
+            and self.stage1_car_complete(car)
+        }
+        self.service_support_cache[cache_key] = result
+        return result
+
+    def stage1_prefix_support_nos(self, source: str) -> set[str]:
+        cache_key = f"stage1-prefix:{source}"
+        cached = self.service_support_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        pending = set(self.stage1_debt()["pending_stage1_nos"])
+        ordered = self.line_ordered_cars(source)
+        first_pending = next(
+            (
+                index
+                for index, car in enumerate(ordered)
+                if physical.car_no(car) in pending
+            ),
+            -1,
+        )
+        if first_pending <= 0:
+            result: set[str] = set()
+        else:
+            result = {
+                physical.car_no(car)
+                for car in ordered[:first_pending]
+                if self.service_eligible(car) and not self.target_satisfied(car)
+            }
+        self.service_support_cache[cache_key] = result
+        return result
+
+    def service_peel_support_nos(self, source: str) -> set[str]:
+        cache_key = f"peel:{source}"
+        cached = self.service_support_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        ordered = self.line_ordered_cars(source)
+        result: set[str] = set()
+        for index, car in enumerate(ordered[1:], start=1):
+            if not self.service_eligible(car) or self.target_satisfied(car):
+                continue
+            prefix = ordered[: index + 1]
+            moving_nos = {physical.car_no(item) for item in prefix}
+            reachable_target = any(
+                target != source
+                and self.real_target_line_ready(
+                    target,
+                    excluded_nos=moving_nos,
+                    respect_forced_reservation=False,
+                )
+                and not self.route_blockers_for_put(source, target, moving_nos)
+                for target in self.service_target_options(car)
+            )
+            blockers = ordered[:index]
+            if not reachable_target or any(
+                self.pending_weigh(blocker)
+                or not (
+                    self.target_satisfied(blocker)
+                    or self.service_eligible(blocker)
+                )
+                for blocker in blockers
+            ):
+                continue
+            result.update(
+                physical.car_no(blocker)
+                for blocker in blockers
+                if not self.target_satisfied(blocker)
+            )
+        self.service_support_cache[cache_key] = result
+        return result
+
+    def service_support_nos(self, source: str) -> set[str]:
+        cached = self.service_support_cache.get(source)
+        if cached is not None:
+            return cached
+        ordered = self.line_ordered_cars(source)
+        result: set[str] = set()
+        bad_indexes = [
+            index
+            for index, car in enumerate(ordered)
+            if not self.target_satisfied(car)
+        ]
+        if bad_indexes:
+            first_bad = min(bad_indexes)
+            suffix = ordered[first_bad : max(bad_indexes) + 1]
+            joins_satisfied_segments = (
+                not any(self.target_satisfied(car) for car in suffix)
+                and any(
+                    self.target_satisfied(car)
+                    for car in ordered[max(bad_indexes) + 1 :]
+                )
+            )
+            if joins_satisfied_segments:
+                result.update(physical.car_no(car) for car in suffix)
+
+        # A clean spotting line may need to be lifted temporarily so a pending
+        # forced-position block can be rebuilt from the access end.
+        if (
+            ordered
+            and physical.is_spotting_line(source)
+            and self.real_target_line_ready(
+                source,
+                respect_forced_reservation=False,
+            )
+            and self.target_reserved_for_forced_cars(source)
+        ):
+            result.update(physical.car_no(car) for car in ordered)
+
+        self.service_support_cache[source] = result
+        return result
 
     def rolling_put_successors(
         self,
@@ -1894,6 +2959,16 @@ class Stage1Solver:
             put_step = self.planned_session_put_step(working_cars, target, move_nos)
             if put_step is None:
                 continue
+            if (
+                not service_only
+                and self.rolling_put_closes_unresolved_source(
+                    working_cars,
+                    target=target,
+                    move_nos=move_nos,
+                    origins=state.carried_origins[start:],
+                )
+            ):
+                continue
             carried = state.carried[:start]
             (
                 service_count,
@@ -1918,6 +2993,7 @@ class Stage1Solver:
                 touched_lines=state.touched_lines | {target},
                 loco=next_loco,
                 route_cost=state.route_cost + route_cost,
+                reget_steps=state.reget_steps,
                 service_count=service_count,
                 forced_count=forced_count,
                 completed_g_count=completed_g_count,
@@ -1926,6 +3002,29 @@ class Stage1Solver:
             )
             successors.append(successor)
         return successors
+
+    def rolling_put_closes_unresolved_source(
+        self,
+        cars: list[dict[str, Any]],
+        *,
+        target: str,
+        move_nos: tuple[str, ...],
+        origins: tuple[str, ...],
+    ) -> bool:
+        if not any(
+            car["Line"] == target
+            and self.stage1_goal(car)
+            and not self.stage1_car_complete(car)
+            for car in cars
+        ):
+            return False
+        by_no = {physical.car_no(car): car for car in cars}
+        return any(
+            origin != target
+            and no in by_no
+            and self.service_eligible(by_no[no])
+            for no, origin in zip(move_nos, origins)
+        )
 
     def rolling_route_transition(
         self,
@@ -2021,12 +3120,11 @@ class Stage1Solver:
             bool(self.stage1_goal(car)) and not self.stage1_car_complete(car)
             for car in batch
         )
-        if not service_only and moved_g <= 0:
-            return None
-
         before_service, before_forced = self.rolling_service_counts(self.cars)
         after_service, after_forced = state.service_count, state.forced_count
         if after_forced < before_forced or after_service < before_service:
+            return None
+        if not service_only and moved_g <= 0 and after_forced <= before_forced:
             return None
         if service_only and (after_forced, after_service) <= (before_forced, before_service):
             return None
@@ -2036,7 +3134,11 @@ class Stage1Solver:
             if moved_g or self.real_target_line_ready(target, excluded_nos=moving_nos):
                 return None
 
-        reason = "stage1_service_rolling_session" if service_only else "stage1_rolling_session"
+        reason = (
+            "stage1_rolling_session"
+            if moved_g
+            else "stage1_service_rolling_session"
+        )
         candidate = self.make_planlet_candidate(
             source=state.steps[0].line,
             target=state.steps[-1].line,
@@ -2058,12 +3160,18 @@ class Stage1Solver:
             ),
             reason,
         )
+        economy_rank = (
+            (
+                state.reget_steps,
+                metrics.business_hooks,
+                -self.candidate_closure_savings(candidate),
+            )
+        )
         rank = (
             -state.completed_g_count if not service_only else -(after_forced - before_forced),
             -(after_forced - before_forced),
             -(after_service - before_service),
-            -self.candidate_closure_savings(candidate),
-            metrics.business_hooks,
+            *economy_rank,
             state.route_cost,
             view.score,
         )
@@ -2151,25 +3259,39 @@ class Stage1Solver:
     ) -> tuple[Any, ...]:
         minimum_puts = self.rolling_minimum_puts(state)
         potential_g = state.completed_g_count + state.carried_g_count
+        projected_business_hooks = len(state.steps) + minimum_puts
         return (
             -state.forced_count if service_only else -potential_g,
             -state.carried_service_count if service_only else -state.completed_g_count,
             -state.service_count,
             -potential_g,
+            state.reget_steps,
+            projected_business_hooks,
             minimum_puts,
-            -len(state.source_lines),
             len(state.steps),
+            -len(state.source_lines),
             state.route_cost,
             state.carried,
         )
 
     def rolling_state_shape(self, state: OpenSessionState) -> tuple[Any, ...]:
         has_put = any(step.action == "Put" for step in state.steps)
+        by_no = {physical.car_no(car): car for car in state.cars}
+        carried_cars = [by_no[no] for no in state.carried if no in by_no]
+        shared_put_targets = self.rolling_feasible_shared_put_targets(
+            state.cars,
+            state.carried_targets,
+            carried_cars,
+        )
         return (
+            bool(state.source_lines & set(ASSEMBLY_ALL)),
             has_put,
             state.steps[-1].action,
+            bool(state.carried_g_count),
+            bool(state.carried_service_count),
             min(len(state.source_lines), 4),
             min(self.rolling_minimum_puts(state), 4),
+            shared_put_targets,
         )
 
     def rolling_endpoint_shape(self, view: CandidateView) -> tuple[Any, ...]:
@@ -2178,17 +3300,24 @@ class Stage1Solver:
         source_count = len({step.line for step in steps if step.action == "Get"})
         put_count = sum(step.action == "Put" for step in steps)
         return (
+            any(step.action == "Get" and step.line in ASSEMBLY_ALL for step in steps),
             metrics.retains_across_put_then_get,
             min(source_count, 4),
             min(put_count, 4),
         )
 
     def rolling_minimum_puts(self, state: OpenSessionState) -> int:
-        if not state.carried_targets:
+        return self.rolling_target_group_count(state.carried_targets)
+
+    def rolling_target_group_count(
+        self,
+        target_options: tuple[tuple[str, ...], ...],
+    ) -> int:
+        if not target_options:
             return 0
         groups = 1
-        common = set(state.carried_targets[-1])
-        for targets in reversed(state.carried_targets[:-1]):
+        common = set(target_options[-1])
+        for targets in reversed(target_options[:-1]):
             overlap = common & set(targets)
             if overlap:
                 common = overlap
@@ -2215,370 +3344,6 @@ class Stage1Solver:
             state.carried_targets,
             tuple(lines),
         )
-
-    def source_session_candidates(
-        self,
-        debt: dict[str, Any],
-        *,
-        service_only: bool,
-        include_monotone: bool,
-        include_retained: bool,
-    ) -> Iterable[CandidateView]:
-        if not self.config.downstream or debt["pollution_nos"]:
-            return
-        if service_only and not debt["complete"]:
-            return
-        for source in self.active_lines():
-            if source in FORBIDDEN_LINES or source in ASSEMBLY_ALL:
-                continue
-            ordered = self.line_ordered_cars(source)
-            movable_prefix: list[dict[str, Any]] = []
-            for car in ordered:
-                if not self.split_put_car_eligible(car, service_only=service_only):
-                    break
-                movable_prefix.append(car)
-                if self.pending_weigh(car):
-                    break
-            if len(movable_prefix) < 2:
-                continue
-
-            pending_on_source = {
-                physical.car_no(car)
-                for car in ordered
-                if self.stage1_goal(car) and not self.stage1_car_complete(car)
-            }
-            source_views: list[tuple[tuple[Any, ...], CandidateView]] = []
-            for size in range(len(movable_prefix), 1, -1):
-                batch = movable_prefix[:size]
-                moving_nos = {physical.car_no(car) for car in batch}
-                tokens = [
-                    self.split_put_destination_token(
-                        car,
-                        source=source,
-                        moving_nos=moving_nos,
-                        service_only=service_only,
-                    )
-                    for car in batch
-                ]
-                if any(not token for token in tokens):
-                    continue
-                segments = self.contiguous_destination_segments(batch, tokens)
-                if not 2 <= len(segments) <= SESSION_MAX_SEGMENTS:
-                    continue
-                moved_g = sum(
-                    1
-                    for car in batch
-                    if self.stage1_goal(car) and not self.stage1_car_complete(car)
-                )
-                if not service_only and moved_g <= 0:
-                    continue
-
-                for segment_targets in self.session_target_assignments(segments):
-                    if include_monotone:
-                        total_pull = physical.pull_equivalent(batch)
-                        if (
-                            total_pull <= physical.PULL_LIMIT_EQUIVALENT
-                            and (service_only or pending_on_source <= moving_nos)
-                        ):
-                            steps = self.build_split_put_steps(
-                                source=source,
-                                batch=batch,
-                                segments=segments,
-                                segment_targets=segment_targets,
-                            )
-                            view = self.source_session_view(
-                                source=source,
-                                batch=batch,
-                                steps=steps,
-                                debt=debt,
-                                moved_g=moved_g,
-                                service_only=service_only,
-                                retained=False,
-                            )
-                            if view:
-                                source_views.append((self.session_view_rank(view, moved_g), view))
-
-                    if not include_retained:
-                        continue
-                    for anchor in dict.fromkeys(segment.token for segment in segments):
-                        if anchor.startswith("@"):
-                            continue
-                        anchor_indexes = [
-                            index for index, segment in enumerate(segments)
-                            if segment.token == anchor
-                        ]
-                        if len(anchor_indexes) < 2:
-                            continue
-                        anchor_targets = {segment_targets[index] for index in anchor_indexes}
-                        if len(anchor_targets) != 1:
-                            continue
-                        steps = self.build_retained_source_steps(
-                            source=source,
-                            segments=segments,
-                            segment_targets=segment_targets,
-                            anchor=anchor,
-                        )
-                        view = self.source_session_view(
-                            source=source,
-                            batch=batch,
-                            steps=steps,
-                            debt=debt,
-                            moved_g=moved_g,
-                            service_only=service_only,
-                            retained=True,
-                        )
-                        if view:
-                            source_views.append((self.session_view_rank(view, moved_g), view))
-
-            seen: set[str] = set()
-            for _rank, view in sorted(source_views, key=lambda item: item[0]):
-                if view.candidate.candidate_id in seen:
-                    continue
-                seen.add(view.candidate.candidate_id)
-                yield view
-                if len(seen) >= SESSION_MAX_CANDIDATES_PER_SOURCE:
-                    break
-
-    def source_session_view(
-        self,
-        *,
-        source: str,
-        batch: list[dict[str, Any]],
-        steps: tuple[physical.PlanStep, ...],
-        debt: dict[str, Any],
-        moved_g: int,
-        service_only: bool,
-        retained: bool,
-    ) -> CandidateView | None:
-        if not steps:
-            return None
-        business_hooks = sum(step.action in {"Get", "Put"} for step in steps)
-        if business_hooks > SESSION_MAX_BUSINESS_HOOKS:
-            return None
-        if retained and not self.steps_retain_cars_across_put_then_get(steps):
-            return None
-        if (
-            retained
-            and not service_only
-            and not self.source_on_stage1_frontier(source, debt)
-        ):
-            return None
-        reason = (
-            "stage1_service_source_session"
-            if service_only and retained
-            else "stage1_service_split_put"
-            if service_only
-            else "stage1_source_session"
-            if retained
-            else "stage1_mixed_split_put"
-        )
-        candidate = self.make_planlet_candidate(
-            source=source,
-            target=steps[-1].line,
-            batch=batch,
-            steps=steps,
-            kind="vnext_depot_inbound_mixed_extraction_session",
-            reason=reason,
-        )
-        if not candidate:
-            return None
-        service_gain = self.candidate_service_delivery_count(candidate)
-        if service_only and service_gain <= 0:
-            return None
-        if retained and self.candidate_closure_savings(candidate) < 0:
-            return None
-        return CandidateView(
-            candidate,
-            self.score_candidate(
-                candidate,
-                debt=debt,
-                moved_g=moved_g,
-                moved_x=len(batch) - moved_g,
-                reason_rank=0 if moved_g else 2,
-            ),
-            reason,
-        )
-
-    def source_on_stage1_frontier(self, source: str, debt: dict[str, Any]) -> bool:
-        unresolved = debt["lines_with_pending_stage1"]
-        return not unresolved or self.source_rank(source) <= min(
-            self.source_rank(line)
-            for line in unresolved
-        )
-
-    def session_view_rank(
-        self,
-        view: CandidateView,
-        moved_g: int,
-    ) -> tuple[Any, ...]:
-        return (
-            -moved_g,
-            -self.candidate_service_delivery_count(view.candidate),
-            -self.candidate_closure_savings(view.candidate),
-            self.candidate_business_hook_count(view.candidate),
-            view.score,
-        )
-
-    def split_put_car_eligible(self, car: dict[str, Any], *, service_only: bool) -> bool:
-        if not service_only and self.stage1_goal(car) and not self.stage1_car_complete(car):
-            return True
-        return self.service_eligible(car)
-
-    def split_put_destination_token(
-        self,
-        car: dict[str, Any],
-        *,
-        source: str,
-        moving_nos: set[str],
-        service_only: bool,
-    ) -> str:
-        if not service_only and self.stage1_goal(car) and not self.stage1_car_complete(car):
-            return "@unwheel" if self.stage1_goal(car) == "存4线" else "@depot"
-        for target in self.service_target_options(car):
-            if not self.car_can_use_real_target(
-                car,
-                target,
-                allow_pending_weigh=False,
-                require_unsatisfied=False,
-            ):
-                continue
-            if (
-                target == source
-                and self.target_satisfied(car)
-                and not physical.force_positions(car)
-            ):
-                return target
-            if self.real_target_line_ready(target, excluded_nos=moving_nos):
-                return target
-        return ""
-
-    def contiguous_destination_segments(
-        self,
-        batch: list[dict[str, Any]],
-        tokens: list[str],
-    ) -> list[SessionSegment]:
-        segments: list[SessionSegment] = []
-        for car, token in zip(batch, tokens):
-            if segments and segments[-1].token == token:
-                previous = segments[-1]
-                segments[-1] = SessionSegment(token, (*previous.cars, car))
-            else:
-                segments.append(SessionSegment(token, (car,)))
-        return segments
-
-    def split_put_segment_targets(self, token: str) -> tuple[str, ...]:
-        if token == "@unwheel":
-            return ("存4线",)
-        if token == "@depot":
-            return ASSEMBLY_DEPOT
-        return (token,) if token in SERVICE_LINE_SET else ()
-
-    def session_target_assignments(
-        self,
-        segments: list[SessionSegment],
-    ) -> Iterable[tuple[str, ...]]:
-        target_options = [
-            self.split_put_segment_targets(segment.token)
-            for segment in segments
-        ]
-        if any(not options for options in target_options):
-            return
-        for index, assignment in enumerate(product(*target_options)):
-            if index >= SESSION_MAX_TARGET_ASSIGNMENTS:
-                break
-            yield assignment
-
-    def build_split_put_steps(
-        self,
-        *,
-        source: str,
-        batch: list[dict[str, Any]],
-        segments: list[SessionSegment],
-        segment_targets: tuple[str, ...],
-    ) -> tuple[physical.PlanStep, ...]:
-        if physical.pull_equivalent(batch) > physical.PULL_LIMIT_EQUIVALENT:
-            return ()
-        batch_nos = tuple(physical.car_no(car) for car in batch)
-        working_cars = [self.clone_car(car) for car in self.cars]
-        physical.apply_physical_get_order(working_cars, source, batch_nos)
-        steps: list[physical.PlanStep] = [physical.plan_step("Get", source, batch_nos)]
-        for segment, target in zip(
-            reversed(segments),
-            reversed(segment_targets),
-        ):
-            put_step = self.planned_session_put_step(
-                working_cars,
-                target,
-                segment.car_nos,
-            )
-            if put_step is None:
-                return ()
-            steps.append(put_step)
-        return tuple(steps)
-
-    def build_retained_source_steps(
-        self,
-        *,
-        source: str,
-        segments: list[SessionSegment],
-        segment_targets: tuple[str, ...],
-        anchor: str,
-    ) -> tuple[physical.PlanStep, ...]:
-        working_cars = [self.clone_car(car) for car in self.cars]
-        carried_order: list[str] = []
-        steps: list[physical.PlanStep] = []
-        index = 0
-        while index < len(segments):
-            end = index + 1
-            if segments[index].token == anchor:
-                while end < len(segments) and segments[end].token != anchor:
-                    end += 1
-            chunk = segments[index:end]
-            chunk_nos = tuple(no for segment in chunk for no in segment.car_nos)
-            working_by_no = {physical.car_no(car): car for car in working_cars}
-            train_cars = [
-                working_by_no[no]
-                for no in (*carried_order, *chunk_nos)
-                if no in working_by_no
-            ]
-            if physical.pull_equivalent(train_cars) > physical.PULL_LIMIT_EQUIVALENT:
-                return ()
-            steps.append(physical.plan_step("Get", source, chunk_nos))
-            physical.apply_physical_get_order(working_cars, source, chunk_nos)
-            carried_order.extend(chunk_nos)
-
-            for segment_index in range(end - 1, index - 1, -1):
-                segment = segments[segment_index]
-                if segment.token == anchor:
-                    continue
-                if carried_order[-len(segment.car_nos):] != list(segment.car_nos):
-                    return ()
-                put_step = self.planned_session_put_step(
-                    working_cars,
-                    segment_targets[segment_index],
-                    segment.car_nos,
-                )
-                if put_step is None:
-                    return ()
-                steps.append(put_step)
-                del carried_order[-len(segment.car_nos):]
-            index = end
-
-        if not carried_order:
-            return ()
-        anchor_index = next(
-            index for index, segment in enumerate(segments)
-            if segment.token == anchor
-        )
-        put_step = self.planned_session_put_step(
-            working_cars,
-            segment_targets[anchor_index],
-            tuple(carried_order),
-        )
-        if put_step is None:
-            return ()
-        steps.append(put_step)
-        return tuple(steps)
 
     def planned_session_put_step(
         self,
@@ -2635,257 +3400,84 @@ class Stage1Solver:
             prefix.append(car)
         return prefix
 
-    def gather_session_candidates(
+    def service_prefix_cleanup_candidates(
         self,
         debt: dict[str, Any],
-        *,
-        service_only: bool,
     ) -> Iterable[CandidateView]:
-        if not self.config.downstream or debt["pollution_nos"]:
+        if not debt["complete"] or debt["pollution_nos"]:
             return
-        if service_only and not debt["complete"]:
-            return
-        mission_tokens = SERVICE_LINES if service_only else ("@unwheel", "@depot")
-        views: list[tuple[tuple[Any, ...], CandidateView]] = []
-        for token in mission_tokens:
-            target_options = self.split_put_segment_targets(token)
-            source_batches = self.gather_source_batches(token)
-            for selected in self.gather_source_orders(source_batches):
-                batch = [car for _source, cars in selected for car in cars]
-                moved_g = sum(
-                    1
-                    for car in batch
-                    if self.stage1_goal(car) and not self.stage1_car_complete(car)
-                )
-                if service_only and moved_g:
-                    continue
-                if not service_only and moved_g < 2:
-                    continue
-                moving_nos = {
-                    physical.car_no(car)
-                    for car in batch
-                }
-                if service_only and any(
-                    self.target_reserved_for_forced_cars(target, moving_nos)
-                    for target in target_options
-                ):
-                    continue
-                for target_assignment in self.gather_target_assignments(
-                    selected,
-                    target_options,
-                ):
-                    steps = self.build_gather_steps(selected, target_assignment)
-                    if not steps:
-                        continue
-                    reason = (
-                        "stage1_service_gather"
-                        if service_only
-                        else "stage1_session_gather"
-                    )
-                    candidate = self.make_planlet_candidate(
-                        source=selected[0][0],
-                        target=steps[-1].line,
-                        batch=batch,
-                        steps=steps,
-                        kind="vnext_depot_inbound_mixed_extraction_session",
-                        reason=reason,
-                    )
-                    if not candidate:
-                        continue
-                    service_gain = self.candidate_service_delivery_count(candidate)
-                    if service_only and service_gain < 2:
-                        continue
-                    view = CandidateView(
-                        candidate,
-                        self.score_candidate(
-                            candidate,
-                            debt=debt,
-                            moved_g=moved_g,
-                            moved_x=len(batch) - moved_g,
-                            reason_rank=0 if moved_g else 2,
-                        ),
-                        reason,
-                    )
-                    views.append((self.session_view_rank(view, moved_g), view))
-        seen: set[str] = set()
-        for _rank, view in sorted(views, key=lambda item: item[0]):
-            if view.candidate.candidate_id in seen:
-                continue
-            seen.add(view.candidate.candidate_id)
-            yield view
-            if len(seen) >= SESSION_GATHER_MAX_CANDIDATES:
-                break
-
-    def gather_source_batches(
-        self,
-        token: str,
-    ) -> list[tuple[str, list[dict[str, Any]]]]:
-        result: list[tuple[str, list[dict[str, Any]]]] = []
-        for source in self.active_lines():
-            if source in FORBIDDEN_LINES or source in ASSEMBLY_ALL:
-                continue
-            if token in SERVICE_LINE_SET:
-                if source == token:
-                    continue
-                batch = self.service_prefix_for_target(source, token)
-            else:
-                expected_goal = "存4线" if token == "@unwheel" else "depot_assembly"
-                batch = []
-                for car in self.line_ordered_cars(source):
-                    if self.stage1_goal(car) != expected_goal or self.stage1_car_complete(car):
-                        break
-                    batch.append(car)
-                    if self.pending_weigh(car):
-                        break
-            if batch:
-                result.append((source, batch))
-        return result
-
-    def gather_source_orders(
-        self,
-        source_batches: list[tuple[str, list[dict[str, Any]]]],
-    ) -> tuple[tuple[tuple[str, list[dict[str, Any]]], ...], ...]:
-        ranked: list[tuple[tuple[Any, ...], tuple[tuple[str, list[dict[str, Any]]], ...]]] = []
-        seen: set[tuple[tuple[str, tuple[str, ...]], ...]] = set()
-        for source_count in range(
-            min(SESSION_GATHER_MAX_SOURCES, len(source_batches)),
-            1,
-            -1,
-        ):
-            for source_group in combinations(source_batches, source_count):
-                for ordered_group in permutations(source_group):
-                    for selected in self.fit_gather_batch_options(ordered_group):
-                        signature = tuple(
-                            (source, tuple(physical.car_no(car) for car in batch))
-                            for source, batch in selected
-                        )
-                        if signature in seen:
-                            continue
-                        seen.add(signature)
-                        operation_lines = (self.loco.line, *(source for source, _batch in selected))
-                        route_cost = sum(
-                            len(self.graph.route(source, target))
-                            for source, target in zip(operation_lines, operation_lines[1:])
-                        )
-                        moved_count = sum(len(batch) for _source, batch in selected)
-                        ranked.append((
-                            (-moved_count, -len(selected), route_cost, signature),
-                            selected,
-                        ))
-        return tuple(
-            selected
-            for _rank, selected in sorted(ranked, key=lambda item: item[0])[
-                :SESSION_GATHER_MAX_SOURCE_ORDERS
+        for source in SERVICE_LINES:
+            ordered = self.line_ordered_cars(source)
+            bad_indexes = [
+                index
+                for index, car in enumerate(ordered)
+                if not self.target_satisfied(car)
             ]
-        )
-
-    def gather_target_assignments(
-        self,
-        selected: tuple[tuple[str, list[dict[str, Any]]], ...],
-        target_options: tuple[str, ...],
-    ) -> tuple[tuple[str, ...], ...]:
-        moving_nos = {
-            physical.car_no(car)
-            for _source, batch in selected
-            for car in batch
-        }
-        by_put_count: dict[int, list[tuple[tuple[Any, ...], tuple[str, ...]]]] = {}
-        for target_assignment in product(target_options, repeat=len(selected)):
-            if any(
-                not physical.line_has_length_capacity(
-                    target,
-                    self.cars,
-                    [
-                        car
-                        for (_source, batch), assigned_target in zip(selected, target_assignment)
-                        if assigned_target == target
-                        for car in batch
-                    ],
-                    moving_nos,
-                )
-                for target in set(target_assignment)
+            if not bad_indexes:
+                continue
+            first_bad = min(bad_indexes)
+            clear_batch = ordered[: max(bad_indexes) + 1]
+            retained_prefix = clear_batch[:first_bad]
+            blocker_suffix = clear_batch[first_bad:]
+            if (
+                not retained_prefix
+                or any(not self.target_satisfied(car) for car in retained_prefix)
+                or any(self.target_satisfied(car) for car in blocker_suffix)
+                or physical.pull_equivalent(clear_batch) > physical.PULL_LIMIT_EQUIVALENT
             ):
                 continue
-            put_count = len(self.compressed(list(target_assignment)))
-            target_ranks = tuple(self.target_rank(target) for target in target_assignment)
-            by_put_count.setdefault(put_count, []).append((
-                (max(target_ranks), sum(target_ranks), target_ranks, target_assignment),
-                target_assignment,
-            ))
-
-        selected_assignments: list[tuple[str, ...]] = []
-        for put_count in sorted(by_put_count):
-            selected_assignments.extend(
-                assignment
-                for _rank, assignment in sorted(
-                    by_put_count[put_count],
-                    key=lambda item: item[0],
-                )[:SESSION_GATHER_ASSIGNMENTS_PER_PUT_COUNT]
-            )
-        return tuple(selected_assignments)
-
-    def fit_gather_batch_options(
-        self,
-        source_batches: tuple[tuple[str, list[dict[str, Any]]], ...],
-    ) -> tuple[tuple[tuple[str, list[dict[str, Any]]], ...], ...]:
-        prefix_choices = [
-            self.prefix_options(batch)
-            for _source, batch in source_batches
-        ]
-        ranked: list[
-            tuple[
-                tuple[Any, ...],
-                tuple[tuple[str, list[dict[str, Any]]], ...],
-            ]
-        ] = []
-        for chosen_prefixes in product(*prefix_choices):
-            combined = [car for prefix in chosen_prefixes for car in prefix]
-            if physical.pull_equivalent(combined) > physical.PULL_LIMIT_EQUIVALENT:
-                continue
-            selected = tuple(
-                (source, prefix)
-                for (source, _batch), prefix in zip(source_batches, chosen_prefixes)
-            )
-            lengths = tuple(len(prefix) for prefix in chosen_prefixes)
-            ranked.append(((-sum(lengths), tuple(-length for length in lengths)), selected))
-        return tuple(
-            selected
-            for _rank, selected in sorted(ranked, key=lambda item: item[0])[
-                :SESSION_GATHER_PREFIX_OPTIONS_PER_ORDER
-            ]
-        )
-
-    def build_gather_steps(
-        self,
-        selected: tuple[tuple[str, list[dict[str, Any]]], ...],
-        targets: tuple[str, ...],
-    ) -> tuple[physical.PlanStep, ...]:
-        if len(selected) != len(targets):
-            return ()
-        working_cars = [self.clone_car(car) for car in self.cars]
-        steps: list[physical.PlanStep] = []
-        put_groups: list[tuple[str, list[str]]] = []
-        for (source, batch), target in zip(selected, targets):
-            move_nos = tuple(physical.car_no(car) for car in batch)
-            steps.append(physical.plan_step("Get", source, move_nos))
-            physical.apply_physical_get_order(working_cars, source, move_nos)
-            if put_groups and put_groups[-1][0] == target:
-                put_groups[-1][1].extend(move_nos)
-            else:
-                put_groups.append((target, list(move_nos)))
-        for target, move_nos in reversed(put_groups):
-            put_step = self.planned_session_put_step(
-                working_cars,
-                target,
-                tuple(move_nos),
-            )
-            if put_step is None:
-                return ()
-            steps.append(put_step)
-        return tuple(steps)
+            clear_nos = tuple(physical.car_no(car) for car in clear_batch)
+            retained_nos = tuple(physical.car_no(car) for car in retained_prefix)
+            blocker_nos = tuple(physical.car_no(car) for car in blocker_suffix)
+            for target in sorted(
+                STORAGE_CACHE_LINES - {source},
+                key=lambda line: (self.target_rank(line), line),
+            ):
+                working_cars = [self.clone_car(car) for car in self.cars]
+                physical.apply_physical_get_order(working_cars, source, clear_nos)
+                blocker_put = self.planned_session_put_step(
+                    working_cars,
+                    target,
+                    blocker_nos,
+                )
+                if blocker_put is None:
+                    continue
+                retained_put = self.planned_session_put_step(
+                    working_cars,
+                    source,
+                    retained_nos,
+                )
+                if retained_put is None:
+                    continue
+                steps = (
+                    physical.plan_step("Get", source, clear_nos),
+                    blocker_put,
+                    retained_put,
+                )
+                candidate = self.make_planlet_candidate(
+                    source=source,
+                    target=target,
+                    batch=clear_batch,
+                    steps=steps,
+                    kind="vnext_depot_inbound_mixed_extraction_session",
+                    reason="stage1_service_prefix_cleanup",
+                )
+                if candidate is None:
+                    continue
+                yield CandidateView(
+                    candidate,
+                    self.score_candidate(
+                        candidate,
+                        debt=debt,
+                        moved_g=0,
+                        moved_x=len(clear_batch),
+                        reason_rank=2,
+                    ),
+                    "stage1_service_prefix_cleanup",
+                )
 
     def spotting_repack_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        if not self.config.downstream or not debt["complete"] or debt["pollution_nos"]:
+        if not debt["complete"] or debt["pollution_nos"]:
             return
         for target in SERVICE_LINES:
             if not physical.is_spotting_line(target):
@@ -2937,7 +3529,7 @@ class Stage1Solver:
             )
 
     def target_rebuild_candidates(self, debt: dict[str, Any]) -> Iterable[CandidateView]:
-        if not self.config.downstream or not debt["complete"] or debt["pollution_nos"]:
+        if not debt["complete"] or debt["pollution_nos"]:
             return
         views: list[tuple[tuple[Any, ...], CandidateView]] = []
         for target in SERVICE_LINES:
@@ -3191,7 +3783,6 @@ class Stage1Solver:
                     batch,
                     source=blocker_line,
                     debt=debt,
-                    allow_unresolved_direct=True,
                 ):
                     view = self.single_put_view(
                         source=blocker_line,
@@ -3407,7 +3998,6 @@ class Stage1Solver:
         *,
         source: str,
         debt: dict[str, Any],
-        allow_unresolved_direct: bool = False,
     ) -> list[str]:
         targets: list[str] = []
         direct = self.common_current_target(batch)
@@ -3416,7 +4006,7 @@ class Stage1Solver:
             direct
             and direct not in FORBIDDEN_LINES
             and direct != source
-            and (allow_unresolved_direct or direct not in unresolved_sources)
+            and direct not in unresolved_sources
             and self.stage1_real_target_available(direct)
             and not self.target_reserved_for_forced_cars(
                 direct,
@@ -3427,11 +4017,25 @@ class Stage1Solver:
             targets.append(direct)
         targets.extend(self.grouped_cache_targets(batch, source=source, debt=debt))
         targets.extend(self.safe_temp_targets(source=source, debt=debt))
-        return list(dict.fromkeys(targets))
+        return [
+            target
+            for target in dict.fromkeys(targets)
+            if not self.pollutes_clean_service_line(target, batch)
+        ]
+
+    def pollutes_clean_service_line(
+        self,
+        target: str,
+        batch: list[dict[str, Any]],
+    ) -> bool:
+        if target not in SERVICE_LINE_SET or target in STORAGE_CACHE_LINES:
+            return False
+        if any(target in set(car.get("TargetLines") or ()) for car in batch):
+            return False
+        existing = self.line_ordered_cars(target)
+        return not existing or all(self.target_satisfied(car) for car in existing)
 
     def grouped_cache_targets(self, batch: list[dict[str, Any]], *, source: str, debt: dict[str, Any]) -> list[str]:
-        if not self.config.downstream:
-            return []
         target = self.common_stage4_cache_target(batch)
         if not target:
             return []
@@ -3601,6 +4205,7 @@ class Stage1Solver:
     ) -> physical.HookCandidate | None:
         if source in FORBIDDEN_LINES or target in FORBIDDEN_LINES:
             return None
+        steps = self.coalesce_adjacent_put_steps(steps)
         return physical.build_planlet_candidate(
             case_id=self.case_id,
             hook_index=self.hook_index,
@@ -3611,6 +4216,46 @@ class Stage1Solver:
             reason=reason,
             candidate_kind=kind,
         )
+
+    def coalesce_adjacent_put_steps(
+        self,
+        steps: tuple[physical.PlanStep, ...],
+    ) -> tuple[physical.PlanStep, ...]:
+        by_no = self.by_no()
+        normalized: list[physical.PlanStep] = []
+        for step in steps:
+            if not normalized:
+                normalized.append(step)
+                continue
+            previous = normalized[-1]
+            if (
+                previous.action != "Put"
+                or step.action != "Put"
+                or previous.line != step.line
+            ):
+                normalized.append(step)
+                continue
+            combined_nos = (*step.move_car_nos, *previous.move_car_nos)
+            if any(
+                no in by_no and self.pending_weigh(by_no[no])
+                for no in combined_nos
+            ):
+                normalized.append(step)
+                continue
+            combined_positions = {
+                **previous.planned_positions,
+                **step.planned_positions,
+            }
+            if combined_positions and set(combined_positions) != set(combined_nos):
+                normalized.append(step)
+                continue
+            normalized[-1] = physical.plan_step(
+                "Put",
+                step.line,
+                combined_nos,
+                combined_positions,
+            )
+        return tuple(normalized)
 
     def score_candidate(
         self,
@@ -3623,6 +4268,7 @@ class Stage1Solver:
     ) -> tuple[Any, ...]:
         return (
             self.pollution_rank(candidate, debt),
+            -len(set(candidate.move_car_nos) & set(debt["pollution_nos"])),
             self.stage_boundary_target_penalty(candidate, debt),
             self.route_unlock_rank(candidate, debt),
             self.candidate_source_rank(candidate),
@@ -3641,8 +4287,6 @@ class Stage1Solver:
         )
 
     def tail_target_rank(self, candidate: physical.HookCandidate) -> int:
-        if not self.config.target_aware:
-            return 1
         moved = [car for car in self.cars if physical.car_no(car) in set(candidate.move_car_nos)]
         if not moved:
             return 1
@@ -3664,8 +4308,6 @@ class Stage1Solver:
         return 3
 
     def real_target_static_rank(self, candidate: physical.HookCandidate) -> int:
-        if not self.config.downstream:
-            return 1
         return 0 if self.safe_static_real_target_put(candidate) else 1
 
     def candidate_moved_cars(self, candidate: physical.HookCandidate) -> list[dict[str, Any]]:
@@ -3767,14 +4409,24 @@ class Stage1Solver:
     def progress_tuple(self, debt: dict[str, Any]) -> tuple[int, int]:
         return debt["debt_count"], debt["blocked_g_count"]
 
-    def pending_get_blocker_info(self, debt: dict[str, Any]) -> tuple[set[str], set[str]]:
+    def pending_get_blocker_info(self, debt: dict[str, Any]) -> GetBlockerInfo:
         blocker_map = self.pending_route_blocker_map(debt)
-        blocked_nos = {
+        lines = frozenset(blocker_map)
+        blocked_nos = frozenset({
             no
             for nos in blocker_map.values()
             for no in nos
-        }
-        return set(blocker_map), blocked_nos
+        })
+        blocker_cars = [car for car in self.cars if car.get("Line") in lines]
+        completed_stage1_cars = sum(
+            bool(self.stage1_goal(car)) and self.stage1_car_complete(car)
+            for car in blocker_cars
+        )
+        return GetBlockerInfo(
+            lines=lines,
+            blocked_nos=blocked_nos,
+            pressure=(len(lines), completed_stage1_cars, len(blocker_cars)),
+        )
 
     def pending_route_blocker_map(self, debt: dict[str, Any]) -> dict[str, list[str]]:
         by_no = self.by_no()
@@ -3820,8 +4472,6 @@ class Stage1Solver:
         return price
 
     def satisfied_break_penalty(self, candidate: physical.HookCandidate) -> int:
-        if not self.config.downstream:
-            return 0
         by_no = self.by_no()
         destinations = self.candidate_put_line_by_no(candidate)
         penalty = 0
@@ -3840,8 +4490,6 @@ class Stage1Solver:
         return bool(self.stage4_target_key(car)) and self.target_satisfied(car)
 
     def cache_group_rank(self, candidate: physical.HookCandidate) -> tuple[int, int, int, int, int]:
-        if not self.config.downstream:
-            return (0, 0, 0, 0, 0)
         if candidate.target_line not in CACHE_LINES:
             return (0, 0, 0, 0, 0)
         by_no = self.by_no()
@@ -3907,11 +4555,17 @@ class Stage1Solver:
             return False
         source = next(iter(source_lines))
         ordered_nos = physical.line_access_order(self.cars, source)
-        indexes = sorted(
-            ordered_nos.index(physical.car_no(car))
-            for car in pending
-        )
-        if indexes[-1] - indexes[0] + 1 != len(indexes):
+        indexes = sorted(ordered_nos.index(physical.car_no(car)) for car in pending)
+        by_no = self.by_no()
+        pending_block = [
+            by_no[no]
+            for no in ordered_nos[indexes[0] : indexes[-1] + 1]
+        ]
+        if any(
+            self.target_satisfied(car)
+            or target not in set(car.get("TargetLines") or ())
+            for car in pending_block
+        ):
             return False
         pending_nos = {physical.car_no(car) for car in pending}
         return not pending_nos <= excluded_nos
@@ -4053,9 +4707,7 @@ class Stage1Solver:
         }
 
     def downstream_quality_tuple(self) -> tuple[int, ...]:
-        if not self.config.downstream:
-            return ()
-        return downstream_quality_vector(self.downstream_quality(), self.config.quality_order)
+        return downstream_quality_vector(self.downstream_quality())
 
     def downstream_quality(self) -> dict[str, Any]:
         cache_key = physical.state_signature(self.cars, self.loco)
@@ -4413,7 +5065,6 @@ class Stage1Solver:
         service_finish_business_hooks = self.service_finish_business_hooks_used()
         summary = {
             "case_id": self.case_id,
-            "profile": self.profile,
             "status": "complete" if debt["complete"] else "partial",
             "hooks": self.hook_index - 1,
             "move_batches": self.hook_index - 1,
@@ -4563,14 +5214,12 @@ def solve_one(
     *,
     max_hooks: int,
     time_budget_seconds: float,
-    profile: str,
     verbose: bool = False,
 ) -> dict[str, Any]:
     solver = Stage1Solver(
         path,
         max_hooks=max_hooks,
         time_budget_seconds=time_budget_seconds,
-        profile=profile,
     )
     result = solver.solve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4582,7 +5231,6 @@ def solve_one(
         summary = result["summary"]
         print(
             f"{summary['case_id']} {summary['status']} "
-            f"profile={summary['profile']} "
             f"business_hooks={summary['business_hooks']} "
             f"move_batches={summary['hooks']} debt={summary['stage1_debt']['debt_count']}",
             flush=True,
@@ -4593,7 +5241,12 @@ def solve_one(
 def case_files(path: Path) -> list[Path]:
     if path.is_file():
         return [path]
-    return sorted(path.glob("validation_*.json"))
+    if not path.is_dir():
+        raise FileNotFoundError(f"input path does not exist: {path}")
+    files = sorted(path.glob("validation_*.json"))
+    if not files:
+        raise ValueError(f"input directory has no validation_*.json files: {path}")
+    return files
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -4606,19 +5259,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, required=True, help="output directory")
     parser.add_argument("--max-hooks", type=int, default=MAX_HOOKS)
     parser.add_argument("--time-budget-seconds", type=float, default=DEFAULT_TIME_BUDGET_SECONDS)
-    parser.add_argument("--limit", type=int, default=0, help="limit number of cases for directory input")
     parser.add_argument("--jobs", type=int, default=1, help="number of cases to solve in parallel")
-    parser.add_argument("--profile", choices=sorted(PROFILE_CONFIGS), default=DEFAULT_PROFILE)
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
     if args.jobs < 1:
         raise ValueError("jobs must be at least 1")
     files = case_files(args.input)
-    if args.limit:
-        files = files[: args.limit]
     args.out.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, Any]] = []
 
@@ -4629,7 +5278,6 @@ def main() -> None:
             case_id = path.stem
         summary = {
             "case_id": case_id,
-            "profile": args.profile,
             "status": "error",
             "hooks": 0,
             "move_batches": 0,
@@ -4648,7 +5296,6 @@ def main() -> None:
     solve_kwargs = {
         "max_hooks": args.max_hooks,
         "time_budget_seconds": args.time_budget_seconds,
-        "profile": args.profile,
     }
     if args.jobs == 1 or len(files) <= 1:
         for path in files:
@@ -4673,7 +5320,6 @@ def main() -> None:
                     if args.input.is_dir():
                         print(
                             f"{summary['case_id']} {summary['status']} "
-                            f"profile={summary['profile']} "
                             f"business_hooks={summary['business_hooks']} "
                             f"move_batches={summary['hooks']} "
                             f"debt={summary['stage1_debt']['debt_count']}",
@@ -4689,12 +5335,12 @@ def main() -> None:
         "error": sum(1 for item in summaries if item["status"] == "error"),
         "avg_hooks": round(sum(item["hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
         "avg_business_hooks": round(sum(item["business_hooks"] for item in summaries) / len(summaries), 3) if summaries else 0,
-        "profile_counts": dict(Counter(item.get("profile", "") for item in summaries)),
         "summaries": summaries,
     }
     write_json(args.out / "aggregate_summary.json", aggregate)
     print(json.dumps({k: v for k, v in aggregate.items() if k != "summaries"}, ensure_ascii=False, indent=2))
+    return 0 if aggregate["complete"] == aggregate["cases"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

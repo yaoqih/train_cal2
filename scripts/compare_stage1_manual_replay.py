@@ -16,11 +16,6 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from analyze_depot_inbound_stage import (  # noqa: E402
-    _assembly_contamination,
-    _initial_depot_inbound_debt,
-    _is_final_assembly_line,
-)
 from solver_vnext import physical  # noqa: E402
 
 
@@ -50,6 +45,79 @@ NON_SERVICE_TARGETS = set(physical.DEPOT_TARGET_LINES) | {"卸轮线"}
 
 
 State = tuple[dict[str, tuple[str, ...]], tuple[str, ...], dict[str, int]]
+
+
+def _initial_depot_inbound_debt(truth_dir: Path) -> dict[str, dict[str, Any]]:
+    cases: dict[str, dict[str, Any]] = {}
+    for path in sorted(truth_dir.glob("*.json")):
+        case_id, _payload, cars, depot_assignment, _loco = physical.read_case(path)
+        loads = physical.line_loads(cars)
+        debt: dict[str, dict[str, Any]] = {}
+        line_by_no: dict[str, str] = {}
+        target_by_no: dict[str, str] = {}
+        for car in cars:
+            no = physical.car_no(car)
+            line_by_no[no] = car["Line"]
+            target_line, _position, _reason = physical.planned_target_for_car(
+                car,
+                cars,
+                depot_assignment,
+                loads,
+            )
+            target_by_no[no] = target_line
+            if physical.car_is_satisfied(car, depot_assignment, cars):
+                continue
+            if (
+                target_line in physical.DEPOT_INBOUND_DESTINATION_LINES
+                and car["Line"] not in physical.DEPOT_INBOUND_DESTINATION_LINES
+            ):
+                debt[no] = {
+                    "source_line": car["Line"],
+                    "target_line": target_line,
+                    "initial_grouped": _is_final_assembly_line(
+                        line=car["Line"],
+                        target_line=target_line,
+                    ),
+                }
+        if debt:
+            cases[case_id] = {
+                "debt": debt,
+                "line_by_no": line_by_no,
+                "target_by_no": target_by_no,
+            }
+    return cases
+
+
+def _assembly_contamination(
+    *,
+    line_by_no: dict[str, str],
+    target_by_no: dict[str, str],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            no
+            for no, line in line_by_no.items()
+            if line in physical.DEPOT_INBOUND_ASSEMBLY_LINES
+            and _is_assembly_contamination_line(
+                line=line,
+                target_line=target_by_no.get(no, ""),
+            )
+        )
+    )
+
+
+def _is_final_assembly_line(*, line: str, target_line: str) -> bool:
+    if target_line == "卸轮线":
+        return line == "存4线"
+    if target_line in physical.DEPOT_TARGET_LINES:
+        return line in physical.DEPOT_INBOUND_ASSEMBLY_LINES and line != "存4线"
+    return False
+
+
+def _is_assembly_contamination_line(*, line: str, target_line: str) -> bool:
+    if line == "存4线":
+        return target_line != "卸轮线"
+    return target_line not in physical.DEPOT_INBOUND_DESTINATION_LINES
 
 
 def main() -> None:

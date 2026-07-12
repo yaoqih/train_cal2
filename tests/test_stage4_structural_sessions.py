@@ -2,617 +2,501 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import replay_validator as rv  # noqa: E402
 from solver_vnext import physical  # noqa: E402
-from stage4_simple.solve import MacroView, SourceRun, Stage4Solver, clone_car  # noqa: E402
+from stage4_simple.construct import (  # noqa: E402
+    SourceWindowGenerator,
+    monotone_stack_prepend_allowed,
+)
+from stage4_simple.contracts import (  # noqa: E402
+    DEPOT_REHOOK_ID,
+    build_contract_graph,
+    classify_depot_rehook,
+)
+from stage4_simple.domain import (  # noqa: E402
+    CarrySegment,
+    ContractStatus,
+    DepotRehookMode,
+    OwnedStack,
+)
+from stage4_simple.optimizer import (  # noqa: E402
+    BlockFlowOptimizer,
+    OptimizationConfig,
+)
+from stage4_simple.planner import PlanningCheckpoint  # noqa: E402
+from stage4_simple.search import (  # noqa: E402
+    OperationTransitions,
+    SearchNode,
+    Stage4Problem,
+)
+from stage4_simple.solve import Stage4Solver  # noqa: E402
+from stage4_simple.topology import (  # noqa: E402
+    RESOURCE_GATES,
+    resource_gate_closure,
+)
 
 
-BASELINE = ROOT / "artifacts" / "stage4_capability_portfolio_full"
-FULLFLOW = ROOT / "artifacts" / "fullflow_truth23_spotting_parallel_v1"
+FULLFLOW = ROOT / "artifacts" / "fullflow_current"
 
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def truth_path(date_code: str) -> Path:
-    return next((ROOT / "data" / "truth2").glob(f"*{date_code}.json"))
+def make_car(
+    no: str,
+    line: str,
+    position: int,
+    target: str,
+    *,
+    force: tuple[int, ...] = (),
+) -> dict:
+    return physical.normalized_car({
+        "No": no,
+        "Line": line,
+        "Position": position,
+        "Length": 14.3,
+        "IsHeavy": False,
+        "IsWeigh": False,
+        "IsClosedDoor": False,
+        "TargetLines": [target],
+        "ForceTargetPosition": list(force),
+        "_Weighed": True,
+    })
 
 
-def residual_solver(case_id: str, date_code: str) -> Stage4Solver:
-    _case_id, request, _cars, depot_assignment, _loco = physical.read_case(truth_path(date_code))
-    stage4_request = load_json(BASELINE / f"{case_id}_stage4_request.json")
-    stage4_response = load_json(BASELINE / f"{case_id}_response.json")
-    return Stage4Solver(
-        case_id,
-        request,
-        depot_assignment,
-        stage4_request,
-        stage4_response,
-        stage4_response,
-        time_budget_seconds=60.0,
-    )
-
-
-def initial_solver(case_id: str, date_code: str) -> Stage4Solver:
-    _case_id, request, _cars, depot_assignment, _loco = physical.read_case(truth_path(date_code))
-    stage4_request = load_json(BASELINE / f"{case_id}_stage4_request.json")
-    response = {
-        "Data": {
-            "Operations": [],
-            "GeneratedEndStatus": stage4_request["StartStatus"],
-        }
-    }
-    return Stage4Solver(
-        case_id,
-        request,
-        depot_assignment,
-        stage4_request,
-        response,
-        response,
-        time_budget_seconds=60.0,
-    )
-
-
-def fullflow_residual_solver(case_id: str, date_code: str, dataset: str) -> Stage4Solver:
-    truth_dir = ROOT / "data" / dataset
-    truth_file = next(truth_dir.glob(f"*{date_code}.json"))
-    _case_id, request, _cars, depot_assignment, _loco = physical.read_case(truth_file)
-    stage4_dir = FULLFLOW / dataset / "stage4"
-    stage4_request = load_json(stage4_dir / f"{case_id}_stage4_request.json")
-    stage4_response = load_json(stage4_dir / f"{case_id}_response.json")
-    return Stage4Solver(
-        case_id,
-        request,
-        depot_assignment,
-        stage4_request,
-        stage4_response,
-        stage4_response,
-        time_budget_seconds=60.0,
-    )
-
-
-def synthetic_solver(
-    rows: tuple[tuple[str, str, int, str, bool, bool], ...],
+def make_problem(
+    rows: tuple[tuple[str, str, int, str], ...],
     *,
     loco: str,
-) -> Stage4Solver:
-    solver = initial_solver("0120W", "20260120W")
-    assert len(solver.cars) >= len(rows)
-    cars = [clone_car(car) for car in solver.cars[: len(rows)]]
-    active_nos: set[str] = set()
-    target_by_no: dict[str, str] = {}
-    for car, (no, line, position, target, heavy, active) in zip(cars, rows):
-        car.update({
-            "No": no,
-            "_No": no,
-            "Line": line,
-            "Position": position,
-            "TargetLines": [target],
-            "_TargetLineSet": {target},
-            "ForceTargetPosition": [],
-            "_Force": (),
-            "_ForcePositions": (),
-            "IsHeavy": heavy,
-            "IsWeigh": False,
-            "_Weighed": True,
-            "IsClosedDoor": False,
-        })
-        target_by_no[no] = target
-        if active:
-            active_nos.add(no)
-    solver.cars = cars
-    solver.initial_cars = [clone_car(car) for car in cars]
-    solver.target_by_no = target_by_no
-    solver.target_reason_by_no = {no: "synthetic" for no in target_by_no}
-    solver.active_nos = active_nos
-    solver.protected_satisfied_nos = set(target_by_no) - active_nos
-    solver.initial_unsatisfied_nos = set(active_nos)
-    solver.initial_unresolved_weigh_nos = set()
-    solver.infeasible_nos = set()
-    solver.infeasible_lines = set()
-    solver.capacity_overflow_by_line = {}
-    solver.capacity_holdout_count_by_line = {}
-    solver.out_of_scope_nos = set()
-    solver.excluded_line_nos = set()
-    solver.loco = physical.LocoLocation(loco)
-    solver.initial_loco = solver.loco
-    solver.invalidate_caches()
-    solver.seen_signatures = {solver.state_signature()}
-    solver.best_progress = solver.main_progress()
-    return solver
-
-
-def target_variant_view(
-    candidate_id: str,
-    *,
-    base_rank: int,
-    window_rank: tuple[int, int, int],
-) -> MacroView:
-    candidate = physical.HookCandidate(
-        case_id="RANK",
-        hook_index=1,
-        candidate_id=candidate_id,
-        source_line="存2线",
-        target_line="调梁棚",
-        move_car_nos=(),
-        action_family="",
-        train_length_m=0.0,
-        pull_equivalent_count=0,
-        has_weigh=False,
-        planned_positions={},
-        generation_reason="test_target_window_rank",
-    )
-    validation = physical.PhysicalValidation(True, (), (), (), (), ())
-    return MacroView(
-        candidate=candidate,
-        validation=validation,
-        score=(0, 0, (base_rank,)),
-        reason="test_target_window_rank",
-        progress_after=(),
-        target_key=("调梁棚",),
-        target_window_rank=window_rank,
-    )
-
-
-def test_target_window_rank_can_select_a_strictly_cheaper_closing_variant() -> None:
-    solver = initial_solver("0120W", "20260120W")
-    anchor = target_variant_view(
-        "anchor",
-        base_rank=0,
-        window_rank=(5_000, 5, 2),
-    )
-    closing = target_variant_view(
-        "closing",
-        base_rank=1,
-        window_rank=(4_000, 4, 1),
-    )
-
-    ranked = sorted(solver.rank_target_variants([anchor, closing]), key=lambda view: view.score)
-
-    assert ranked[0].candidate.candidate_id == "closing"
-
-
-def test_target_window_rank_preserves_anchor_when_future_rounds_do_not_drop() -> None:
-    solver = initial_solver("0120W", "20260120W")
-    anchor = target_variant_view(
-        "anchor",
-        base_rank=0,
-        window_rank=(5_000, 5, 2),
-    )
-    local_gain_only = target_variant_view(
-        "local_gain_only",
-        base_rank=1,
-        window_rank=(3_000, 3, 2),
-    )
-
-    ranked = sorted(
-        solver.rank_target_variants([anchor, local_gain_only]),
-        key=lambda view: view.score,
-    )
-
-    assert ranked[0].candidate.candidate_id == "anchor"
-
-
-def test_layout_rebuild_closes_cross_line_spotting_window() -> None:
-    solver = residual_solver("0116W", "20260116W")
-    move = tuple(physical.line_access_order(solver.cars, "存5线南"))
-
-    candidate = solver.build_layout_rebuild_session("存5线南", move, "调梁棚")
-
-    assert candidate is not None
-    validation = solver.validate(candidate)
-    assert validation.accepted, validation.reasons
-    assert len(physical.candidate_plan_steps(candidate)) <= 11
-
-
-def test_ordered_prefix_restore_rebuilds_occupied_target_in_five_steps() -> None:
-    cases = (
-        ("0116W", "20260116W", "truth2", "卸轮线"),
-        ("0416W", "20260416W", "truth3", "修1库外"),
-    )
-    for case_id, date_code, dataset, source_line in cases:
-        solver = fullflow_residual_solver(case_id, date_code, dataset)
-        pending = solver.current_unsatisfied_nos() & solver.active_nos
-        source_order = tuple(physical.line_access_order(solver.cars, source_line))
-        active_indexes = [index for index, no in enumerate(source_order) if no in pending]
-        assert active_indexes
-        move = source_order[: max(active_indexes) + 1]
-
-        candidate = solver.build_prefix_ordered_target_restore_session(source_line, move)
-
-        assert candidate is not None
-        assert len(physical.candidate_plan_steps(candidate)) == 5
-        validation = solver.validate(candidate)
-        assert validation.accepted, validation.reasons
-        probe = solver.probe_after(candidate, validation)
-        assert probe.debt()["actionable_complete"]
-        assert not probe.protected_damage_nos()
-
-
-def test_ordered_prefix_restore_accepts_flexible_satisfied_outer_line_cars() -> None:
-    cases = (
-        ("0202Z", "20260202Z", "修1库外"),
-        ("0206Z", "20260206Z", "修4库外"),
-        ("0324W", "20260324W", "修2库外"),
-    )
-    for case_id, date_code, source_line in cases:
-        solver = fullflow_residual_solver(case_id, date_code, "truth2")
-        pending = solver.current_unsatisfied_nos() & solver.active_nos
-        source_order = tuple(physical.line_access_order(solver.cars, source_line))
-        source_pending = {no for no in source_order if no in pending}
-        active_indexes = [index for index, no in enumerate(source_order) if no in source_pending]
-        assert active_indexes
-        move = source_order[: max(active_indexes) + 1]
-
-        candidate = solver.build_prefix_ordered_target_restore_session(source_line, move)
-
-        assert candidate is not None
-        assert len(physical.candidate_plan_steps(candidate)) == 5
-        validation = solver.validate(candidate)
-        assert validation.accepted, validation.reasons
-        probe = solver.probe_after(candidate, validation)
-        assert not (source_pending & probe.current_unsatisfied_nos())
-        assert not probe.protected_damage_nos()
-
-
-def test_three_source_same_target_rebuilds_occupied_target_once() -> None:
-    solver = synthetic_solver(
-        (
-            ("A", "存2线", 1, "存1线", False, True),
-            ("B", "存3线", 1, "存1线", False, True),
-            ("C", "存5线南", 1, "存1线", False, True),
-            ("E", "存1线", 1, "存1线", False, False),
-        ),
-        loco="存2线",
-    )
-
-    candidate = solver.build_multi_source_same_target_session(
-        {"存2线": ("A",), "存3线": ("B",), "存5线南": ("C",)},
-        "存1线",
-    )
-
-    assert candidate is not None
-    steps = physical.candidate_plan_steps(candidate)
-    assert [step.action for step in steps] == ["Get", "Get", "Get", "Get", "Put"]
-    assert sum(step.action == "Put" and step.line == "存1线" for step in steps) == 1
-    validation = solver.validate(candidate)
-    assert validation.accepted, validation.reasons
-    probe = solver.probe_after(candidate, validation)
-    assert probe.debt()["actionable_complete"]
-    assert not probe.protected_damage_nos()
-
-
-def test_two_source_same_target_uses_two_gets_and_one_put() -> None:
-    solver = synthetic_solver(
-        (
-            ("A", "存2线", 1, "存1线", False, True),
-            ("B", "存3线", 1, "存1线", False, True),
-        ),
-        loco="存2线",
-    )
-
-    candidate = solver.build_multi_source_same_target_session(
-        {"存2线": ("A",), "存3线": ("B",)},
-        "存1线",
-    )
-
-    assert candidate is not None
-    assert [step.action for step in physical.candidate_plan_steps(candidate)] == [
-        "Get",
-        "Get",
-        "Put",
+    forces: dict[str, tuple[int, ...]] | None = None,
+) -> Stage4Problem:
+    physical.clear_state_caches()
+    forces = forces or {}
+    cars = [
+        make_car(no, line, position, target, force=forces.get(no, ()))
+        for no, line, position, target in rows
     ]
+    assignment = physical.DepotAssignment({}, {}, {})
+    unsatisfied = {
+        physical.car_no(car)
+        for car in physical.unsatisfied_cars(cars, assignment)
+    }
+    return Stage4Problem(
+        case_id="TEST",
+        cars=cars,
+        loco_location=physical.LocoLocation(loco),
+        depot_assignment=assignment,
+        target_by_no={no: target for no, _line, _position, target in rows},
+        active_nos=frozenset(unsatisfied),
+        protected_nos=frozenset({car["_No"] for car in cars} - unsatisfied),
+    )
 
 
-def test_partial_put_then_fresh_get_merges_the_retained_target_run() -> None:
-    solver = synthetic_solver(
+def exact_stage4_solver(
+    case_id: str,
+    date_code: str,
+    *,
+    dataset: str = "truth2",
+) -> Stage4Solver:
+    truth_path = next((ROOT / "data" / dataset).glob(f"*{date_code}.json"))
+    _case_id, request, _cars, assignment, _loco = physical.read_case(truth_path)
+    stage3 = FULLFLOW / dataset / "stage3"
+    return Stage4Solver(
+        case_id,
+        request,
+        assignment,
+        load_json(stage3 / f"{case_id}_stage3_request.json"),
+        load_json(stage3 / f"{case_id}_response.json"),
+        load_json(stage3 / f"{case_id}_combined_response.json"),
+        time_budget_seconds=30.0,
+        max_labels=16,
+        max_expansions=30_000,
+    )
+
+
+def test_incremental_transition_matches_full_planlet_validation() -> None:
+    problem = make_problem(
         (
-            ("A", "存2线", 1, "存1线", False, True),
-            ("TAIL", "存2线", 2, "机库线", False, True),
-            ("B", "存3线", 1, "存1线", False, True),
+            ("A", "存2线", 1, "存1线"),
+            ("TAIL", "存2线", 2, "机库线"),
+            ("B", "存3线", 1, "存1线"),
         ),
         loco="存2线",
     )
-    runs = (
-        SourceRun("存2线", "存1线", ("A",)),
-        SourceRun("存2线", "机库线", ("TAIL",)),
-    )
+    transitions = OperationTransitions(problem)
+    initial = SearchNode(physical.initial_planlet_state(
+        problem.cars,
+        problem.loco_location,
+    ))
+    first_get = physical.plan_step("Get", "存2线", ("A", "TAIL"))
+    first = transitions.apply_step(initial, first_get)
+    assert first is not None
 
-    candidate = solver.build_partial_drop_continue_get_session(
-        first_runs=runs,
-        join_index=0,
-        second_source="存3线",
-        second_group=("B",),
+    alternate = replace(
+        initial,
+        state=replace(initial.state, operation_paths=(("sentinel",),)),
     )
+    alternate_first = transitions.apply_step(alternate, first_get)
+    assert alternate_first is not None
+    assert alternate_first.state.operation_paths[0] == ("sentinel",)
+    assert alternate_first.state.operation_paths[1] == first.state.operation_paths[0]
 
-    assert candidate is not None
-    steps = physical.candidate_plan_steps(candidate)
-    assert [(step.action, step.line, step.move_car_nos) for step in steps] == [
-        ("Get", "存2线", ("A", "TAIL")),
+    steps = [first_get]
+    node = first
+    for action, line, move in (
         ("Put", "机库线", ("TAIL",)),
         ("Get", "存3线", ("B",)),
         ("Put", "存1线", ("A", "B")),
-    ]
-    validation = solver.validate(candidate)
+    ):
+        positions = transitions.planned_positions(node.state, line, move) if action == "Put" else {}
+        assert positions is not None
+        step = physical.plan_step(action, line, move, positions)
+        successor = transitions.apply_step(node, step)
+        assert successor is not None
+        node = successor
+        steps.append(step)
+
+    candidate = physical.build_planlet_candidate(
+        case_id="TEST",
+        hook_index=1,
+        source_line="存2线",
+        target_line="存1线",
+        batch=problem.cars,
+        steps=tuple(steps),
+        reason="incremental_equivalence",
+        candidate_kind="blocker_relocation",
+    )
+    validation = physical.validate_planlet(
+        problem.graph,
+        candidate,
+        problem.cars,
+        problem.loco_location,
+        problem.depot_assignment,
+    )
+
     assert validation.accepted, validation.reasons
+    assert validation.operation_paths == node.state.operation_paths
+    assert problem.complete(node)
 
 
-def test_partial_put_session_uses_stepwise_pull_limit() -> None:
-    solver = synthetic_solver(
-        (
-            ("A", "存2线", 1, "存1线", True, True),
-            ("T1", "存2线", 2, "机库线", True, True),
-            ("T2", "存2线", 3, "机库线", True, True),
-            ("T3", "存2线", 4, "机库线", True, True),
-            ("T4", "存2线", 5, "机库线", True, True),
-            ("B1", "存3线", 1, "存1线", True, True),
-            ("B2", "存3线", 2, "存1线", True, True),
-            ("B3", "存3线", 3, "存1线", True, True),
-            ("B4", "存3线", 4, "存1线", True, True),
-        ),
+def test_contract_graph_has_one_explicit_predecessor_boundary() -> None:
+    problem = make_problem(
+        (("A", "存2线", 1, "存1线"),),
         loco="存2线",
     )
-    runs = (
-        SourceRun("存2线", "存1线", ("A",)),
-        SourceRun("存2线", "机库线", ("T1", "T2", "T3", "T4")),
+    assert classify_depot_rehook(problem).mode == DepotRehookMode.NOT_REQUIRED
+
+    graph = build_contract_graph(problem)
+    assert [contract.contract_id for contract in graph.ready()] == [DEPOT_REHOOK_ID]
+    graph = graph.activate(DEPOT_REHOOK_ID).close(DEPOT_REHOOK_ID)
+    ready = graph.ready()
+
+    assert len(ready) == 1
+    assert ready[0].target == "存1线"
+    assert ready[0].status == ContractStatus.PENDING
+
+
+def test_owned_stack_distinguishes_ranked_and_restore_segments() -> None:
+    ranked = OwnedStack("存1线", (CarrySegment("油漆线", ("B",), (2,)),))
+    ranked = ranked.prepend(CarrySegment("油漆线", ("A",), (1,)))
+    assert ranked is not None
+    assert ranked.nos == ("A", "B")
+
+    restore = OwnedStack(
+        "存2线",
+        (CarrySegment("restore:存3线", ("Y",), (0,), protected=True),),
     )
-
-    candidate = solver.build_partial_drop_continue_get_session(
-        first_runs=runs,
-        join_index=0,
-        second_source="存3线",
-        second_group=("B1", "B2", "B3", "B4"),
+    restore = restore.prepend(
+        CarrySegment("restore:存3线", ("X",), (0,), protected=True)
     )
+    assert restore is not None
+    assert restore.nos == ("X", "Y")
+    assert restore.prepend(CarrySegment("restore:存3线", ("R",), (1,), True)) is None
+    assert restore.consume(("X",)).nos == ("Y",)
 
-    assert candidate is not None
-    assert candidate.pull_equivalent_count > physical.PULL_LIMIT_EQUIVALENT
-    validation = solver.validate(candidate)
-    assert validation.accepted, validation.reasons
 
-
-def test_partial_put_session_can_append_to_clean_occupied_storage_target() -> None:
-    solver = synthetic_solver(
-        (
-            ("A", "存2线", 1, "存1线", False, True),
-            ("TAIL", "存2线", 2, "机库线", False, True),
-            ("B", "存3线", 1, "存1线", False, True),
-            ("EXISTING", "存1线", 1, "存1线", False, False),
-        ),
+def test_resource_gate_closure_is_transitive_and_reserved() -> None:
+    assert resource_gate_closure("油漆线") == frozenset({
+        "洗油北",
+        "机走棚",
+        "机走北",
+    })
+    problem = make_problem(
+        (("PENDING", "存2线", 1, "油漆线"),),
         loco="存2线",
     )
-    runs = (
-        SourceRun("存2线", "存1线", ("A",)),
-        SourceRun("存2线", "机库线", ("TAIL",)),
-    )
+    generator = SourceWindowGenerator(problem, OperationTransitions(problem))
 
-    candidate = solver.build_partial_drop_continue_get_session(
-        first_runs=runs,
-        join_index=0,
-        second_source="存3线",
-        second_group=("B",),
-    )
-
-    assert candidate is not None
-    validation = solver.validate(candidate)
-    assert validation.accepted, validation.reasons
-    probe = solver.probe_after(candidate, validation)
-    assert probe.debt()["actionable_complete"]
+    for resource in resource_gate_closure("油漆线"):
+        assert generator.resource_reserved(resource)
+    assert not generator.resource_reserved("存1线")
 
 
-def test_multi_source_session_enforces_pull_equivalent_boundary() -> None:
-    rows = (
-        ("A1", "存1线", 1, "存3线", True, True),
-        ("A2", "存1线", 2, "存3线", True, True),
-        ("A3", "存1线", 3, "存3线", True, True),
-        ("B1", "存2线", 1, "存3线", True, True),
-        ("B2", "存2线", 2, "存3线", True, True),
-        ("B3", "存2线", 3, "存3线", False, True),
-    )
-    solver = synthetic_solver(rows, loco="存1线")
-
-    at_limit = solver.build_multi_source_same_target_session(
-        {"存1线": ("A1", "A2", "A3"), "存2线": ("B1", "B2")},
-        "存3线",
-    )
-    over_limit = solver.build_multi_source_same_target_session(
-        {"存1线": ("A1", "A2", "A3"), "存2线": ("B1", "B2", "B3")},
-        "存3线",
-    )
-
-    assert at_limit is not None
-    assert at_limit.pull_equivalent_count == physical.PULL_LIMIT_EQUIVALENT
-    assert over_limit is None
-
-
-def test_persistent_corridor_puts_preserve_pending_service_routes() -> None:
-    scenarios = (
-        ("洗罐线北", "抛丸线", "存2线", "机南"),
-        ("存2线", "油漆线", "存3线", "洗油北"),
-        ("存2线", "调梁棚", "存3线", "调梁线北"),
-    )
-    for pending_source, pending_target, move_source, blocked_line in scenarios:
-        solver = synthetic_solver(
-            (
-                ("PENDING", pending_source, 1, pending_target, False, True),
-                ("MOVE", move_source, 1, blocked_line, False, True),
-            ),
-            loco=move_source,
-        )
-        planning_cars = [clone_car(car) for car in solver.cars]
-        physical.apply_physical_get_order(planning_cars, move_source, ("MOVE",))
-
-        damage = solver.route_lock_damage_after_put(
-            target_line=blocked_line,
-            move=("MOVE",),
-            planning_cars=planning_cars,
-        )
-
-        assert damage == {"PENDING"}
-
-
-def test_gate_lease_allows_restoring_the_original_blocker_set() -> None:
-    solver = synthetic_solver(
+def test_active_resource_blockers_transfer_to_their_flow_owner() -> None:
+    problem = make_problem(
         (
-            ("PENDING", "存2线", 1, "调梁棚", False, True),
-            ("BLOCKER", "调梁线北", 1, "调梁线北", False, False),
+            ("ACTIVE", "调梁线北", 1, "洗罐站"),
+            ("SATISFIED", "调梁线北", 2, "调梁线北"),
         ),
         loco="调梁线北",
     )
-    candidate = physical.build_planlet_candidate(
-        case_id="GATE",
-        hook_index=1,
-        source_line="调梁线北",
-        target_line="调梁线北",
-        batch=[solver.by_no()["BLOCKER"]],
-        steps=(
-            physical.plan_step("Get", "调梁线北", ("BLOCKER",)),
-            physical.plan_step("Put", "调梁线北", ("BLOCKER",), {"BLOCKER": 1}),
+    generator = SourceWindowGenerator(problem, OperationTransitions(problem))
+
+    assert generator.transferable_resource_owner(("ACTIVE",)) == "洗罐站"
+    assert generator.transferable_resource_owner(("ACTIVE", "SATISFIED")) == ""
+
+
+def test_staging_does_not_occupy_open_operation_gates() -> None:
+    problem = make_problem(
+        (
+            ("PENDING", "存2线", 1, "抛丸线"),
+            ("MOVE", "存3线", 1, "存1线"),
         ),
-        reason="test_gate_restore",
-        candidate_kind="stage4_closed_macro",
+        loco="存3线",
     )
-    validation = solver.validate(candidate)
-    assert validation.accepted, validation.reasons
-    probe = solver.probe_after(candidate, validation)
+    generator = SourceWindowGenerator(problem, OperationTransitions(problem))
+    assert generator.apply(physical.plan_step("Get", "存3线", ("MOVE",)))
 
-    assert not solver.persistent_gate_lease_damage(candidate, probe)
-
-
-def test_same_line_spotting_repack_can_use_chunk_staging() -> None:
-    solver = residual_solver("0204Z", "20260204Z")
-
-    candidates = list(solver.same_line_spotting_repack_candidates(solver.debt()))
-
-    assert candidates
-    candidate, reason = candidates[0]
-    assert reason == "closed_spotting_same_line_repack"
-    validation = solver.validate(candidate)
-    assert validation.accepted, validation.reasons
-    assert len(physical.candidate_plan_steps(candidate)) <= 17
+    candidates = {
+        line
+        for _rank, line in generator.staging_candidates(("MOVE",), "存1线")
+    }
+    assert not candidates.intersection(RESOURCE_GATES["抛丸线"])
 
 
-def test_capacity_proof_excludes_only_the_unavoidable_overflow_subset() -> None:
-    solver = initial_solver("0109W", "20260109W")
-
-    assert solver.infeasible_lines == {"存5线南"}
-    assert round(solver.capacity_overflow_by_line["存5线南"], 1) == 22.8
-    assert solver.capacity_holdout_count_by_line == {"存5线南": 2}
-    assert len(solver.infeasible_nos) == 2
-    assert len({"3462450", "1844907", "1850929"} - solver.infeasible_nos) == 1
-
-
-def test_capacity_overflow_prefers_the_short_accessible_holdout() -> None:
-    solver = initial_solver("0306Z", "20260306Z")
-
-    assert solver.infeasible_lines == {"存5线南"}
-    assert round(solver.capacity_overflow_by_line["存5线南"], 1) == 12.9
-    assert solver.capacity_holdout_count_by_line == {"存5线南": 1}
-    assert solver.infeasible_nos == {"5249102"}
-
-
-def test_spotting_capacity_lower_bound_is_not_reported_as_search_failure() -> None:
-    for case_id, date_code, target in (
-        ("0128W", "20260128W", "洗罐站"),
-        ("0203W", "20260203W", "调梁棚"),
-    ):
-        solver = residual_solver(case_id, date_code)
-        held_no = next(iter(solver.current_unsatisfied_nos()))
-        solver.infeasible_nos.clear()
-        solver.active_nos.add(held_no)
-        debt = solver.debt()
-
-        assert solver.capacity_holdout_count_by_line == {target: 1}
-        assert debt["actionable_complete"]
-        assert debt["active_unsatisfied_count"] == 0
-        assert debt["infeasible_unsatisfied_count"] == 1
-
-        solver.capacity_overflow_by_line[target] = (
-            physical.car_length(solver.by_no()[held_no]) + 0.1
-        )
-        insufficient_debt = solver.debt()
-        assert not insufficient_debt["actionable_complete"]
-        assert insufficient_debt["active_unsatisfied_count"] == 1
-        assert insufficient_debt["infeasible_unsatisfied_count"] == 0
-
-
-def test_capacity_classification_counts_preselected_and_active_holdouts_together() -> None:
-    solver = residual_solver("0129Z", "20260129Z")
-    debt = solver.debt()
-
-    assert solver.capacity_holdout_count_by_line == {"存5线南": 1}
-    assert not debt["actionable_complete"]
-    assert debt["active_unsatisfied_count"] == 1
-    assert debt["infeasible_unsatisfied_count"] == 1
-
-
-def test_cache_reserves_lines_with_pending_inbound_service() -> None:
-    solver = initial_solver("0120W", "20260120W")
-    move = ("5740270",)
-    planning_cars = [clone_car(car) for car in solver.cars]
-    physical.apply_physical_get_order(planning_cars, "存5线北", move)
-
-    cache_line = solver.choose_cache_line(move, "存5线北", planning_cars)
-
-    assert cache_line
-    assert cache_line not in solver.pending_target_lines(planning_cars)
-    assert cache_line != "洗罐线北"
-
-
-def test_dirty_non_corridor_terminal_can_be_stacked_for_later_cleanup() -> None:
-    solver = initial_solver("0310W", "20260310W")
-    source_move = (
-        "1656904",
-        "1450094",
-        "1780389",
-        "3829174",
-        "3500114",
-        "5314312",
+def test_source_window_combines_two_sources_before_one_put() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "调梁棚"),
+            ("B", "存3线", 1, "调梁棚"),
+        ),
+        loco="存2线",
     )
-    planning_cars = [clone_car(car) for car in solver.cars]
-    physical.apply_physical_get_order(planning_cars, "存5线北", source_move)
+    result = SourceWindowGenerator(problem, OperationTransitions(problem)).advance()
 
-    assert solver.dirty_terminal_stack_allowed(
-        target_line="预修线",
-        move=source_move[:3],
-        planning_cars=planning_cars,
+    assert result.complete, result.reason
+    assert [(step.action, step.line, step.move_car_nos) for step in result.node.steps] == [
+        ("Get", "存2线", ("A",)),
+        ("Get", "存3线", ("B",)),
+        ("Put", "调梁棚", ("A", "B")),
+    ]
+
+
+def test_source_window_splits_one_get_into_tail_first_puts() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "存1线"),
+            ("B", "存2线", 2, "存3线"),
+        ),
+        loco="存2线",
     )
-    assert solver.line_is_pending_transit_corridor("洗罐线北", solver.cars)
+    generator = SourceWindowGenerator(problem, OperationTransitions(problem))
+
+    assert generator.digest_line("存2线", clear_all=False)
+    assert problem.complete(generator.node)
+    assert [(step.action, step.line, step.move_car_nos) for step in generator.node.steps] == [
+        ("Get", "存2线", ("A", "B")),
+        ("Put", "存3线", ("B",)),
+        ("Put", "存1线", ("A",)),
+    ]
 
 
-def test_spotting_repack_cannot_bury_unfinished_outbound_cars() -> None:
-    solver = initial_solver("0225W", "20260225W")
-    probe = initial_solver("0225W", "20260225W")
-    for car in probe.cars:
-        no = physical.car_no(car)
-        if no == "5243652":
-            car["Line"] = "油漆线"
-            car["Position"] = 1
-        elif no == "5242641":
-            car["Line"] = "油漆线"
-            car["Position"] = 2
-        elif car["Line"] == "油漆线":
-            car["Position"] = int(car["Position"]) + 2
-    probe.invalidate_caches()
-    move = ("5243652", "5242641")
-    candidate = physical.build_planlet_candidate(
-        case_id="0225W",
-        hook_index=1,
-        source_line="卸轮线",
-        target_line="油漆线",
-        batch=[solver.by_no()[no] for no in move],
-        steps=(physical.plan_step("Put", "油漆线", move),),
-        reason="test_target_put_burial",
-        candidate_kind="stage4_closed_macro",
+def test_optimizer_returns_a_closed_physically_valid_plan() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "调梁棚"),
+            ("B", "存3线", 1, "调梁棚"),
+        ),
+        loco="存2线",
+    )
+    optimized = BlockFlowOptimizer(
+        problem,
+        OptimizationConfig(
+            time_budget_seconds=5.0,
+            max_labels=8,
+            max_expansions=1_000,
+        ),
+    ).solve()
+
+    assert optimized.plan.complete, optimized.plan.reason
+    assert optimized.feasible_labels >= 1
+    assert not optimized.plan.node.state.carried_order
+    assert not optimized.plan.leases
+    assert problem.complete(optimized.plan.node)
+
+
+def test_source_search_deepens_only_inside_terminal_recovery_domain() -> None:
+    problem = make_problem(
+        (("A", "存3线", 1, "存1线"),),
+        loco="存3线",
+    )
+    optimizer = BlockFlowOptimizer(problem, OptimizationConfig())
+    checkpoint = PlanningCheckpoint(
+        node=SearchNode(physical.initial_planlet_state(
+            problem.cars,
+            problem.loco_location,
+        )),
+        contracts=build_contract_graph(problem),
+        stacks=(),
+        leases=(),
+        trace=(),
+        expansions=0,
+        goal_owners=(),
     )
 
-    buried = solver.newly_buried_by_target_put(candidate, probe)
+    assert optimizer._source_attempt_limit(()) == 64
+    assert optimizer._source_attempt_limit((checkpoint,)) == 6
 
-    assert buried == {"3803921"}
-    assert not solver.target_put_burial_recoverable(candidate, probe, buried)
+    staged = replace(
+        checkpoint,
+        stacks=((
+            "存3线",
+            OwnedStack(
+                "存3线",
+                (CarrySegment("存1线", ("A",), (1,)),),
+            ),
+        ),),
+    )
+    assert optimizer._source_attempt_limit((staged,)) == 128
+
+
+def test_source_label_rank_refresh_is_isolated_from_the_problem() -> None:
+    problem = make_problem(
+        (("A", "存3线", 1, "调梁棚"),),
+        loco="存3线",
+    )
+    baseline = dict(problem.final_rank_by_no)
+    first = SourceWindowGenerator(problem, OperationTransitions(problem))
+    first.rank_by_no["A"] = 99
+
+    assert dict(problem.final_rank_by_no) == baseline
+    assert SourceWindowGenerator(
+        problem,
+        OperationTransitions(problem),
+    ).rank_by_no == baseline
+    with pytest.raises(TypeError):
+        problem.final_rank_by_no["A"] = 99
+
+
+def test_spotting_stacks_only_prepend_consecutive_lower_ranks() -> None:
+    assert monotone_stack_prepend_allowed([1, 2], [3, 4])
+    assert not monotone_stack_prepend_allowed([1, 2], [4, 5])
+    assert not monotone_stack_prepend_allowed([2, 1], [3, 4])
+    assert not monotone_stack_prepend_allowed([1, 3], [4, 5])
+    assert not monotone_stack_prepend_allowed([3, 4], [1, 2])
+    assert not monotone_stack_prepend_allowed([], [1, 2])
+
+
+def test_owner_stack_ranks_remove_unused_physical_position_gaps() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "调梁棚"),
+            ("B", "存3线", 1, "调梁棚"),
+            ("C", "存5线南", 1, "调梁棚"),
+        ),
+        loco="存2线",
+    )
+    generator = SourceWindowGenerator(problem, OperationTransitions(problem))
+    generator.rank_by_no = {"A": 4, "B": 6, "C": 9}
+
+    assert generator.owner_stack_rank_by_no("调梁棚") == {
+        "A": 1,
+        "B": 2,
+        "C": 3,
+    }
+
+
+def test_unranked_protected_owner_keeps_target_access_order() -> None:
+    problem = make_problem(
+        (
+            ("A", "调梁棚", 1, "调梁棚"),
+            ("B", "调梁棚", 2, "调梁棚"),
+            ("C", "调梁棚", 3, "调梁棚"),
+        ),
+        loco="调梁棚",
+    )
+    generator = SourceWindowGenerator(problem, OperationTransitions(problem))
+
+    assert problem.owner_order("调梁棚") == ("A", "B", "C")
+    assert generator.owner_stack_rank_by_no("调梁棚") == {
+        "A": 1,
+        "B": 2,
+        "C": 3,
+    }
+
+
+def test_target_ranks_pull_the_full_dirty_target_before_repacking() -> None:
+    problem = make_problem(
+        (
+            ("A", "调梁棚", 1, "调梁棚"),
+            ("OUT", "调梁棚", 2, "存1线"),
+            ("B", "调梁棚", 3, "调梁棚"),
+        ),
+        loco="调梁棚",
+    )
+
+    assert problem.final_rank_by_no["A"] > 0
+    assert problem.final_rank_by_no["B"] > 0
+
+
+@pytest.mark.parametrize(
+    ("case_id", "date_code", "line", "holdouts"),
+    (
+        ("0128W", "20260128W", "洗罐站", 1),
+        ("0203W", "20260203W", "调梁棚", 1),
+    ),
+)
+def test_capacity_holdout_is_selected_before_search(
+    case_id: str,
+    date_code: str,
+    line: str,
+    holdouts: int,
+) -> None:
+    solver = exact_stage4_solver(case_id, date_code)
+
+    assert solver.scope.infeasible_lines == {line}
+    assert solver.scope.capacity_holdout_count_by_line == {line: holdouts}
+    assert len(solver.scope.infeasible_nos) == holdouts
+    held_length = sum(
+        physical.car_length(solver.problem.by_no[no])
+        for no in solver.scope.infeasible_nos
+    )
+    assert held_length >= solver.scope.capacity_overflow_by_line[line]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "date_code", "hook_ceiling"),
+    (
+        ("0127Z", "20260127Z", 18),
+        ("0205Z", "20260205Z", 26),
+        ("0209W", "20260209W", 35),
+    ),
+)
+def test_representative_cases_complete_and_replay_cleanly(
+    case_id: str,
+    date_code: str,
+    hook_ceiling: int,
+) -> None:
+    result = exact_stage4_solver(case_id, date_code).solve()
+    summary = result["summary"]
+
+    assert summary["status"] == "complete", summary["blocking_reasons"]
+    assert summary["business_hooks"] <= hook_ceiling
+    assert summary["replay_physical_ok"]
+    assert summary["combined_replay_physical_ok"]
+    assert summary["unrecovered_lease_count"] == 0
+    assert rv.replay(result["stage4_request"], result["response"])[1] == []

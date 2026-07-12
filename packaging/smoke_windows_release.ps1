@@ -56,6 +56,7 @@ try {
 
     $Body = @'
 {
+  "case_id": "0101Z",
   "request": {
     "StartStatus": [{
       "Line": "\u5b581\u7ebf",
@@ -85,7 +86,7 @@ try {
     $headers = @{ Authorization = "Bearer release-smoke-secret" }
     $result = Invoke-RestMethod `
         -Method Post `
-        -Uri "$BaseUrl/api/plan/generate?case_id=0101Z" `
+        -Uri "$BaseUrl/api/plan/generate" `
         -Headers $headers `
         -ContentType "application/json; charset=utf-8" `
         -Body $Body `

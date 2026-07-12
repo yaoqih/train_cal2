@@ -3,15 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import replay_validator as rv
-
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from solver_vnext import physical
+import replay_validator as rv  # noqa: E402
+from solver_vnext import physical  # noqa: E402
 
 
 def _car(no: str, line: str, position: int, target: str = "调梁棚") -> dict:

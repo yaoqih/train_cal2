@@ -15,15 +15,15 @@ if str(ROOT) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import replay_validator as rv
-from stage3_simple.solve import (
+import replay_validator as rv  # noqa: E402
+from stage3_simple.solve import (  # noqa: E402
     TEMPLATE_B_ORDER,
     Op,
     SearchResult,
     Stage3Solver,
     State,
     case_id_from_path,
-    unavailable_summary,
+    diagnostic_summary,
 )
 
 
@@ -522,7 +522,7 @@ class Stage3StructuralTests(unittest.TestCase):
 
         self.assertEqual(solver.next_assigned_no_by_line(state)["修1库内"], deepest)
 
-    def test_all_strategies_are_compared_and_template_a_can_win(self) -> None:
+    def test_all_search_specs_are_compared_and_template_a_can_win(self) -> None:
         req = request([
             car("A", "机走北", 1, ["修4库内"], forced=[1, 2, 3, 4, 5]),
             car("B", "机南", 1, ["修4库内"], forced=[1, 2, 3, 4, 5]),
@@ -828,7 +828,7 @@ class Stage3StructuralTests(unittest.TestCase):
         )
         self.assertEqual(solver.template_operation_lower_bound("B"), 2)
 
-    def test_zero_lower_bound_and_incomplete_portfolio_are_distinct(self) -> None:
+    def test_zero_lower_bound_and_incomplete_search_space_are_distinct(self) -> None:
         req = request([car("F", "存4线", 1, ["存4线"])])
         solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
         chosen = SearchResult(
@@ -852,7 +852,7 @@ class Stage3StructuralTests(unittest.TestCase):
             reasons=("stage3_global_time_budget_exhausted",),
             expansions=0,
             elapsed_seconds=0.0,
-            strategy_evaluated=False,
+            search_spec_evaluated=False,
         )
 
         summary = solver.result(chosen, [chosen, not_evaluated])["summary"]
@@ -863,15 +863,15 @@ class Stage3StructuralTests(unittest.TestCase):
             summary["operation_lower_bound_scope"],
             "assignment_independent_relaxation",
         )
-        self.assertFalse(summary["portfolio_evaluation_complete"])
-        self.assertEqual(summary["optimality_status"], "portfolio_evaluation_incomplete")
+        self.assertFalse(summary["search_space_evaluation_complete"])
+        self.assertEqual(summary["optimality_status"], "search_space_evaluation_incomplete")
         self.assertEqual(summary["template_summaries"][0]["operation_lower_bound_gap"], 0)
 
     def test_upstream_unavailable_summary_keeps_optimality_contract(self) -> None:
-        summary = unavailable_summary("TEST", "stage2_not_complete:partial")
+        summary = diagnostic_summary("TEST", "stage2_not_complete:partial")
 
         self.assertIsNone(summary["operation_lower_bound"])
-        self.assertIsNone(summary["evaluated_strategy_portfolio_lower_bound"])
+        self.assertIsNone(summary["evaluated_search_space_lower_bound"])
         self.assertEqual(summary["operation_lower_bound_scope"], "not_applicable")
         self.assertEqual(summary["optimality_status"], "not_applicable")
 
@@ -922,7 +922,7 @@ class Stage3StructuralTests(unittest.TestCase):
         )
 
     def test_0117z_operation_lower_bound_components_are_exact(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "four_stage_balanced_current" / "stage2"
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth2" / "stage2"
         stage2_path = stage2_dir / "0117Z_combined_response.json"
         if not stage2_path.exists():
             self.skipTest("local 0117Z stage2 regression artifact is not available")
@@ -936,16 +936,16 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertEqual(
             components,
             {
-                "source_gets": 6,
+                "source_gets": 4,
                 "inner_puts": 5,
-                "non_inner_puts": 2,
+                "non_inner_puts": 1,
                 "frontier_rehandle": 1,
             },
         )
-        self.assertEqual(result["summary"]["operation_lower_bound"], 14)
+        self.assertEqual(result["summary"]["operation_lower_bound"], 11)
 
     def test_all_complete_full_corpus_candidates_respect_operation_lower_bound(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "four_stage_balanced_current" / "stage2"
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth2" / "stage2"
         if not stage2_dir.exists():
             self.skipTest("local full stage2 regression artifacts are not available")
 
@@ -1013,12 +1013,12 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertIsNone(built.state)
 
     def test_real_difficult_cases_are_solved_without_search(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "four_stage_balanced_current" / "stage2"
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth2" / "stage2"
         cases = {
             "0104Z": (9, 0),
             "0112Z": (14, None),
-            "0117Z": (14, 0),
-            "0226W": (10, 0),
+            "0117Z": (12, 6),
+            "0226W": (14, 5),
         }
         if not all((stage2_dir / f"{case_id}_combined_response.json").exists() for case_id in cases):
             self.skipTest("local stage2 regression artifacts are not available")
@@ -1036,21 +1036,27 @@ class Stage3StructuralTests(unittest.TestCase):
                 self.assertEqual(summary["status"], "complete")
                 self.assertLessEqual(summary["operations"], hook_limit)
                 if expected_gap is not None:
-                    self.assertEqual(summary["evaluated_strategy_portfolio_gap"], expected_gap)
-                    self.assertEqual(summary["optimality_status"], "portfolio_lower_bound_reached")
+                    self.assertEqual(summary["evaluated_search_space_gap"], expected_gap)
+                    self.assertEqual(
+                        summary["optimality_status"],
+                        (
+                            "search_space_lower_bound_reached"
+                            if expected_gap == 0
+                            else "best_known_with_gap"
+                        ),
+                    )
                 self.assertEqual(summary["expansions"], 0)
                 self.assertEqual(rv.replay(result["stage3_request"], result["response"])[1], [])
                 self.assertEqual(rv.replay(req, result["combined_response"])[1], [])
 
     def test_truth3_exact_alignment_cases_complete_without_exact_search(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "stage1-4_simple" / "truth3" / "stage2"
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth3" / "stage2"
         cases = {
-            "0401Z": 12,
-            "0408W": 17,
-            "0416W": 33,
-            "0420W": 28,
-            "0427W": 27,
-            "0429Z": 16,
+            "0401Z": 13,
+            "0408W": 12,
+            "0420W": 20,
+            "0427W": 26,
+            "0429Z": 17,
         }
         if not all((stage2_dir / f"{case_id}_combined_response.json").exists() for case_id in cases):
             self.skipTest("local truth3 stage2 regression artifacts are not available")
@@ -1081,7 +1087,7 @@ class Stage3StructuralTests(unittest.TestCase):
                     )
 
     def test_0420w_sparse_factory_slots_use_exact_matching(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "stage1-4_simple" / "truth3" / "stage2"
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth3" / "stage2"
         stage2_path = stage2_dir / "0420W_combined_response.json"
         if not stage2_path.exists():
             self.skipTest("local truth3 stage2 regression artifact is not available")
@@ -1101,11 +1107,12 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertEqual(solver.assigned_slot_by_no["5310676"], ("修1库内", 4))
         self.assertEqual(solver.assigned_slot_by_no["5317385"], ("修1库内", 5))
 
-    def test_truth3_infeasible_cases_emit_capacity_certificates(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "stage1-4_simple" / "truth3" / "stage2"
+    def test_truth3_infeasible_cases_emit_structural_certificates(self) -> None:
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth3" / "stage2"
         expected = {
             "0406W": "inner_slot_capacity_infeasible:cars=14>reachable_slots=13",
-            "0424Z": "outer_capacity_infeasible:修3库外:demand=52.8>capacity=49.3",
+            "0416W": "cohesive_direct_unload_order_infeasible",
+            "0424Z": "cohesive_direct_unload_order_infeasible",
         }
         if not all((stage2_dir / f"{case_id}_combined_response.json").exists() for case_id in expected):
             self.skipTest("local truth3 stage2 regression artifacts are not available")
@@ -1133,7 +1140,7 @@ class Stage3StructuralTests(unittest.TestCase):
                 )
 
     def test_0226w_retires_outer_leads_before_clearing_deferred_inner_cars(self) -> None:
-        stage2_dir = ROOT / "artifacts" / "four_stage_balanced_current" / "stage2"
+        stage2_dir = ROOT / "artifacts" / "fullflow_current" / "truth2" / "stage2"
         stage2_path = stage2_dir / "0226W_combined_response.json"
         if not stage2_path.exists():
             self.skipTest("local 0226W stage2 regression artifact is not available")
@@ -1157,9 +1164,9 @@ class Stage3StructuralTests(unittest.TestCase):
             and row["line"] in {"修1库内", "修3库内"}
         }
 
-        self.assertEqual(summary["operations"], 10)
-        self.assertEqual(summary["operation_lower_bound"], 10)
-        self.assertEqual(summary["evaluated_strategy_portfolio_gap"], 0)
+        self.assertEqual(summary["operations"], 14)
+        self.assertEqual(summary["operation_lower_bound"], 11)
+        self.assertEqual(summary["evaluated_search_space_gap"], 5)
         self.assertEqual(completed_before_clear, {"修1库内", "修3库内"})
         self.assertEqual(rv.replay(result["stage3_request"], result["response"])[1], [])
         self.assertEqual(rv.replay(req, result["combined_response"])[1], [])

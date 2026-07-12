@@ -20,8 +20,8 @@ if str(ROOT) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import replay_validator as rv
-from solver_vnext import physical
+import replay_validator as rv  # noqa: E402
+from solver_vnext import physical  # noqa: E402
 
 
 INF_COST = 10**9
@@ -87,7 +87,7 @@ class SearchResult:
     lower_bound: int | None = None
     lower_bound_components: tuple[tuple[str, int], ...] = ()
     lower_bound_scope: str = "not_applicable"
-    strategy_evaluated: bool = True
+    search_spec_evaluated: bool = True
 
 
 def case_id_from_path(path: Path) -> str:
@@ -219,7 +219,7 @@ class Stage3Solver:
         self.optimization_attempted = 0
         self.optimization_expansions = 0
         self.optimization_budget_exhausted = False
-        self.portfolio_evaluation_incomplete = False
+        self.search_space_evaluation_incomplete = False
 
     def validate_input_contract(self, request: dict[str, Any]) -> None:
         errors: list[str] = []
@@ -1132,7 +1132,7 @@ class Stage3Solver:
             if any(self.is_stage4_deferred(no) for no in self.active_nos)
             else (True,)
         )
-        strategies = tuple(
+        search_specs = tuple(
             (template, layout, deferred_clear, terminal_merge, inner_clear_policy)
             for template, layout in (
                 ("B", "cohesive"),
@@ -1153,26 +1153,26 @@ class Stage3Solver:
                 inner_clear_policy=inner_clear_policy,
                 allow_search=False,
             ))
-            for template, layout, deferred_clear, terminal_merge, inner_clear_policy in strategies
+            for template, layout, deferred_clear, terminal_merge, inner_clear_policy in search_specs
         ]
 
-        # Exact search is an explicit small-state strategy, not a failure
-        # continuation.  Larger cases stay on the block planner so their
-        # diagnostics and memory use remain bounded.
+        # Exact search is an explicit small-state mode in the same search
+        # space. Larger cases stay on the block planner so diagnostics and
+        # memory use remain bounded.
         if len(self.active_nos) <= EXACT_SEARCH_ACTIVE_LIMIT:
             exact_specs = tuple(dict.fromkeys(
                 (template, layout, deferred_clear)
-                for template, layout, deferred_clear, _merge, _policy in strategies
+                for template, layout, deferred_clear, _merge, _policy in search_specs
             ))
             for offset, (template, layout, deferred_clear) in enumerate(exact_specs):
                 remaining_time = max(0.0, self.global_deadline - time.monotonic())
-                remaining_strategies = len(exact_specs) - offset
+                remaining_specs = len(exact_specs) - offset
                 if remaining_time <= 0.0:
-                    self.portfolio_evaluation_incomplete = True
+                    self.search_space_evaluation_incomplete = True
                     break
                 self.deadline = min(
                     self.global_deadline,
-                    time.monotonic() + remaining_time / remaining_strategies,
+                    time.monotonic() + remaining_time / remaining_specs,
                 )
                 results.append(self.validate_candidate(self.solve_template(
                     template,
@@ -1186,7 +1186,7 @@ class Stage3Solver:
         if any(item.status == "complete" for item in results) and len(self.active_nos) > EXACT_SEARCH_ACTIVE_LIMIT:
             best_result = self.choose_result(results)
             incumbent_hooks = self.business_hook_count(best_result.ops)
-            portfolio_lower_bound = min(
+            search_space_lower_bound = min(
                 (item.lower_bound for item in results if item.lower_bound is not None),
                 default=incumbent_hooks,
             )
@@ -1204,7 +1204,7 @@ class Stage3Solver:
             )
             remaining_expansions = MAX_IMPROVEMENT_EXPANSIONS
             for offset, (template, layout, deferred_clear) in enumerate(improvable):
-                if incumbent_hooks <= portfolio_lower_bound:
+                if incumbent_hooks <= search_space_lower_bound:
                     break
                 remaining_time = improvement_deadline - time.monotonic()
                 remaining_candidates = len(improvable) - offset
@@ -1344,7 +1344,7 @@ class Stage3Solver:
                 deferred_clear=deferred_clear,
                 terminal_merge=terminal_merge,
                 inner_clear_policy=inner_clear_policy,
-                strategy_evaluated=False,
+                search_spec_evaluated=False,
             )
         self.assigned_line_by_no = self.build_assigned_line_by_no(template, layout)
         if self.assignment_reasons:
@@ -1424,7 +1424,7 @@ class Stage3Solver:
             ))
         if inner_clear_policy == "exact":
             if not allow_search:
-                raise ValueError("exact_strategy_requires_search")
+                raise ValueError("exact_mode_requires_search")
             return annotate(self.search(
                 template,
                 state,
@@ -1467,7 +1467,7 @@ class Stage3Solver:
         }
 
     def template_operation_lower_bound_components(self, template: str) -> dict[str, int]:
-        """Cheap admissible hook bound for one fixed template/layout strategy."""
+        """Cheap admissible hook bound for one fixed template/layout search spec."""
         used_inner = {
             line
             for no, line in self.assigned_line_by_no.items()
@@ -4086,18 +4086,18 @@ class Stage3Solver:
         evaluated_bounds = [
             item.lower_bound for item in results if item.lower_bound is not None
         ]
-        portfolio_lower_bound = min(
+        search_space_lower_bound = min(
             evaluated_bounds,
             default=None,
         )
-        portfolio_gap = (
-            executable_hooks - portfolio_lower_bound
-            if validated_complete and portfolio_lower_bound is not None
+        search_space_gap = (
+            executable_hooks - search_space_lower_bound
+            if validated_complete and search_space_lower_bound is not None
             else None
         )
-        portfolio_evaluation_complete = (
-            not self.portfolio_evaluation_incomplete
-            and all(item.strategy_evaluated for item in results)
+        search_space_evaluation_complete = (
+            not self.search_space_evaluation_incomplete
+            and all(item.search_spec_evaluated for item in results)
         )
         replay_reasons = tuple(f"replay_{v.kind}:{v.code}:{v.detail}" for v in hard_bad[:12])
         combined_reasons = tuple(
@@ -4140,7 +4140,7 @@ class Stage3Solver:
                     if item.status == "complete" and item.lower_bound is not None
                     else None
                 ),
-                "strategy_evaluated": item.strategy_evaluated,
+                "search_spec_evaluated": item.search_spec_evaluated,
                 "blocking_reasons": list(item.reasons),
                 "expansions": item.expansions,
                 "elapsed_seconds": item.elapsed_seconds,
@@ -4184,11 +4184,11 @@ class Stage3Solver:
             "operation_lower_bound": lower_bound,
             "operation_lower_bound_components": lower_bound_components,
             "operation_lower_bound_scope": chosen.lower_bound_scope,
-            "evaluated_strategy_portfolio_bound_scope": "evaluated_template_layout_clear_merge_policy_modes",
+            "evaluated_search_space_bound_scope": "template_layout_clear_merge_policy_modes",
             "operation_lower_bound_gap": optimality_gap,
-            "evaluated_strategy_portfolio_lower_bound": portfolio_lower_bound,
-            "evaluated_strategy_portfolio_gap": portfolio_gap,
-            "portfolio_evaluation_complete": portfolio_evaluation_complete,
+            "evaluated_search_space_lower_bound": search_space_lower_bound,
+            "evaluated_search_space_gap": search_space_gap,
+            "search_space_evaluation_complete": search_space_evaluation_complete,
             "lower_bound_validation_violations": lower_bound_validation_violations,
             "optimization_attempted": self.optimization_attempted,
             "optimization_expansions": self.optimization_expansions,
@@ -4197,12 +4197,12 @@ class Stage3Solver:
                 "invalid_lower_bound_certificate"
                 if validated_complete
                 and (optimality_gap is not None and optimality_gap < 0
-                     or portfolio_gap is not None and portfolio_gap < 0
+                     or search_space_gap is not None and search_space_gap < 0
                      or lower_bound_validation_violations)
-                else "portfolio_evaluation_incomplete"
-                if validated_complete and not portfolio_evaluation_complete
-                else "portfolio_lower_bound_reached"
-                if validated_complete and portfolio_gap == 0
+                else "search_space_evaluation_incomplete"
+                if validated_complete and not search_space_evaluation_complete
+                else "search_space_lower_bound_reached"
+                if validated_complete and search_space_gap == 0
                 else "bounded_improvement_exhausted"
                 if validated_complete and self.optimization_budget_exhausted
                 else "best_known_with_gap"
@@ -4437,17 +4437,25 @@ class Stage3Solver:
         return sum(1 for op in ops if op.action in {"Get", "Put"})
 
 
-def request_paths(input_path: Path, case: str | None) -> list[Path]:
+def case_files(input_path: Path) -> list[Path]:
     if input_path.is_file():
         return [input_path]
-    paths = sorted(input_path.glob("*.json"))
-    if case:
-        target = case.upper()
-        paths = [path for path in paths if case_id_from_path(path) == target]
-    return paths
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"input path does not exist: {input_path}")
+    files = sorted(input_path.glob("validation_*.json"))
+    if not files:
+        raise ValueError(
+            f"input directory has no validation_*.json files: {input_path}"
+        )
+    return files
 
 
-def unavailable_summary(case_id: str, reason: str, *, status: str = "partial") -> dict[str, Any]:
+def diagnostic_summary(
+    case_id: str,
+    reason: str,
+    *,
+    status: str = "unavailable",
+) -> dict[str, Any]:
     return {
         "case_id": case_id,
         "status": status,
@@ -4464,10 +4472,10 @@ def unavailable_summary(case_id: str, reason: str, *, status: str = "partial") -
         "operation_lower_bound_components": {},
         "operation_lower_bound_scope": "not_applicable",
         "operation_lower_bound_gap": None,
-        "evaluated_strategy_portfolio_bound_scope": "not_applicable",
-        "evaluated_strategy_portfolio_lower_bound": None,
-        "evaluated_strategy_portfolio_gap": None,
-        "portfolio_evaluation_complete": False,
+        "evaluated_search_space_bound_scope": "not_applicable",
+        "evaluated_search_space_lower_bound": None,
+        "evaluated_search_space_gap": None,
+        "search_space_evaluation_complete": False,
         "lower_bound_validation_violations": [],
         "optimization_attempted": 0,
         "optimization_expansions": 0,
@@ -4500,29 +4508,42 @@ def unavailable_summary(case_id: str, reason: str, *, status: str = "partial") -
     }
 
 
-def solve_one(path: Path, stage2_out: Path, out_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+def solve_one(
+    path: Path,
+    stage2_out: Path,
+    out_dir: Path,
+    *,
+    time_budget_seconds: float,
+) -> dict[str, Any]:
     case_id = case_id_from_path(path)
     stage2_summary_path = stage2_out / f"{case_id}_summary.json"
     combined_path = stage2_out / f"{case_id}_combined_response.json"
-    if not combined_path.exists():
-        summary = unavailable_summary(case_id, "stage2_combined_response_missing")
+    missing = [
+        str(artifact)
+        for artifact in (stage2_summary_path, combined_path)
+        if not artifact.exists()
+    ]
+    if missing:
+        summary = diagnostic_summary(
+            case_id,
+            "stage2_artifact_missing:" + ",".join(missing),
+        )
         write_json(out_dir / f"{case_id}_summary.json", summary)
         return summary
-    if stage2_summary_path.exists():
-        stage2_summary = read_json(stage2_summary_path)
-        if stage2_summary.get("status") != "complete" and not args.include_stage2_partial:
-            summary = unavailable_summary(
-                case_id,
-                f"stage2_not_complete:{stage2_summary.get('status')}",
-            )
-            write_json(out_dir / f"{case_id}_summary.json", summary)
-            return summary
+    stage2_summary = read_json(stage2_summary_path)
+    if stage2_summary.get("status") != "complete":
+        summary = diagnostic_summary(
+            case_id,
+            f"stage2_not_complete:{stage2_summary.get('status')}",
+        )
+        write_json(out_dir / f"{case_id}_summary.json", summary)
+        return summary
 
     solver = Stage3Solver(
         case_id,
         read_json(path),
         read_json(combined_path),
-        time_budget_seconds=args.time_budget_seconds,
+        time_budget_seconds=time_budget_seconds,
     )
     result = solver.solve()
     write_json(out_dir / f"{case_id}_stage3_request.json", result["stage3_request"])
@@ -4537,6 +4558,9 @@ def solve_one(path: Path, stage2_out: Path, out_dir: Path, args: argparse.Namesp
 def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(summaries)
     complete = sum(1 for item in summaries if item.get("status") == "complete")
+    partial = sum(1 for item in summaries if item.get("status") == "partial")
+    unavailable = sum(1 for item in summaries if item.get("status") == "unavailable")
+    errors = sum(1 for item in summaries if item.get("status") == "error")
     ops = [int(item.get("operations") or 0) for item in summaries if item.get("status") == "complete"]
     reasons = Counter(
         reason.split(":", 1)[0]
@@ -4548,7 +4572,9 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "cases": total,
         "complete": complete,
-        "partial": total - complete,
+        "partial": partial,
+        "unavailable": unavailable,
+        "error": errors,
         "avg_operations_complete": round(sum(ops) / len(ops), 3) if ops else 0,
         "max_operations_complete": max(ops) if ops else 0,
         "templates_complete": dict(sorted(templates.items())),
@@ -4560,11 +4586,17 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 3 simple exact-ish depot inbound solver.")
     parser.add_argument("input", type=Path, help="request JSON file or directory")
-    parser.add_argument("--stage2-out", type=Path, default=Path("artifacts/stage2_simple_final"))
-    parser.add_argument("--out", type=Path, default=Path("artifacts/stage3_simple"))
-    parser.add_argument("--case", help="case id filter, e.g. 0226Z")
+    parser.add_argument(
+        "--stage2-out",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--time-budget-seconds", type=float, default=DEFAULT_TIME_BUDGET_SECONDS)
-    parser.add_argument("--include-stage2-partial", action="store_true")
     return parser.parse_args()
 
 
@@ -4572,15 +4604,32 @@ def main() -> int:
     args = parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     summaries: list[dict[str, Any]] = []
-    for path in request_paths(args.input, args.case):
+    for path in case_files(args.input):
         case_id = case_id_from_path(path)
         print(case_id, flush=True)
-        summaries.append(solve_one(path, args.stage2_out, args.out, args))
+        try:
+            summaries.append(
+                solve_one(
+                    path,
+                    args.stage2_out,
+                    args.out,
+                    time_budget_seconds=args.time_budget_seconds,
+                )
+            )
+        except Exception as exc:
+            summary = diagnostic_summary(
+                case_id,
+                f"solver_exception:{type(exc).__name__}:{exc}",
+                status="error",
+            )
+            summaries.append(summary)
+            write_json(args.out / f"{case_id}_summary.json", summary)
     agg = aggregate(summaries)
     write_json(args.out / "aggregate_summary.json", agg)
     print(
         "done "
         f"cases={agg['cases']} complete={agg['complete']} partial={agg['partial']} "
+        f"unavailable={agg['unavailable']} error={agg['error']} "
         f"avg_ops={agg['avg_operations_complete']} max_ops={agg['max_operations_complete']}",
         flush=True,
     )

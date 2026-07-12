@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-import hashlib
 import hmac
 import json
 import logging
@@ -65,7 +64,7 @@ LOGGER = logging.getLogger("train_cal.plan_api")
 def _worker_command(job_dir: Path) -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "--worker", str(job_dir)]
-    return [sys.executable, "-m", "plan_api.worker", str(job_dir)]
+    return [sys.executable, "-m", "plan_api", "--worker", str(job_dir)]
 
 
 class ApiProblem(Exception):
@@ -884,13 +883,7 @@ async def generate(request: Request) -> Response:
         raise ApiProblem(429, "任务队列已满")
 
     payload = await _read_json_body(request)
-    case_id, plan_request, options = parse_single_submission(
-        payload,
-        case_id_hint=(
-            request.query_params.get("case_id")
-            or request.headers.get("X-Case-Id")
-        ),
-    )
+    case_id, plan_request, options = parse_single_submission(payload)
     try:
         reservation = manager.reserve_capacity()
     except QueueFullError as exc:
@@ -957,6 +950,9 @@ async def generate_batch(request: Request) -> Response:
     payload = await _read_json_body(request)
     if not isinstance(payload, dict):
         raise ApiProblem(422, "请求体必须是 JSON 对象")
+    unknown = sorted(set(payload) - {"cases", "options"})
+    if unknown:
+        raise ApiProblem(422, f"未知批量提交字段: {','.join(unknown)}")
     cases = payload.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ApiProblem(422, "cases 必须是非空数组")
@@ -983,10 +979,23 @@ async def generate_batch(request: Request) -> Response:
             if not isinstance(item, dict):
                 validation_errors.append({"index": index, "errors": ["案例必须是 JSON 对象"]})
                 continue
+            unknown = sorted(set(item) - {"case_id", "request", "options"})
+            if unknown:
+                validation_errors.append({
+                    "index": index,
+                    "errors": [f"未知案例字段: {','.join(unknown)}"],
+                })
+                continue
             plan_request = item.get("request")
             case_id_raw = item.get("case_id")
+            if not isinstance(plan_request, dict):
+                validation_errors.append({
+                    "index": index,
+                    "errors": ["request 必须是 JSON 对象"],
+                })
+                continue
             try:
-                case_id = normalize_case_id(case_id_raw, plan_request)
+                case_id = normalize_case_id(case_id_raw)
                 item_options = item.get("options", {})
                 if item_options is None:
                     item_options = {}
@@ -1100,42 +1109,34 @@ async def openapi(_request: Request) -> Response:
 
 def parse_single_submission(
     payload: Any,
-    *,
-    case_id_hint: Any = None,
 ) -> tuple[str, dict[str, Any], PipelineOptions]:
     if not isinstance(payload, dict):
         raise ApiProblem(422, "请求体必须是 JSON 对象")
+    unknown = sorted(set(payload) - {"case_id", "request", "options"})
+    if unknown:
+        raise ApiProblem(422, f"未知提交字段: {','.join(unknown)}")
 
-    if "request" in payload and "StartStatus" not in payload:
-        plan_request = payload.get("request")
-        case_id_raw = payload.get("case_id") or case_id_hint
-        raw_options = payload.get("options", {})
-        if raw_options is None:
-            raw_options = {}
-    else:
-        plan_request = payload
-        case_id_raw = case_id_hint
+    plan_request = payload.get("request")
+    case_id_raw = payload.get("case_id")
+    raw_options = payload.get("options", {})
+    if raw_options is None:
         raw_options = {}
 
     if not isinstance(plan_request, dict):
         raise ApiProblem(422, "request 必须是 JSON 对象")
     try:
-        case_id = normalize_case_id(case_id_raw, plan_request)
+        case_id = normalize_case_id(case_id_raw)
         options = PipelineOptions.from_mapping(raw_options)
     except (PipelineOptionError, ValueError) as exc:
         raise ApiProblem(422, str(exc)) from exc
     return case_id, plan_request, options
 
 
-def normalize_case_id(value: Any, request_payload: Any) -> str:
-    if value is not None and str(value).strip():
-        parsed = str(value).strip().upper()
-        if not CASE_ID_RE.fullmatch(parsed):
-            raise ValueError("case_id 必须符合 4 位数字加 W/Z，例如 0104W")
-        return parsed
-    canonical = json.dumps(request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"{int(digest[:8], 16) % 10000:04d}Z"
+def normalize_case_id(value: Any) -> str:
+    parsed = str(value or "").strip().upper()
+    if not CASE_ID_RE.fullmatch(parsed):
+        raise ValueError("case_id 必须符合 4 位数字加 W/Z，例如 0104W")
+    return parsed
 
 
 def _deep_merge_options(common: Mapping[str, Any], item: Any) -> dict[str, Any]:
@@ -1194,11 +1195,12 @@ def _reject_json_constant(value: str) -> Any:
 
 
 def _wants_async(request: Request) -> bool:
-    query_value = str(request.query_params.get("async") or "").strip().lower()
-    if query_value in {"1", "true", "yes"}:
+    query_value = str(request.query_params.get("async") or "false").strip().lower()
+    if query_value in {"1", "true"}:
         return True
-    prefer = str(request.headers.get("Prefer") or "").lower()
-    return "respond-async" in prefer
+    if query_value in {"0", "false"}:
+        return False
+    raise ApiProblem(422, "async 必须是 true 或 false")
 
 
 def _accepted_response(job: dict[str, Any], request: Request) -> Response:
@@ -1380,7 +1382,7 @@ if cors_origins:
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_methods=["GET", "POST"],
-        allow_headers=["Authorization", "Content-Type", "Prefer", "X-API-Key", "X-Case-Id"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
 
@@ -1394,13 +1396,6 @@ def _openapi_schema() -> dict[str, Any]:
         "429": {"description": "任务队列已满"},
         "500": {"description": "求解或服务内部错误"},
         "503": {"description": "任务执行器不可用或批量提交部分失败"},
-    }
-    case_id_parameter = {
-        "name": "case_id",
-        "in": "query",
-        "required": False,
-        "schema": {"type": "string", "pattern": "^[0-9]{4}[WZ]$"},
-        "description": "案例号；也可通过 X-Case-Id 传递。省略时按请求内容生成内部案例号。",
     }
     return {
         "openapi": "3.1.0",
@@ -1424,39 +1419,21 @@ def _openapi_schema() -> dict[str, Any]:
             },
             "/api/plan/generate": {
                 "post": {
-                    "summary": "提交单个调车计划；默认同步，async=true 或 Prefer: respond-async 异步",
+                    "summary": "提交单个调车计划；默认同步，async=true 异步",
                     "security": security,
                     "parameters": [
-                        case_id_parameter,
                         {
                             "name": "async",
                             "in": "query",
                             "required": False,
                             "schema": {"type": "boolean", "default": False},
                         },
-                        {
-                            "name": "X-Case-Id",
-                            "in": "header",
-                            "required": False,
-                            "schema": {"type": "string", "pattern": "^[0-9]{4}[WZ]$"},
-                        },
-                        {
-                            "name": "Prefer",
-                            "in": "header",
-                            "required": False,
-                            "schema": {"type": "string", "example": "respond-async"},
-                        },
                     ],
                     "requestBody": {
                         "required": True,
                         "content": {
                             "application/json": {
-                                "schema": {
-                                    "oneOf": [
-                                        {"$ref": "#/components/schemas/PlanRequest"},
-                                        {"$ref": "#/components/schemas/PlanSubmission"},
-                                    ]
-                                }
+                                "schema": {"$ref": "#/components/schemas/PlanSubmission"}
                             }
                         },
                     },
@@ -1601,7 +1578,6 @@ def _openapi_schema() -> dict[str, Any]:
                             "properties": {
                                 "max_hooks": {"type": "integer", "minimum": 1, "maximum": 500},
                                 "time_budget_seconds": {"type": "number", "minimum": 0.1, "maximum": 900},
-                                "profile": {"type": "string", "enum": ["baseline", "balanced", "stage3", "stage4"]},
                             },
                         },
                         "stage2": {
@@ -1623,8 +1599,8 @@ def _openapi_schema() -> dict[str, Any]:
                             "additionalProperties": False,
                             "properties": {
                                 "time_budget_seconds": {"type": "number", "minimum": 0.1, "maximum": 900},
-                                "max_macros": {"type": "integer", "minimum": 1, "maximum": 500},
-                                "max_candidates_per_step": {"type": "integer", "minimum": 1, "maximum": 256},
+                                "max_labels": {"type": "integer", "minimum": 1, "maximum": 4096},
+                                "max_expansions": {"type": "integer", "minimum": 1, "maximum": 1000000},
                             },
                         },
                     },
@@ -1632,7 +1608,8 @@ def _openapi_schema() -> dict[str, Any]:
                 },
                 "PlanSubmission": {
                     "type": "object",
-                    "required": ["request"],
+                    "additionalProperties": False,
+                    "required": ["case_id", "request"],
                     "properties": {
                         "case_id": {"type": "string", "pattern": "^[0-9]{4}[WZ]$"},
                         "request": {"$ref": "#/components/schemas/PlanRequest"},

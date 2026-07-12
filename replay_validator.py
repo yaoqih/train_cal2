@@ -510,7 +510,8 @@ def replay(req: dict[str, Any], resp: dict[str, Any]) -> tuple[list[dict[str, An
         move = [str(x) for x in op.get("MoveCars") or []]
         train = [str(x) for x in op.get("TrainCars") or []]
         if action not in {"Get", "Put", "Weigh"}:
-            bad.append(V(idx, "physical", "unknown_action", action)); continue
+            bad.append(V(idx, "physical", "unknown_action", action))
+            continue
         if line not in TRACK_LEN and line not in RUNNING:
             bad.append(V(idx, "physical", "line_unknown", line))
         if action in {"Get", "Put"} and line in RUNNING:
@@ -686,15 +687,29 @@ def build_slots(cars: list[dict[str, Any]], caps: dict[str, int]) -> tuple[dict[
             slots[car_no(c)] = Slot(c["_InitialLine"], int(c["Position"]), True)
             used[c["_InitialLine"]].add(int(c["Position"]))
     rest = [c for c in depot_cars if car_no(c) not in slots]
-    cand = {car_no(c): [(l, p) for l in sorted(DEPOT & set(c["TargetLines"])) for p in range(1, caps[l] + 1)
-                        if p not in used[l] and slot_ok(c, l, p, caps)] for c in rest}
+    cand = {
+        car_no(car): [
+            (line, position)
+            for line in sorted(DEPOT & set(car["TargetLines"]))
+            for position in range(1, caps[line] + 1)
+            if position not in used[line]
+            and slot_ok(car, line, position, caps)
+        ]
+        for car in rest
+    }
     owner: dict[tuple[str, int], str] = {}
     lookup = {car_no(c): c for c in rest}
 
-    def pref(no: str, s: tuple[str, int]) -> tuple[int, int, int, str]:
-        c, (l, p) = lookup[no], s
-        return ((line_no(l) not in ({3, 4} if c["Length"] >= 17.6 else {1, 2})),
-                0 if not repair(c).startswith("厂") or p in {4, 5} else 1, p, l)
+    def pref(no: str, slot: tuple[str, int]) -> tuple[int, int, int, str]:
+        car = lookup[no]
+        line, position = slot
+        preferred_lines = {3, 4} if car["Length"] >= 17.6 else {1, 2}
+        return (
+            line_no(line) not in preferred_lines,
+            0 if not repair(car).startswith("厂") or position in {4, 5} else 1,
+            position,
+            line,
+        )
 
     def assign(no: str, seen: set[tuple[str, int]]) -> bool:
         for s in sorted(cand.get(no, ()), key=lambda x: pref(no, x)):
@@ -709,9 +724,9 @@ def build_slots(cars: list[dict[str, Any]], caps: dict[str, int]) -> tuple[dict[
     for no in sorted(cand, key=lambda n: (len(cand[n]), n)):
         if not cand[no] or not assign(no, set()):
             fail[no] = "no_feasible_depot_slot"
-    for (l, p), no in owner.items():
+    for (line, position), no in owner.items():
         if no not in fail:
-            slots[no] = Slot(l, p)
+            slots[no] = Slot(line, position)
     return slots, fail
 
 

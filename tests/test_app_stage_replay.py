@@ -3,33 +3,33 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
-import types
 from pathlib import Path
 
-
-class _DummyStreamlit(types.ModuleType):
-    def cache_data(self, *args, **kwargs):
-        def decorator(fn):
-            return fn
-
-        return decorator
-
-    def cache_resource(self, *args, **kwargs):
-        def decorator(fn):
-            return fn
-
-        return decorator
-
-    def __getattr__(self, _name):
-        def noop(*args, **kwargs):
-            return None
-
-        return noop
+from streamlit.testing.v1 import AppTest
 
 
-sys.modules.setdefault("streamlit", _DummyStreamlit("streamlit"))
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import app  # noqa: E402
+
+
+APP_PATH = ROOT / "app.py"
+
+
+def test_app_renders_all_dashboards_without_exceptions() -> None:
+    rendered = AppTest.from_file(str(APP_PATH)).run(timeout=60)
+
+    assert not rendered.exception
+    assert [tab.label for tab in rendered.tabs] == [
+        "全流程回放",
+        "人工计划回放",
+        "第一阶段可视化",
+        "第二阶段可视化",
+        "第三阶段可视化",
+        "第四阶段可视化",
+    ]
 
 
 def test_replay_put_frame_keeps_remaining_train_cars() -> None:
@@ -80,8 +80,8 @@ def test_replay_put_frame_keeps_remaining_train_cars() -> None:
         }
     }
 
-    rows = app._stage1_response_operation_rows(response)
-    frames = app._p10_build_replay_frames(payload, rows, response)
+    rows = app._response_operation_rows(response)
+    frames = app._replay_build_replay_frames(payload, rows, response)
 
     assert frames[2]["action"] == "Put"
     assert frames[2]["move_cars"] == ["C"]
@@ -111,7 +111,7 @@ def test_truth_payload_loader_supports_truth3_cases() -> None:
         try:
             app.TRUTH2_DIR = truth2
             app.TRUTH3_DIR = truth3
-            loaded = app._stage1_load_truth_payload("0401W")
+            loaded = app._load_truth_payload("0401W")
         finally:
             app.TRUTH2_DIR = original_truth2
             app.TRUTH3_DIR = original_truth3
@@ -149,8 +149,8 @@ def test_stage4_combined_response_builds_full_flow_frames() -> None:
             "GeneratedEndStatus": [{"No": "A", "Line": "预修线", "Position": 1}],
         }
     }
-    operation_rows = app._stage1_response_operation_rows(combined_response)
-    frames = app._p10_build_replay_frames(payload, operation_rows, combined_response)
+    operation_rows = app._response_operation_rows(combined_response)
+    frames = app._replay_build_replay_frames(payload, operation_rows, combined_response)
 
     assert len(frames) == len(operation_rows) + 2
     assert frames[0]["title"] == "初始状态"
@@ -179,3 +179,19 @@ def test_fullflow_stage_boundaries_cover_every_operation() -> None:
 
     assert [row["operationRange"] for row in boundaries] == ["1-2", "3-3", "无", "4-6"]
     assert stage_sequence == ["第一阶段", "第一阶段", "第二阶段", "第四阶段", "第四阶段", "第四阶段"]
+
+
+def test_all_retained_manual_bundles_build_replay_frames() -> None:
+    paths = [Path(path) for path in app._manual_restored_bundle_options()]
+    assert paths
+    assert len(paths) == len(list((app.MANUAL_RESTORE_DIR / "bundles").glob("*.json")))
+
+    for path in paths:
+        bundle = app._read_json_object(path)
+        assert {"Request", "Response", "Summary", "Trace"} <= set(bundle)
+        request = bundle["Request"]
+        response = bundle["Response"]
+        rows = app._manual_response_operation_rows(response)
+        frames = app._replay_build_replay_frames(request, rows, response)
+        assert frames[0]["title"] == "初始状态"
+        assert frames[-1]["action"] == "Final"

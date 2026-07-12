@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import dataclass
@@ -50,12 +49,11 @@ class PipelineOptionError(ValueError):
 class PipelineOptions:
     stage1_max_hooks: int = 80
     stage1_time_budget_seconds: float = 300.0
-    stage1_profile: str = "balanced"
     stage2_time_budget_seconds: float = 300.0
     stage3_time_budget_seconds: float = 180.0
     stage4_time_budget_seconds: float = 300.0
-    stage4_max_macros: int = 160
-    stage4_max_candidates_per_step: int = 96
+    stage4_max_labels: int = 64
+    stage4_max_expansions: int = 30_000
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "PipelineOptions":
@@ -69,13 +67,13 @@ class PipelineOptions:
         if unknown_top:
             raise PipelineOptionError(f"未知 options 字段: {','.join(unknown_top)}")
 
-        stage1 = _option_section(raw, "stage1", {"max_hooks", "time_budget_seconds", "profile"})
+        stage1 = _option_section(raw, "stage1", {"max_hooks", "time_budget_seconds"})
         stage2 = _option_section(raw, "stage2", {"time_budget_seconds"})
         stage3 = _option_section(raw, "stage3", {"time_budget_seconds"})
         stage4 = _option_section(
             raw,
             "stage4",
-            {"time_budget_seconds", "max_macros", "max_candidates_per_step"},
+            {"time_budget_seconds", "max_labels", "max_expansions"},
         )
 
         options = cls(
@@ -85,11 +83,6 @@ class PipelineOptions:
                 "stage1.time_budget_seconds",
                 0.1,
                 900.0,
-            ),
-            stage1_profile=_choice(
-                stage1.get("profile", "balanced"),
-                "stage1.profile",
-                {"baseline", "balanced", "stage3", "stage4"},
             ),
             stage2_time_budget_seconds=_bounded_float(
                 stage2.get("time_budget_seconds", 300.0),
@@ -109,17 +102,17 @@ class PipelineOptions:
                 0.1,
                 900.0,
             ),
-            stage4_max_macros=_bounded_int(
-                stage4.get("max_macros", 160),
-                "stage4.max_macros",
+            stage4_max_labels=_bounded_int(
+                stage4.get("max_labels", 64),
+                "stage4.max_labels",
                 1,
-                500,
+                4096,
             ),
-            stage4_max_candidates_per_step=_bounded_int(
-                stage4.get("max_candidates_per_step", 96),
-                "stage4.max_candidates_per_step",
+            stage4_max_expansions=_bounded_int(
+                stage4.get("max_expansions", 30_000),
+                "stage4.max_expansions",
                 1,
-                256,
+                1_000_000,
             ),
         )
         total_budget = (
@@ -139,14 +132,13 @@ class PipelineOptions:
             "stage1": {
                 "max_hooks": self.stage1_max_hooks,
                 "time_budget_seconds": self.stage1_time_budget_seconds,
-                "profile": self.stage1_profile,
             },
             "stage2": {"time_budget_seconds": self.stage2_time_budget_seconds},
             "stage3": {"time_budget_seconds": self.stage3_time_budget_seconds},
             "stage4": {
                 "time_budget_seconds": self.stage4_time_budget_seconds,
-                "max_macros": self.stage4_max_macros,
-                "max_candidates_per_step": self.stage4_max_candidates_per_step,
+                "max_labels": self.stage4_max_labels,
+                "max_expansions": self.stage4_max_expansions,
             },
         }
 
@@ -192,13 +184,6 @@ def _bounded_float(value: Any, name: str, minimum: float, maximum: float) -> flo
         raise PipelineOptionError(f"{name} 必须是有限数字")
     if parsed < minimum or parsed > maximum:
         raise PipelineOptionError(f"{name} 必须在 {minimum:g} 到 {maximum:g} 之间")
-    return parsed
-
-
-def _choice(value: Any, name: str, choices: set[str]) -> str:
-    parsed = str(value or "")
-    if parsed not in choices:
-        raise PipelineOptionError(f"{name} 必须是: {','.join(sorted(choices))}")
     return parsed
 
 
@@ -621,7 +606,6 @@ def _run_stage1(input_path: Path, options: PipelineOptions) -> dict[str, Any]:
         input_path,
         max_hooks=options.stage1_max_hooks,
         time_budget_seconds=options.stage1_time_budget_seconds,
-        profile=options.stage1_profile,
     ).solve()
 
 
@@ -638,8 +622,6 @@ def _run_stage2(
         request,
         stage1_response,
         time_budget_seconds=options.stage2_time_budget_seconds,
-        allow_depot_in_buffer=False,
-        accept_upper_bound=False,
     ).solve()
 
 
@@ -666,22 +648,19 @@ def _run_stage4(
     stage3_result: dict[str, Any],
     options: PipelineOptions,
 ) -> dict[str, Any]:
-    from stage4_simple.solve import run_solver
+    from stage4_simple.solve import Stage4Solver
 
-    args = argparse.Namespace(
+    return Stage4Solver(
+        case_id,
+        request,
+        depot_assignment,
+        stage3_result["stage3_request"],
+        stage3_result["response"],
+        stage3_result["combined_response"],
         time_budget_seconds=options.stage4_time_budget_seconds,
-        max_macros=options.stage4_max_macros,
-        max_candidates_per_step=options.stage4_max_candidates_per_step,
-    )
-    return run_solver(
-        case_id=case_id,
-        request=request,
-        depot_assignment=depot_assignment,
-        stage3_request=stage3_result["stage3_request"],
-        stage3_response=stage3_result["response"],
-        stage3_combined_response=stage3_result["combined_response"],
-        args=args,
-    )
+        max_labels=options.stage4_max_labels,
+        max_expansions=options.stage4_max_expansions,
+    ).solve()
 
 
 def _call_with_stage_log(

@@ -35,7 +35,6 @@ CAR_NO_PATTERN = re.compile(r"(?<!\d)\d{7}(?!\d)")
 POSITIONING_PATTERN = re.compile(r"(对\d+|顶\d+|连续对位)")
 AMBIGUOUS_LINE_ALIASES = {"存5", "注意存5", "存5线", "库", "注意库"}
 METHODS = {"+", "-", "顶", "称", "代", "外", "回"}
-QUALITY_ORDER = {"clean": 0, "review": 1, "invalid": 2}
 SPOTTING_POSITIONING_LINES = {"调梁棚", "洗罐站", "油漆线", "抛丸线"}
 DEPOT_SHORTHAND_PATTERN = re.compile(r"^(?:注意)?修([1-4])$")
 STORAGE5_ALIASES = {"存5", "注意存5", "存5线"}
@@ -463,9 +462,19 @@ def build_rule_enrichments(
     }
     issues_by_key: dict[str, list[ValidationIssue]] = {}
     graph = physical.TrackGraph()
-    add_issue = lambda operation, code, detail: issues_by_key.setdefault(operation_key(operation), []).append(
-        hook_issue(operation.manual_file, operation.manual_file_id, operation.case_id, operation.hook, "warn", code, detail)
-    )
+
+    def add_issue(operation: ManualOperation, code: str, detail: str) -> None:
+        issues_by_key.setdefault(operation_key(operation), []).append(
+            hook_issue(
+                operation.manual_file,
+                operation.manual_file_id,
+                operation.case_id,
+                operation.hook,
+                "warn",
+                code,
+                detail,
+            )
+        )
 
     previous_line = ""
     for record in records:
@@ -640,9 +649,20 @@ def validate_operation(
     truth_path: Path | None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    add = lambda severity, code, detail: issues.append(
-        hook_issue(operation.manual_file, operation.manual_file_id, operation.case_id, operation.hook, severity, code, detail)
-    )
+
+    def add(severity: str, code: str, detail: str) -> None:
+        issues.append(
+            hook_issue(
+                operation.manual_file,
+                operation.manual_file_id,
+                operation.case_id,
+                operation.hook,
+                severity,
+                code,
+                detail,
+            )
+        )
+
     if not operation.line_raw:
         add("error", "line_missing", "")
     elif line_resolution.status == "unknown":
@@ -1009,7 +1029,10 @@ def build_summary(
     site_alias_counts = Counter(str(row.get("site_confirmed_alias") or "") for row in labels if row.get("site_confirmed_alias"))
     north_head_semantics = Counter(str(row.get("north_head_semantics") or "") for row in labels if row.get("north_head_semantics"))
     air_hose_state = Counter(str(row.get("air_hose_state_status") or "") for row in labels)
-    sum_field = lambda field: sum(int(row.get(field) or 0) for row in labels)
+
+    def sum_field(field: str) -> int:
+        return sum(int(row.get(field) or 0) for row in labels)
+
     return {
         "manual_file_count": len(case_summaries),
         "truth2_matched_file_count": matched,

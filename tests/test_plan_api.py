@@ -14,16 +14,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from plan_api import pipeline
-from plan_api import server
-from plan_api import launcher
-from plan_api.pipeline import (
+from plan_api import launcher  # noqa: E402
+from plan_api import pipeline  # noqa: E402
+from plan_api import server  # noqa: E402
+from plan_api.pipeline import (  # noqa: E402
     PipelineOptionError,
     PipelineOptions,
     atomic_write_json,
     validate_plan_request,
 )
-from plan_api.server import (
+from plan_api.server import (  # noqa: E402
     JobManager,
     ServiceShuttingDownError,
     normalize_case_id,
@@ -52,6 +52,10 @@ def _request(no: str = "1000001") -> dict:
         ],
         "locoNode": {"Line": "机库线", "End": "North"},
     }
+
+
+def _submission(case_id: str = "0101Z") -> dict:
+    return {"case_id": case_id, "request": _request()}
 
 
 def _empty_response() -> dict:
@@ -253,21 +257,51 @@ def test_pipeline_replay_gate_rejects_invalid_downstream_response(tmp_path: Path
     stage4.assert_not_called()
 
 
-def test_options_and_submission_envelope_are_validated() -> None:
+def test_options_and_canonical_submission_are_validated() -> None:
     case_id, request, options = parse_single_submission(
         {
             "case_id": "0104w",
             "request": _request(),
-            "options": {"stage1": {"max_hooks": 120}, "stage4": {"max_macros": 200}},
+            "options": {
+                "stage1": {"max_hooks": 120},
+                "stage4": {"max_labels": 200, "max_expansions": 40_000},
+            },
         }
     )
 
     assert case_id == "0104W"
     assert request["StartStatus"][0]["No"] == "1000001"
     assert options.stage1_max_hooks == 120
-    assert options.stage4_max_macros == 200
+    assert options.stage4_max_labels == 200
+    assert options.stage4_max_expansions == 40_000
 
-    for removed_field in ("portfolio", "heavy_repack_policy", "ranking_mode"):
+    for invalid_submission in (
+        _request(),
+        {"request": _request()},
+        {"case_id": "0104W", "request": _request(), "unknown": True},
+    ):
+        try:
+            parse_single_submission(invalid_submission)
+        except server.ApiProblem as exc:
+            assert exc.status_code == 422
+        else:
+            raise AssertionError(f"non-canonical submission accepted: {invalid_submission!r}")
+
+    try:
+        PipelineOptions.from_mapping({"stage1": {"profile": "balanced"}})
+    except PipelineOptionError as exc:
+        assert "未知 options.stage1 字段" in str(exc)
+    else:
+        raise AssertionError("removed Stage1 profile option accepted")
+
+    for removed_field in (
+        "portfolio",
+        "heavy_repack_policy",
+        "ranking_mode",
+        "max_branches",
+        "max_macros",
+        "max_candidates_per_step",
+    ):
         try:
             PipelineOptions.from_mapping({"stage4": {removed_field: "unused"}})
         except PipelineOptionError as exc:
@@ -317,29 +351,37 @@ def test_options_and_submission_envelope_are_validated() -> None:
 
 def test_stage4_api_invokes_one_structural_solver() -> None:
     expected = _stage4()
+    assignment = object()
+    stage3 = _stage3()
     options = PipelineOptions(
         stage4_time_budget_seconds=123.0,
-        stage4_max_macros=77,
-        stage4_max_candidates_per_step=55,
+        stage4_max_labels=77,
+        stage4_max_expansions=12_345,
     )
 
-    with patch("stage4_simple.solve.run_solver", return_value=expected) as run_solver:
+    with patch("stage4_simple.solve.Stage4Solver") as solver_class:
+        solver_class.return_value.solve.return_value = expected
         result = pipeline._run_stage4(
             "0101Z",
             _request(),
-            object(),
-            _stage3(),
+            assignment,
+            stage3,
             options,
         )
 
     assert result is expected
-    run_solver.assert_called_once()
-    args = run_solver.call_args.kwargs["args"]
-    assert vars(args) == {
-        "time_budget_seconds": 123.0,
-        "max_macros": 77,
-        "max_candidates_per_step": 55,
-    }
+    solver_class.assert_called_once_with(
+        "0101Z",
+        _request(),
+        assignment,
+        stage3["stage3_request"],
+        stage3["response"],
+        stage3["combined_response"],
+        time_budget_seconds=123.0,
+        max_labels=77,
+        max_expansions=12_345,
+    )
+    solver_class.return_value.solve.assert_called_once_with()
 
 
 def test_malformed_nested_input_returns_validation_errors_instead_of_crashing() -> None:
@@ -376,17 +418,15 @@ def test_request_validation_rejects_coercion_prone_field_types() -> None:
     )
 
 
-def test_missing_case_id_is_deterministic_and_job_storage_uses_uuid() -> None:
-    request = _request()
-
-    assert normalize_case_id(None, request) == normalize_case_id(None, request)
-    assert normalize_case_id(None, request).endswith("Z")
-    try:
-        normalize_case_id("٠١٠٤W", request)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("case_id must use ASCII digits")
+def test_case_id_is_required_and_uses_ascii_digits() -> None:
+    assert normalize_case_id("0104w") == "0104W"
+    for invalid in (None, "", "٠١٠٤W"):
+        try:
+            normalize_case_id(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid case_id accepted: {invalid!r}")
 
 
 def test_frozen_runtime_uses_executable_root_and_internal_worker_mode() -> None:
@@ -404,6 +444,18 @@ def test_frozen_runtime_uses_executable_root_and_internal_worker_mode() -> None:
             "--worker",
             str(job_dir),
         ]
+
+
+def test_source_runtime_uses_the_package_worker_entry() -> None:
+    job_dir = Path("/tmp/train-cal-source-job")
+
+    assert server._worker_command(job_dir) == [
+        server.sys.executable,
+        "-m",
+        "plan_api",
+        "--worker",
+        str(job_dir),
+    ]
 
 
 def test_launcher_worker_mode_dispatches_without_starting_uvicorn(tmp_path: Path) -> None:
@@ -1001,8 +1053,8 @@ def test_http_capacity_is_reserved_before_expensive_validation(tmp_path: Path) -
             barrier.wait(timeout=5)
             status, _headers, _body = _asgi_json_request(
                 "POST",
-                "/api/plan/generate?async=true&case_id=0101Z",
-                payload=_request(),
+                "/api/plan/generate?async=true",
+                payload=_submission(),
             )
             with result_lock:
                 results.append(status)
@@ -1064,7 +1116,7 @@ def test_slow_single_request_body_does_not_reserve_job_capacity(tmp_path: Path) 
             await release_body.wait()
             return {
                 "type": "http.request",
-                "body": json.dumps(_request()).encode("utf-8"),
+                "body": json.dumps(_submission()).encode("utf-8"),
                 "more_body": False,
             }
 
@@ -1077,7 +1129,7 @@ def test_slow_single_request_body_does_not_reserve_job_capacity(tmp_path: Path) 
                 "scheme": "http",
                 "path": "/api/plan/generate",
                 "raw_path": b"/api/plan/generate",
-                "query_string": b"async=true&case_id=0101Z",
+                "query_string": b"async=true",
                 "headers": [],
                 "client": ("127.0.0.1", 12345),
                 "server": ("testserver", 80),
@@ -1166,16 +1218,16 @@ def test_http_async_auth_status_result_and_nonstandard_json_rejection(tmp_path: 
 
             status, headers, body = _asgi_json_request(
                 "POST",
-                "/api/plan/generate?async=true&case_id=0101Z",
-                payload=_request(),
+                "/api/plan/generate?async=true",
+                payload=_submission(),
             )
             assert status == 401
             assert headers["cache-control"] == "no-store, private"
 
             status, headers, body = _asgi_json_request(
                 "POST",
-                "/api/plan/generate?async=true&case_id=0101Z",
-                payload=_request(),
+                "/api/plan/generate?async=true",
+                payload=_submission(),
                 headers={"authorization": "Bearer secret"},
             )
             assert status == 202
@@ -1200,7 +1252,7 @@ def test_http_async_auth_status_result_and_nonstandard_json_rejection(tmp_path: 
 
             status, _headers, invalid_body = _asgi_json_request(
                 "POST",
-                "/api/plan/generate?async=true&case_id=0101Z",
+                "/api/plan/generate?async=true",
                 raw_body=b'{"unused": NaN}',
                 headers={"authorization": "Bearer secret"},
             )

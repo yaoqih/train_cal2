@@ -1,124 +1,58 @@
-# stage4_simple
+# Stage4
 
-Stage4 是 Stage3 完成大库主流程后的前场残债闭合器。它读取 Stage3 的最终状态，处理存车、洗油抛、调梁、预修、机区和强台位重排；修 1-4 库目标与卸轮目标仍属于上游阶段契约，不由 Stage4 重新规划。
+Stage4 接管 Stage3 后仍在前场的可行动债务，以有序车辆块、目标窗口、临编 owner
+和拓扑资源租约构造闭合调车 session。
+
+## 活跃模块
+
+- `scope.py`：冻结 active、protected、容量留置和目标合同；
+- `domain.py` / `contracts.py`：闭合 session、临编 owner 和出库重挂合同；
+- `topology.py`：共享区段 gate 与资源闭包；
+- `model.py`：构建来源块、目标窗口、逆序与松弛成本；
+- `search.py`：定义有序 carry 状态和统一物理转移；
+- `construct.py`：生成 source-window 标签边，并维护 owner 栈与恢复租约；
+- `planner.py`：生成 target-window 闭合会话和强制出库重挂 checkpoint；
+- `optimizer.py`：在共享 checkpoint 上执行单一块流标签搜索；
+- `solve.py`：生成证书并执行独立及合并 replay。
+
+合法边只有 `Get(prefix)`、`Put(carry suffix)` 和 `Weigh(tail)`。容量必然留置与
+真实 active residual 分开报告；求解器不使用案例特判、profile、retry 或 fallback。
+
+目标位次分为两层：`Stage4Problem` 保存不可变的物理位次基准和目标 owner 顺序，
+每个 source 标签持有独立 rank ledger。spotting 临编栈使用稠密 owner 序号，只允许
+严格相邻的低位次块前插；物理位置中的空号不会制造假断点，不同标签也不会互相污染。
+当拓扑资源上的阻塞块全部属于同一 active owner 时，资源租约直接转化为该 owner 的
+持续临编栈，后续 source-window 可以在同一列上续挂。
+
+source-window 使用单一自适应标签边界：尚未找到闭合边时最多检查 64 个标签；找到
+普通中间闭合边后保留前 6 个结构标签；进入终局恢复域后检查最多 128 个标签。每个
+checkpoint 最终提交按统一代价排序的 4 条边。该边界是同一标签图的状态分类，不是
+失败后换策略。
 
 ## 运行
 
-默认读取以下 Stage3 产物：
-
-- `<case>_stage3_request.json`
-- `<case>_response.json`
-- `<case>_combined_response.json`
-- `<case>_summary.json`
-
 ```bash
-python scripts/stage4_simple/solve.py data/truth2 \
-  --stage3-out artifacts/four_stage_balanced_early_release_v2/stage3 \
-  --out artifacts/stage4_refactor_single_full_final \
-  --time-budget-seconds 240
+python3 scripts/stage4_simple/solve.py data/truth2 \
+  --stage3-out artifacts/fullflow_current/truth2/stage3 \
+  --out artifacts/fullflow_current/truth2/stage4 \
+  --time-budget-seconds 30 \
+  --max-labels 64 \
+  --max-expansions 30000
 ```
 
-求解器只有一套确定性的 `structural` 策略。每一步只生成一次候选、执行一次物理/业务校验并在同一个排序池中选择；没有第二策略、失败重跑或多结果选优。命令行与 `plan_api` 也只暴露时间、宏数量和候选数量上限。
-
-## 不变量
-
-- `Get`、`Put`、`Weigh` 每条 operation 各计一钩。
-- 全局状态始终闭合；持车只存在于单个 session 内，session 退出时必须清空。
-- 每个候选先经 `physical.validate_candidate` 验证端别、路径、占线、牵引长度、摘挂顺序、容量、台位和业务组窗。
-- 初始已满足车辆受硬保护，不能因后续宏变成未满足。
-- 仍有入线需求的目标线被预约，不能用作持久缓存。
-- 持久 Put 不能新增其他残债车辆的服务路径锁或机车接近锁。
-- `机南/洗油北/机走棚/调梁线北/机北2` 使用单调 gate lease：允许临时取下并原样恢复初始 blocker，但候选结束时不能给仍未关闭的服务族新增 gate 占车。
-- 临存车辆必须能从缓存线再次取出；缓存线不能位于该组从源线到真实目标的中间必经路径上。
-- 对位线 Put 不能埋住多个迁出目标；仅当迁出车辆同目标、目标可接收且清理前缀不超牵引上限时允许可恢复堆叠。
-- 单目标车辆总长超过线路有效长度时，先精确求最少留置辆数，再求其余车辆的可行方案；终止时同时校验留置辆数和留置总长足以覆盖赤字，容量留置不伪装成搜索失败。
-
-这些约束直接使用 `TrackGraph`、当前占线和 Request 目标计算。因此，“抛丸未完成时不能占住机南”“洗南/洗北未完成时不能占住洗油北”“调梁棚未完成时保护调梁线北”等结论来自当前拓扑依赖，不是按案例或车号写死。
-
-## 结构能力
-
-- `service sweep`：从北端取一个可牵前缀，按机后尾端可摘顺序连续送真实目标。
-- `storage shaping`：显式处理存5北到存5南的完整业务段，并把容量留置车辆单独送往中性缓存。
-- `corridor release`：临时取走挡住串联目标的已满足尾段，完成服务后按原结构恢复。
-- `route clearing`：在同一闭合 session 内清理 Get/Put 路径 blocker、完成主服务并恢复临时占线。
-- `target rebuild`：联合目标线既有车和外部来车一次重放，支持强制台位插入。
-- `layout rebuild`：先求最终合法布局，再按连续块分配临停线并重建多个参与线路。
-- `ordered prefix restore`：先取目标既有车，再取“已满足前缀 + 深层目标车”，按深位到浅位回放目标并把前缀恢复原线；典型占用目标由 10 步降到 5 步。
-- `multi-source same-target`：按目标最终位置序，从 2-3 条独立源线连续 Get，目标线只重建一次；总挂车始终受 20 当量约束。
-- `partial drop + continue Get`：先摘首源尾段，保留头段，再取第二源同目标车并合挂，整个 session 最终清空持车。
-- `same-line spotting repack`：对已经在目标线但台位/组窗错误的车辆分块临停、逆序回取和重放。
-- `dirty terminal stack`：普通非通道终端线允许可证明能清理的目标车堆叠；对位线和待用通道不允许。
-- `dynamic target refresh`：多目标车辆按当前容量重新选择等价目标，候选探测和真实接纳使用同一状态语义。
-
-同等结构成本下，评分先比较真实残债下降，再比较路径不可用、目标线污染数量/深度、强台位重建缺陷和阻塞深度。大规模布局重建与直接 sweep 位于同一候选池，但具有更高结构成本，避免为了局部进展无条件整线搬运。
-
-## 全量结果
-
-验证产物：`artifacts/stage4_refactor_single_full_final`
-
-| 指标 | 结果 |
-|---|---:|
-| truth2 案例 | 113 |
-| Stage3 可用 | 109 |
-| Stage3 不可用 | 4 |
-| Stage3 可用且容量可行 | 102 |
-| 完成 | 102/102 |
-| 单目标容量不可行 | 7 |
-| 容量理论最少残车 / 实际残车 | 8 / 8 |
-| 非容量搜索失败 | 0 |
-| complete 平均钩数 | 25.951 |
-| complete 中位数 / P95 / 最大值 | 25 / 46 / 54 |
-| Stage4 replay 硬违反 | 0 |
-| 四阶段 combined replay 硬违反 | 0 |
-
-与旧 `stage4_capability_portfolio_full` 的 88 个已完成案例配对：完成性回退 0，45 例减钩、18 例持平、25 例增钩，合计减少 139 钩，平均每例减少 1.58 钩；另新增 14 个完成案例。当前结果只证明可行性，不声明逐例或全局最少钩。
-
-## 多摘多挂重构验证
-
-本轮使用与 `fullflow_truth23_spotting_parallel_v1` 完全相同的 Stage3 输入，对 truth2 113 例和 truth3 34 例逐例配对。最终产物：
-
-- `artifacts/stage4_multiget_refactor_final_v2_truth2`
-- `artifacts/stage4_multiget_refactor_final_v2_truth3`
-- `artifacts/multi_get_capability_refactor_validation`
-
-| 指标 | truth2 | truth3 | 合计 |
-|---|---:|---:|---:|
-| 案例 | 113 | 34 | 147 |
-| 旧 complete | 98 | 23 | 121 |
-| 新 complete | 102 | 27 | 129 |
-| 新增 complete / 回退 | 4 / 0 | 4 / 0 | 8 / 0 |
-| 新 complete 平均钩数 | 20.696 | 11.889 | - |
-| 新 complete 中位数 / P95 / 最大值 | 21 / 42.8 / 50 | 10 / 25.7 / 34 | - |
-| 旧新均 complete 配对减钩 | 99 | 21 | 120 |
-| 配对减钩 / 持平 / 增钩案例 | 31 / 63 / 4 | 8 / 14 / 1 | 39 / 77 / 5 |
-
-能力分析器在 140 个有 Stage4 response 的案例中识别到：
-
-- `multi_source_same_target_session` 45 个宏、覆盖 39 例，45/45 都是战略性多源，不是 blocker 恢复或目标既有车回取；
-- `partial_drop_continue_get_session` 在 `0421W` 实际命中 1 个 4 钩宏；
-- `ordered_prefix_restore` 命中 16 个宏；原 8 个 protected-prefix 死点全部完成；
-- 独立重放 Stage4 140 次、combined 140 次，`schema/physical/business/state` 硬违反和警告均为 0；另 7 例因 Stage3 已是 partial，没有提交 Stage4 response。
-
-仍有 4 个容量之外的可行动残余案例：truth2 `0309Z`，truth3 `0401W/0421Z/0428Z`。因此本轮结论是“提高可解性并消除已知 protected-prefix 死点”，不是宣称所有容量可行输入已全解。
+`input` 传 JSON 文件时运行单案，传目录时批量运行全部 `validation_*.json`。
+输入不存在或目录中没有案例时直接报错。Stage3 产物缺失或未完成记为
+`unavailable`，Stage4 真正求解未完成记为 `partial`，程序异常记为 `error`；批次中
+存在非 complete 案例时退出码为 1。
 
 ## 验证
 
 ```bash
-python -m py_compile \
-  scripts/stage4_simple/solve.py \
-  scripts/solver_vnext/spotting.py \
-  plan_api/pipeline.py
-
-pytest -q \
-  tests/test_stage4_structural_sessions.py \
-  tests/test_analyze_multi_get_capability.py \
-  tests/test_plan_api.py
-
-python scripts/analyze_multi_get_capability.py \
-  --algorithm-dir artifacts/stage4_multiget_refactor_final_v2 \
-  --output-dir artifacts/multi_get_capability_refactor_validation
-
-python replay_validator.py \
-  artifacts/stage4_refactor_single_full_final/0204Z_response.json \
-  --request artifacts/stage4_refactor_single_full_final/0204Z_stage4_request.json
+python3 -m pytest -q tests/test_stage4_structural_sessions.py tests/test_plan_api.py
 ```
+
+冻结的 truth2/truth3 共 140 例最终产物位于
+`artifacts/stage4_block_flow_final`。当前结果为 140/140 可行动闭合，总计 2464 勾，
+平均 17.600 勾；同起点基准为 2543 勾、平均 18.164 勾，逐例无增勾。独立 replay、
+combined replay、pending gate staging、owner 位次链、未回收租约均为 0 违规，峰值
+牵引当量为 20。

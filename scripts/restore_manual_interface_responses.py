@@ -13,9 +13,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import generate_manual_action_labels as manual_labels
-import replay_manual_identity_labels as manual_replay
-from solver_vnext import physical
+import generate_manual_action_labels as manual_labels  # noqa: E402
+import replay_manual_identity_labels as manual_replay  # noqa: E402
+from solver_vnext import physical  # noqa: E402
 
 
 PASSING_RESTORE_STATUSES = {"restored", "noop", "weigh_restored"}

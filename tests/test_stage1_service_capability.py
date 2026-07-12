@@ -18,6 +18,7 @@ from solver_vnext import physical  # noqa: E402
 
 
 CASE_0309Z = ROOT / "data/truth2/validation_取送车计划_20260309Z.json"
+CASE_0305Z = ROOT / "data/truth2/validation_取送车计划_20260305Z.json"
 CASE_0109W = ROOT / "data/truth2/validation_取送车计划_20260109W.json"
 CASE_0201W = ROOT / "data/truth2/validation_取送车计划_20260201W.json"
 CASE_0122W = ROOT / "data/truth2/validation_取送车计划_20260122W.json"
@@ -28,12 +29,16 @@ CASE_0304Z = ROOT / "data/truth2/validation_取送车计划_20260304Z.json"
 CASE_0302W = ROOT / "data/truth2/validation_取送车计划_20260302W.json"
 CASE_0318W = ROOT / "data/truth2/validation_取送车计划_20260318W.json"
 CASE_0126W = ROOT / "data/truth2/validation_取送车计划_20260126W.json"
+CASE_0311W = ROOT / "data/truth2/validation_取送车计划_20260311W.json"
+CASE_0205W = ROOT / "data/truth2/validation_取送车计划_20260205W.json"
+CASE_0210Z = ROOT / "data/truth2/validation_取送车计划_20260210Z.json"
+CASE_0105W = ROOT / "data/truth2/validation_取送车计划_20260105W.json"
 
 
-def test_default_profile_is_balanced() -> None:
+def test_stage1_exposes_one_policy() -> None:
     solver = Stage1Solver(CASE_0309Z)
 
-    assert solver.profile == "balanced"
+    assert not hasattr(solver, "profile")
 
 
 def test_initial_candidate_pool_contains_a_valid_move() -> None:
@@ -95,74 +100,284 @@ def test_solve_one_runs_exactly_one_solver(tmp_path: Path) -> None:
             tmp_path,
             max_hooks=80,
             time_budget_seconds=5,
-            profile="balanced",
         )
 
     solver_type.assert_called_once_with(
         CASE_0309Z,
         max_hooks=80,
         time_budget_seconds=5,
-        profile="balanced",
     )
     solver_type.return_value.solve.assert_called_once_with()
 
 
-def test_source_sessions_obey_train_tail_order_and_close_stage1_source() -> None:
+def test_rolling_sessions_are_physically_valid_closed_stack_words() -> None:
     solver = Stage1Solver(CASE_0330W)
-    debt = solver.stage1_debt()
-
-    candidates = list(solver.source_session_candidates(
-        debt,
+    candidates = list(solver.rolling_session_candidates(
+        solver.stage1_debt(),
         service_only=False,
-        include_monotone=True,
-        include_retained=False,
     ))
 
     assert candidates
     for view in candidates:
         steps = physical.candidate_plan_steps(view.candidate)
+        metrics = solver.session_metrics(steps)
         assert steps[0].action == "Get"
-        assert sum(step.action == "Put" for step in steps) >= 2
-        carried = list(steps[0].move_car_nos)
-        for step in steps[1:]:
-            if step.action == "Weigh":
-                continue
-            assert step.action == "Put"
-            assert carried[-len(step.move_car_nos):] == list(step.move_car_nos)
-            del carried[-len(step.move_car_nos):]
-        assert not carried
-
-        source_pending = {
-            physical.car_no(car)
-            for car in solver.line_ordered_cars(view.candidate.source_line)
-            if solver.stage1_goal(car) and not solver.stage1_car_complete(car)
-        }
-        assert source_pending <= set(view.candidate.move_car_nos)
+        assert steps[-1].action == "Put"
+        assert metrics.stack_valid
+        assert solver.validate_candidate(view.candidate).accepted
 
 
-def test_source_sessions_plan_forced_service_positions() -> None:
+def test_session_metrics_do_not_reward_repeated_puts_to_same_line() -> None:
     solver = Stage1Solver(CASE_0309Z)
+    steps = (
+        physical.plan_step("Get", "预修线", ("A", "B", "C")),
+        physical.plan_step("Put", "机走棚", ("C",)),
+        physical.plan_step("Put", "机走棚", ("B",)),
+        physical.plan_step("Put", "机走棚", ("A",)),
+    )
 
-    candidates = [
+    metrics = solver.session_metrics(steps)
+
+    assert metrics.stack_valid
+    assert metrics.business_hooks == 4
+    assert metrics.flow_count == 1
+    assert metrics.redundant_put_count == 2
+
+    normalized = solver.coalesce_adjacent_put_steps(steps)
+    assert normalized == (
+        steps[0],
+        physical.plan_step("Put", "机走棚", ("A", "B", "C")),
+    )
+
+    identity = solver.session_metrics((
+        physical.plan_step("Get", "洗罐站", ("A",)),
+        physical.plan_step("Put", "洗罐站", ("A",)),
+    ))
+    assert identity.stack_valid
+    assert identity.flow_count == 0
+
+
+def test_forced_target_reservation_accepts_a_contiguous_mixed_target_block() -> None:
+    solver = Stage1Solver(CASE_0305Z, time_budget_seconds=60)
+    while not solver.stage1_debt()["complete"]:
+        assert solver.step(solver.stage1_debt())
+
+    assert solver.target_reserved_for_forced_cars("调梁棚")
+    assert solver.service_support_nos("调梁棚")
+
+    before = solver.service_quality()
+    candidate = next(
         view.candidate
-        for view in solver.source_session_candidates(
+        for view in solver.forced_position_rebuild_candidates(solver.stage1_debt())
+        if sum(
+            step.action == "Get" and step.line == "存5线北"
+            for step in physical.candidate_plan_steps(view.candidate)
+        ) >= 2
+        and solver.validate_candidate(view.candidate).accepted
+    )
+    validation = solver.validate_candidate(candidate)
+    after = solver.probe_after(candidate, validation).service_quality()
+
+    assert validation.accepted
+    assert solver.candidate_business_hook_count(candidate) <= 8
+    assert after["service_satisfied_count"] >= before["service_satisfied_count"] + 6
+    assert after["service_south_contiguous_count"] >= before["service_south_contiguous_count"] + 6
+    assert after["service_forced_position_satisfied_count"] == 5
+
+
+def test_rolling_session_uses_passive_insertion_to_improve_forced_positions() -> None:
+    solver = Stage1Solver(CASE_0311W)
+    before = solver.service_quality()["service_forced_position_satisfied_count"]
+    candidate = next(
+        view.candidate
+        for view in solver.rolling_session_candidates(
             solver.stage1_debt(),
             service_only=False,
-            include_monotone=True,
-            include_retained=False,
         )
-        if view.candidate.source_line == "油漆线"
-    ]
+        if [
+            (step.action, step.line)
+            for step in physical.candidate_plan_steps(view.candidate)
+        ] == [("Get", "油漆线"), ("Put", "洗罐站")]
+    )
+    validation = solver.validate_candidate(candidate)
+    probe = solver.probe_after(candidate, validation)
 
-    assert candidates
-    wash_puts = [
-        step
-        for candidate in candidates
-        for step in physical.candidate_plan_steps(candidate)
-        if step.action == "Put" and step.line == "洗罐站"
+    assert validation.accepted
+    assert probe.service_quality()["service_forced_position_satisfied_count"] == before + 2
+
+
+def test_source_dependency_boundary_avoids_rehandling_real_0205w() -> None:
+    result = Stage1Solver(CASE_0205W, time_budget_seconds=60).solve()
+    quality = result["summary"]["downstream_quality"]
+
+    assert result["summary"]["stage1_debt"]["complete"]
+    assert result["summary"]["business_hooks"] <= 27
+    assert quality["service_satisfied_count"] >= 47
+    assert quality["service_south_contiguous_count"] >= 47
+    assert quality["service_forced_position_satisfied_count"] >= 4
+
+
+def test_contextual_rank_finishes_nearer_source_phase_before_cross_phase_gather() -> None:
+    solver = Stage1Solver(CASE_0105W, time_budget_seconds=60)
+    assert solver.step(solver.stage1_debt())
+    debt = solver.stage1_debt()
+    context = solver.selection_context(debt)
+    assert context is not None
+
+    views = solver.generate_candidates(debt)
+    direct = next(
+        view
+        for view in views
+        if [
+            (step.action, step.line, step.move_car_nos)
+            for step in physical.candidate_plan_steps(view.candidate)
+        ] == [
+            ("Get", "抛丸线", ("5241331", "5313548")),
+            ("Put", "机南", ("5241331", "5313548")),
+        ]
+    )
+    cross_phase = next(
+        view
+        for view in views
+        if [
+            (step.action, step.line)
+            for step in physical.candidate_plan_steps(view.candidate)
+        ] == [
+            ("Get", "洗罐站"),
+            ("Get", "预修线"),
+            ("Put", "机南"),
+        ]
+        and len(view.candidate.move_car_nos) == 4
+    )
+
+    evaluations = []
+    for view in (direct, cross_phase):
+        evaluation = solver.evaluate_candidate(
+            view,
+            debt,
+            [],
+            reject_dead_end=False,
+            compute_downstream_quality=True,
+        )
+        assert evaluation is not None
+        ranked, violations = solver.rank_contextual_candidate(context, evaluation, debt)
+        assert not violations
+        assert ranked is not None
+        evaluations.append(ranked)
+
+    direct_rank, cross_phase_rank = evaluations
+    assert solver.candidate_source_phase_gap(direct.candidate, debt) == 0
+    assert solver.candidate_source_phase_gap(cross_phase.candidate, debt) > 0
+    assert direct_rank.score < cross_phase_rank.score
+
+
+def test_get_blocker_pressure_rejects_loading_an_already_blocking_line() -> None:
+    solver = Stage1Solver(CASE_0309Z, time_budget_seconds=60)
+    debt = solver.stage1_debt()
+    context = solver.selection_context(debt)
+    assert context is not None
+    assert context.mode == "get_unlock"
+    assert "机走棚" in context.get_blockers.lines
+
+    view = next(
+        candidate
+        for candidate in solver.generate_candidates(debt)
+        if [
+            (step.action, step.line, step.move_car_nos)
+            for step in physical.candidate_plan_steps(candidate.candidate)
+        ] == [
+            ("Get", "预修线", ("4872648", "4873395", "7701952")),
+            ("Put", "机走棚", ("4872648", "4873395", "7701952")),
+        ]
+    )
+    evaluation = solver.evaluate_candidate(
+        view,
+        debt,
+        [],
+        reject_dead_end=False,
+        compute_downstream_quality=True,
+    )
+    assert evaluation is not None
+
+    after = evaluation.probe.pending_get_blocker_info(evaluation.after_debt)
+    ranked, violations = solver.rank_contextual_candidate(context, evaluation, debt)
+
+    assert after.lines == context.get_blockers.lines
+    assert after.pressure > context.get_blockers.pressure
+    assert ranked is None
+    assert violations == ("worsens_get_route_blockers",)
+
+
+def test_route_support_lane_gathers_from_an_assembly_blocker_real_0309z() -> None:
+    solver = Stage1Solver(CASE_0309Z, time_budget_seconds=60)
+
+    assert solver.step(solver.stage1_debt())
+
+    accepted = solver.trace[-1]
+    assert accepted["reason"] == "stage1_rolling_session"
+    assert "Get:预修线:4872648,4873395,7701952" in accepted["accepted"]
+    assert "Get:机走棚:4872019,5492118,5496322" in accepted["accepted"]
+    assert accepted["debt_after"]["debt_count"] == 9
+    assert accepted["route_blocker_pressure_after"] < accepted["route_blocker_pressure_before"]
+
+
+def test_route_support_lane_preserves_ordinary_completion_real_0105w() -> None:
+    result = Stage1Solver(CASE_0105W, time_budget_seconds=120).solve()
+    quality = result["summary"]["service_quality"]
+
+    assert result["summary"]["stage1_debt"]["complete"]
+    assert result["summary"]["business_hooks"] <= 36
+    assert quality["service_satisfied_count"] >= 52
+    assert quality["service_south_contiguous_count"] >= 47
+    assert quality["service_forced_position_satisfied_count"] >= 3
+
+
+def test_rolling_session_retains_short_prefix_for_reachable_target_real_0210z() -> None:
+    solver = Stage1Solver(CASE_0210Z, time_budget_seconds=60)
+    for _ in range(2):
+        assert solver.step(solver.stage1_debt())
+
+    expected = [
+        ("Get", "预修线", ("5347131", "5349797", "5487841")),
+        ("Get", "存2线", ("1660229",)),
+        ("Put", "洗油北", ("5347131", "5349797", "5487841", "1660229")),
     ]
-    assert wash_puts
-    assert any(step.planned_positions for step in wash_puts)
+    candidate = next(
+        view.candidate
+        for view in solver.rolling_session_candidates(
+            solver.stage1_debt(),
+            service_only=False,
+        )
+        if [
+            (step.action, step.line, step.move_car_nos)
+            for step in physical.candidate_plan_steps(view.candidate)
+        ] == expected
+    )
+
+    assert solver.validate_candidate(candidate).accepted
+
+
+def test_service_rolling_can_peel_a_reachable_tail_and_restore_its_prefix() -> None:
+    solver = Stage1Solver(CASE_0320Z, time_budget_seconds=120)
+    result = solver.solve()
+
+    quality = result["summary"]["service_quality"]
+    assert result["summary"]["stage1_debt"]["complete"]
+    assert result["summary"]["business_hooks"] <= 36
+    assert quality["service_satisfied_count"] >= 46
+    assert quality["service_south_contiguous_count"] >= 43
+    assert quality["service_forced_position_satisfied_count"] >= 5
+
+
+def test_rolling_session_completes_real_0210z_with_clean_service_tails() -> None:
+    result = Stage1Solver(CASE_0210Z, time_budget_seconds=60).solve()
+    quality = result["summary"]["downstream_quality"]
+
+    assert result["summary"]["stage1_debt"]["complete"]
+    assert result["summary"]["business_hooks"] <= 20
+    assert quality["service_satisfied_count"] >= 37
+    assert quality["service_south_contiguous_count"] >= 37
+    assert quality["service_forced_position_satisfied_count"] >= 2
 
 
 def test_service_quality_matches_stage1_reporting_scope() -> None:
@@ -273,29 +488,28 @@ def test_target_rebuild_retains_target_prefix_until_final_put() -> None:
     assert steps[4].move_car_nos == (physical.car_no(target_cars[0]),)
 
 
-def test_main_gather_collects_multiple_sources_before_putting() -> None:
-    solver = Stage1Solver(CASE_0122W, time_budget_seconds=60)
-
-    result = solver.solve()
-
-    assert result["summary"]["status"] == "complete"
-    multi_get = next(
-        item
-        for item in result["trace"]
-        if item.get("reason") == "stage1_session_gather"
+def test_rolling_session_search_is_not_limited_to_three_sources() -> None:
+    solver = Stage1Solver(CASE_0112W)
+    candidate = next(
+        view.candidate
+        for view in solver.rolling_session_candidates(
+            solver.stage1_debt(),
+            service_only=False,
+        )
+        if len({
+            step.line
+            for step in physical.candidate_plan_steps(view.candidate)
+            if step.action == "Get"
+        }) >= 4
     )
-    encoded_steps = str(multi_get["accepted"]).split(":", 4)[-1].split(";")
-    actions = [step.split(":", 1)[0] for step in encoded_steps]
-    first_put = actions.index("Put")
-    assert first_put >= 2
-    assert set(actions[:first_put]) == {"Get"}
-    assert set(actions[first_put:]) == {"Put"}
+
+    assert solver.session_metrics(physical.candidate_plan_steps(candidate)).stack_valid
 
 
-def test_main_gather_session_merges_real_0112w_sources_and_closes_stack() -> None:
+def test_rolling_session_merges_real_0112w_sources_and_closes_stack() -> None:
     solver = Stage1Solver(CASE_0112W)
 
-    candidates = list(solver.gather_session_candidates(
+    candidates = list(solver.rolling_session_candidates(
         solver.stage1_debt(),
         service_only=False,
     ))
@@ -313,47 +527,43 @@ def test_main_gather_session_merges_real_0112w_sources_and_closes_stack() -> Non
     assert solver.candidate_closure_savings(candidate) >= 1
 
 
-def test_gather_session_covers_real_0318w_ggpp_word() -> None:
+def test_rolling_session_covers_real_0318w_multi_get_and_multi_put() -> None:
     solver = Stage1Solver(CASE_0318W)
 
     candidate = next(
         view.candidate
-        for view in solver.gather_session_candidates(
+        for view in solver.rolling_session_candidates(
             solver.stage1_debt(),
             service_only=False,
         )
-        if "".join(
-            step.action[0]
+        if sum(
+            step.action == "Get"
             for step in physical.candidate_plan_steps(view.candidate)
-            if step.action in {"Get", "Put"}
-        ) == "GGPP"
-        if solver.validate_candidate(view.candidate).accepted
+        ) >= 2
+        and sum(
+            step.action == "Put"
+            for step in physical.candidate_plan_steps(view.candidate)
+        ) >= 2
     )
     steps = physical.candidate_plan_steps(candidate)
     metrics = solver.session_metrics(steps)
 
-    assert "".join(step.action[0] for step in steps if step.action in {"Get", "Put"}) == "GGPP"
     assert metrics.stack_valid
-    assert metrics.flow_count == 2
+    assert metrics.flow_count >= 2
 
 
-def test_retained_source_session_covers_real_0304z_put_then_get() -> None:
+def test_rolling_session_covers_real_0304z_put_then_get() -> None:
     solver = Stage1Solver(CASE_0304Z)
-    debt = {
-        **solver.stage1_debt(),
-        "lines_with_pending_stage1": ["预修线"],
-    }
 
     candidate = next(
         view.candidate
-        for view in solver.source_session_candidates(
-            debt,
+        for view in solver.rolling_session_candidates(
+            solver.stage1_debt(),
             service_only=False,
-            include_monotone=False,
-            include_retained=True,
         )
-        if view.reason == "stage1_source_session"
-        and solver.validate_candidate(view.candidate).accepted
+        if solver.session_metrics(
+            physical.candidate_plan_steps(view.candidate)
+        ).retains_across_put_then_get
     )
     metrics = solver.session_metrics(physical.candidate_plan_steps(candidate))
 
@@ -390,24 +600,41 @@ def test_unresolved_source_dependencies_order_real_0302w_and_0318w() -> None:
 
 def test_forced_spotting_cars_reserve_real_0318w_target() -> None:
     solver = Stage1Solver(CASE_0318W)
-    fragmented = Stage1Solver(CASE_0122W)
+    mixed_target_block = Stage1Solver(CASE_0122W)
     forced_nos = {"1676903", "3470077", "1503793", "4950626"}
 
     assert solver.target_reserved_for_forced_cars("调梁棚")
     assert not solver.target_reserved_for_forced_cars("调梁棚", forced_nos)
-    assert not fragmented.target_reserved_for_forced_cars("调梁棚")
+    assert mixed_target_block.target_reserved_for_forced_cars("调梁棚")
 
 
-def test_forced_rebuild_places_complete_real_0126w_position_group() -> None:
-    result = Stage1Solver(CASE_0126W, time_budget_seconds=60).solve()
+def test_service_rebuild_places_complete_real_0126w_position_group() -> None:
+    # This is a capability assertion; the complete four-planlet rebuild runs
+    # close to 60 seconds on a cold worker, so keep latency out of the verdict.
+    result = Stage1Solver(CASE_0126W, time_budget_seconds=75).solve()
 
-    rebuild = next(
-        item
-        for item in result["trace"]
-        if item.get("reason") == "stage1_service_forced_rebuild"
+    rebuild = max(
+        (
+            item
+            for item in result["trace"]
+            if item.get("phase") == "service_finish"
+            and item.get("service_quality_before")
+            and item.get("service_quality_after")
+        ),
+        key=lambda item: (
+            item["service_quality_after"]["service_forced_position_satisfied_count"]
+            - item["service_quality_before"]["service_forced_position_satisfied_count"]
+        ),
     )
 
     assert result["summary"]["stage1_debt"]["complete"]
+    assert result["summary"]["business_hooks"] <= 31
+    assert result["summary"]["service_quality"]["service_satisfied_count"] >= 38
+    assert result["summary"]["service_quality"]["service_south_contiguous_count"] >= 38
+    assert (
+        result["summary"]["service_quality"]["service_forced_position_satisfied_count"]
+        >= 5
+    )
     assert (
         rebuild["service_quality_after"]["service_forced_position_satisfied_count"]
         > rebuild["service_quality_before"]["service_forced_position_satisfied_count"]

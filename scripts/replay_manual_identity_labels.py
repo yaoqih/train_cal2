@@ -47,7 +47,10 @@ class ReplayCandidate:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay cleaned manual labels against truth2 car identities.")
     parser.add_argument("--root", default=".")
-    parser.add_argument("--label-dir", default="artifacts/manual_label_cleaning_20260702")
+    parser.add_argument(
+        "--label-dir",
+        default="artifacts/manual_restored_interface/_labels",
+    )
     parser.add_argument("--truth-dir", default="data/truth2")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-states", type=int, default=512)
