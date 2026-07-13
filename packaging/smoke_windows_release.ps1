@@ -17,7 +17,8 @@ $listener.Start()
 $Port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
 $listener.Stop()
 
-$env:TRAIN_CAL_API_KEY = "release-smoke-secret"
+Remove-Item Env:TRAIN_CAL_API_KEY -ErrorAction SilentlyContinue
+$env:TRAIN_CAL_ALLOW_UNAUTHENTICATED = "true"
 $env:TRAIN_CAL_API_WORKERS = "2"
 $env:TRAIN_CAL_API_MAX_PENDING = "4"
 $env:TRAIN_CAL_API_JOB_ROOT = Join-Path $SmokeRoot "jobs"
@@ -83,11 +84,9 @@ try {
   }
 }
 '@
-    $headers = @{ Authorization = "Bearer release-smoke-secret" }
     $result = Invoke-RestMethod `
         -Method Post `
         -Uri "$BaseUrl/api/plan/generate" `
-        -Headers $headers `
         -ContentType "application/json; charset=utf-8" `
         -Body $Body `
         -TimeoutSec 30

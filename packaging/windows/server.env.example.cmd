@@ -1,5 +1,5 @@
 @echo off
-set "TRAIN_CAL_API_KEY=replace-with-a-long-random-secret"
+set "TRAIN_CAL_ALLOW_UNAUTHENTICATED=true"
 set "TRAIN_CAL_API_WORKERS=1"
 set "TRAIN_CAL_API_MAX_PENDING=4"
 set "TRAIN_CAL_API_PORT=8000"
