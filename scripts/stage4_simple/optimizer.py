@@ -3,12 +3,13 @@ from __future__ import annotations
 import heapq
 import time
 from collections import Counter
-from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import count
 
 from .construct import SourceWindowGenerator, SourceWindowResult
+from .contracts import mandatory_rehook_prefix_hooks
 from .domain import ContractStatus
+from .episode import OpenCarryEpisodeOptimizer
 from .planner import (
     ContractPlanner,
     PlanningCheckpoint,
@@ -22,8 +23,9 @@ from .search import OperationTransitions, Stage4Problem
 @dataclass(frozen=True)
 class OptimizationConfig:
     time_budget_seconds: float = 300.0
-    max_labels: int = 64
+    max_labels: int = 128
     max_expansions: int = 30_000
+    episode_max_labels: int = 8_192
 
 
 @dataclass(frozen=True)
@@ -36,24 +38,32 @@ class OptimizationResult:
 
 
 class BlockFlowOptimizer:
-    """Shortest-path search over closed target/source-window sessions."""
+    """Label-setting search over block-flow episodes."""
 
-    MAX_SOURCE_EDGES = 4
-    FAST_SOURCE_ATTEMPTS = 6
-    MAX_SOURCE_ATTEMPTS = 64
-    MAX_TERMINAL_SOURCE_ATTEMPTS = 128
+    SOURCE_LABEL_BUDGET = 16
+    FRAGMENTED_SOURCE_RUN_THRESHOLD = 7
+    COMPLETE_SCREEN_LABELS = 1
 
     def __init__(self, problem: Stage4Problem, config: OptimizationConfig) -> None:
         self.problem = problem
         self.config = config
         self.transitions = OperationTransitions(problem)
+        self.mandatory_get_prefix_hooks = 0
+        self.deadline: float | None = None
+        self.fragmented_initial_signature: tuple | None = None
 
     def solve(self) -> OptimizationResult:
         started = time.monotonic()
         deadline = started + self.config.time_budget_seconds
+        self.deadline = deadline
         head = ContractPlanner(self.problem, self._planning_config(deadline))
         head.resolve_depot_rehook()
         initial = head.builder.checkpoint()
+        self.mandatory_get_prefix_hooks = mandatory_rehook_prefix_hooks(
+            self.problem,
+            initial.node.steps,
+        )
+        self._initialize_source_budget(initial)
         if initial.node.state.carried_order or initial.stacks or initial.leases:
             raise PlanningFailure("depot_rehook_checkpoint_not_closed")
 
@@ -83,6 +93,11 @@ class BlockFlowOptimizer:
 
             if self._complete(checkpoint):
                 feasible_labels += 1
+                checkpoint = self._refine_complete(
+                    checkpoint,
+                    self.COMPLETE_SCREEN_LABELS,
+                    include_aligned_macros=False,
+                )
                 if (
                     best_complete is None
                     or checkpoint.node.cost < best_complete.node.cost
@@ -117,17 +132,29 @@ class BlockFlowOptimizer:
                 best_cost[successor_signature] = successor.node.cost
                 if self._complete(successor):
                     feasible_labels += 1
+                    successor = self._refine_complete(
+                        successor,
+                        self.COMPLETE_SCREEN_LABELS,
+                        include_aligned_macros=False,
+                    )
                     if (
                         best_complete is None
                         or successor.node.cost < best_complete.node.cost
                     ):
                         best_complete = successor
+                    continue
                 heapq.heappush(frontier, (
                     self._priority(successor),
                     next(serial),
                     successor,
                 ))
 
+        if best_complete is not None:
+            best_complete = self._refine_complete(
+                best_complete,
+                self.config.episode_max_labels,
+                include_aligned_macros=True,
+            )
         chosen = best_complete or best_partial
         reason = "complete" if best_complete is not None else self._failure_reason(rejected)
         return OptimizationResult(
@@ -136,6 +163,61 @@ class BlockFlowOptimizer:
             feasible_labels=feasible_labels,
             elapsed_seconds=round(time.monotonic() - started, 3),
             stop_reason=stop_reason,
+        )
+
+    def _refine_complete(
+        self,
+        checkpoint: PlanningCheckpoint,
+        max_labels: int,
+        *,
+        include_aligned_macros: bool,
+    ) -> PlanningCheckpoint:
+        episode = OpenCarryEpisodeOptimizer(
+            self.problem,
+            self.transitions,
+            mandatory_get_prefix_hooks=self.mandatory_get_prefix_hooks,
+            max_labels=max_labels,
+            deadline=self.deadline,
+            include_aligned_macros=include_aligned_macros,
+        ).optimize(checkpoint.node)
+        summary = {
+            "event": "episode_search_summary",
+            "evaluated_paths": episode.evaluated_paths,
+            "label_budget_exhausted": episode.label_budget_exhausted,
+            "time_budget_exhausted": episode.time_budget_exhausted,
+        }
+        if episode.node.cost >= checkpoint.node.cost:
+            return PlanningCheckpoint(
+                node=checkpoint.node,
+                contracts=checkpoint.contracts,
+                stacks=checkpoint.stacks,
+                leases=checkpoint.leases,
+                trace=(*checkpoint.trace, summary),
+                expansions=checkpoint.expansions + episode.evaluated_paths,
+                goal_owners=checkpoint.goal_owners,
+            )
+        return PlanningCheckpoint(
+            node=episode.node,
+            contracts=checkpoint.contracts,
+            stacks=checkpoint.stacks,
+            leases=checkpoint.leases,
+            trace=(
+                *checkpoint.trace,
+                summary,
+                *(
+                    {
+                        "event": "episode_contraction",
+                        "kind": contraction.kind,
+                        "removed_hooks": contraction.removed_hooks,
+                        "retained_cars": list(contraction.retained_cars),
+                        "start_hook": contraction.start_hook,
+                        "end_hook": contraction.end_hook,
+                    }
+                    for contraction in episode.contractions
+                ),
+            ),
+            expansions=checkpoint.expansions + episode.evaluated_paths,
+            goal_owners=checkpoint.goal_owners,
         )
 
     def _target_edge(
@@ -165,7 +247,7 @@ class BlockFlowOptimizer:
         ]
         while (
             frontier
-            and len(evaluated) < self._source_attempt_limit(accepted.values())
+            and len(evaluated) < self._source_label_budget(checkpoint)
         ):
             _rank, choices = heapq.heappop(frontier)
             if choices in evaluated:
@@ -192,30 +274,40 @@ class BlockFlowOptimizer:
             accepted.values(),
             key=self._priority,
         )
-        return ranked[: self.MAX_SOURCE_EDGES], rejected
+        return ranked, rejected
 
-    def _source_attempt_limit(
-        self,
-        accepted: Iterable[PlanningCheckpoint],
-    ) -> int:
-        closed = tuple(accepted)
-        if any(self._terminal_recovery_reachable(edge) for edge in closed):
-            return self.MAX_TERMINAL_SOURCE_ATTEMPTS
-        if closed:
-            return self.FAST_SOURCE_ATTEMPTS
-        return self.MAX_SOURCE_ATTEMPTS
-
-    def _terminal_recovery_reachable(
+    def _source_label_budget(
         self,
         checkpoint: PlanningCheckpoint,
-    ) -> bool:
+    ) -> int:
         pending = self.problem.unsatisfied_active(checkpoint.node.state)
         staged = {
             no
             for _line, stack in checkpoint.stacks
             for no in stack.nos
         }
-        return pending <= staged
+        terminal_recovery = bool(pending and pending <= staged)
+        fragmented_initial = (
+            self.fragmented_initial_signature is not None
+            and self._signature(checkpoint) == self.fragmented_initial_signature
+        )
+        if terminal_recovery or fragmented_initial:
+            return self.config.max_labels
+        return min(self.SOURCE_LABEL_BUDGET, self.config.max_labels)
+
+    def _initialize_source_budget(
+        self,
+        checkpoint: PlanningCheckpoint,
+    ) -> None:
+        source_lines, max_owner_runs = self.problem.source_fragmentation(
+            checkpoint.node.state
+        )
+        self.fragmented_initial_signature = (
+            self._signature(checkpoint)
+            if source_lines == 1
+            and max_owner_runs >= self.FRAGMENTED_SOURCE_RUN_THRESHOLD
+            else None
+        )
 
     def _run_source_edge(
         self,
@@ -310,10 +402,12 @@ class BlockFlowOptimizer:
     def _priority(self, checkpoint: PlanningCheckpoint) -> tuple:
         state = checkpoint.node.state
         return (
-            len(self.problem.unsatisfied_active(state)),
             checkpoint.node.cost.hooks + self.problem.hook_lower_bound(state),
+            checkpoint.node.cost.hooks
+            + self.problem.ordered_block_estimate(state),
             len(checkpoint.leases),
             checkpoint.node.cost,
+            len(self.problem.unsatisfied_active(state)),
         )
 
     def _partial_rank(self, checkpoint: PlanningCheckpoint) -> tuple:
@@ -327,6 +421,9 @@ class BlockFlowOptimizer:
     def _signature(self, checkpoint: PlanningCheckpoint) -> tuple:
         return (
             self.problem.physical_signature(checkpoint.node.state),
+            checkpoint.node.handled_nos,
+            checkpoint.node.target_windows,
+            checkpoint.node.carry_origins,
             tuple(
                 (line, stack.owner, stack.nos)
                 for line, stack in checkpoint.stacks

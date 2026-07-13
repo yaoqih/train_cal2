@@ -68,6 +68,36 @@ def classify_depot_rehook(problem: Stage4Problem) -> DepotRehookContract:
     )
 
 
+def mandatory_rehook_prefix_hooks(
+    problem: Stage4Problem,
+    steps: tuple[physical.PlanStep, ...],
+) -> int:
+    """Return the immutable prefix ending at the required first acquisitions."""
+
+    contract = classify_depot_rehook(problem)
+    required = tuple(
+        (line, move)
+        for line, move in (
+            ("存4线", contract.c4_backbone),
+            ("卸轮线", contract.unload_prefix),
+        )
+        if move
+    )
+    cursor = 0
+    for line, move in required:
+        match = next((
+            index
+            for index in range(cursor, len(steps))
+            if steps[index].action == "Get"
+            and steps[index].line == line
+            and steps[index].move_car_nos == move
+        ), None)
+        if match is None:
+            raise ValueError(f"mandatory rehook acquisition missing:{line}")
+        cursor = match + 1
+    return cursor
+
+
 def build_contract_graph(problem: Stage4Problem) -> ContractGraph:
     rehook = classify_depot_rehook(problem)
     contracts: list[FlowContract] = [FlowContract(

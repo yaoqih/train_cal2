@@ -146,12 +146,18 @@ def main() -> None:
 
 def compare_all(manual_dir: Path, solver_dir: Path, truth_dir: Path) -> list[dict[str, Any]]:
     case_summary_rows = read_csv(manual_dir / "manual_restore_case_summary.csv")
-    successful = [row for row in case_summary_rows if row.get("success") == "1"]
     truth_by_case = {
         physical.case_id_from_path(path): path
         for path in truth_dir.glob("*.json")
     }
     inbound_cases = _initial_depot_inbound_debt(truth_dir)
+    successful = [
+        row
+        for row in case_summary_rows
+        if row.get("success") == "1"
+        and row.get("case_id") in truth_by_case
+        and row.get("case_id") in inbound_cases
+    ]
     rows: list[dict[str, Any]] = []
     for item in successful:
         case_id = item["case_id"]
@@ -635,7 +641,7 @@ def summarize(
                     - total(rows, "manual_total_completed_count")
                 ) / len(rows),
                 3,
-            ),
+            ) if rows else 0,
             "case_comparison": comparison_counts(
                 rows,
                 "manual_total_completed_count",

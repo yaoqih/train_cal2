@@ -686,7 +686,16 @@ def build_slots(cars: list[dict[str, Any]], caps: dict[str, int]) -> tuple[dict[
         if c["_InitialLine"] in DEPOT and c["_InitialLine"] in c["TargetLines"] and slot_ok(c, c["_InitialLine"], int(c["Position"]), caps):
             slots[car_no(c)] = Slot(c["_InitialLine"], int(c["Position"]), True)
             used[c["_InitialLine"]].add(int(c["Position"]))
-    rest = [c for c in depot_cars if car_no(c) not in slots]
+    # A car with both inner and outer targets has one joint terminal domain.
+    # It only needs an inner matching certificate when it actually stays inner;
+    # final outer placement is validated directly by business_errors().
+    rest = [
+        c
+        for c in depot_cars
+        if car_no(c) not in slots
+        and set(c["TargetLines"])
+        and set(c["TargetLines"]) <= DEPOT
+    ]
     cand = {
         car_no(car): [
             (line, position)

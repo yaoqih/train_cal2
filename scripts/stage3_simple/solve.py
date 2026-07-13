@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import itertools
 import json
 import re
 import sys
@@ -21,6 +22,8 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import replay_validator as rv  # noqa: E402
+from stage3_simple import placement  # noqa: E402
+from stage3_simple import transactions  # noqa: E402
 from solver_vnext import physical  # noqa: E402
 
 
@@ -42,10 +45,17 @@ TEMPLATE_B_ORDER = ("机走北", "机走棚", "洗油北", "机南")
 TEMPLATE_A_FIRST_ORDER = ("机走北", "机走棚", "机南")
 TEMPLATE_A_SECOND_LINE = "洗油北"
 DEFAULT_TIME_BUDGET_SECONDS = 180.0
-MAX_EXPANSIONS = 300_000
-MAX_IMPROVEMENT_EXPANSIONS = 600
-IMPROVEMENT_TIME_BUDGET_SECONDS = 0.05
-EXACT_SEARCH_ACTIVE_LIMIT = 6
+PLACEMENT_MAX_PLANS = 8
+PLACEMENT_NODE_BUDGET = 10_000
+TRANSACTION_EXPANSION_LEVELS = (25, 100, 5_000, 10_000)
+SHALLOW_COMPLETE_QUORUM = 2
+SCREEN_COMPLETE_QUORUM = 3
+SCREEN_PLAN_BUDGET = 6
+SCREEN_BASE_PLAN_BUDGET = 4
+STATIC_FINALIST_PLAN_BUDGET = 2
+FINALIST_PLAN_BUDGET = 3
+ALIGNMENT_STATE_BUDGET = 256
+POST_BUDGET_FRONTIER_WIDTH = 2
 STAGE3_REHOOK_LOCO = PREPICKUP_OUTER_SOURCE
 BLOCKING_REPLAY_KINDS = {"schema", "physical", "business", "state"}
 
@@ -80,14 +90,29 @@ class SearchResult:
     reasons: tuple[str, ...]
     expansions: int
     elapsed_seconds: float
-    layout: str = "cost"
-    deferred_clear: bool = True
+    layout: str = "unified"
+    deferred_clear: bool = False
     terminal_merge: bool = True
-    inner_clear_policy: str = "eager"
+    inner_clear_policy: str = "transaction"
     lower_bound: int | None = None
     lower_bound_components: tuple[tuple[str, int], ...] = ()
     lower_bound_scope: str = "not_applicable"
     search_spec_evaluated: bool = True
+    committed_count: int = 0
+    budgeted_progress_key: tuple[int, int, int, int, int] | None = None
+
+
+@dataclass(frozen=True)
+class PlacementSpec:
+    operation_lower_bound: int
+    placement_score: tuple[int, ...]
+    signature: tuple[tuple[str, str, str, int], ...]
+    template: str
+    layout: str
+
+    @property
+    def shallow_group(self) -> tuple[int, tuple[int, ...]]:
+        return self.operation_lower_bound, self.placement_score
 
 
 def case_id_from_path(path: Path) -> str:
@@ -208,14 +233,15 @@ class Stage3Solver:
             tuple[dict[str, str], dict[str, tuple[str, int]], tuple[str, ...]],
         ] = {}
         self.pickup_cache: dict[
-            tuple[str, str, bool],
+            tuple[str, str],
             tuple[State, tuple[Op, ...]] | SearchResult,
         ] = {}
         self.candidate_evaluation_cache: dict[
             tuple[State, tuple[Op, ...]],
             dict[str, Any],
         ] = {}
-        self.assigned_line_by_no = self.build_assigned_line_by_no("B", "cost")
+        self.assigned_line_by_no: dict[str, str] = {}
+        self.placement_results: dict[str, placement.SolveResult] = {}
         self.optimization_attempted = 0
         self.optimization_expansions = 0
         self.optimization_budget_exhausted = False
@@ -392,397 +418,201 @@ class Stage3Solver:
                 out[line][position] = rv.car_no(car)
         return out
 
-    def build_assigned_line_by_no(self, template: str, layout: str = "cost") -> dict[str, str]:
+    @staticmethod
+    def placement_length_units(value: float) -> int:
+        return int(round(float(value) * 10))
+
+    def build_placement_problem(
+        self,
+        template: str,
+    ) -> tuple[placement.Problem, dict[str, str]]:
+        """Build the single finite terminal domain used by every Stage3 plan."""
+
+        domains: list[placement.CarDomain] = []
+        fixed_assignments: dict[str, str] = {}
+        positioned_fixed = tuple(
+            (line, position)
+            for line, by_position in self.fixed_positioned_positions.items()
+            for position in by_position
+        )
+        fixed_factory = tuple(
+            (line, position)
+            for line, by_position in self.fixed_positioned_positions.items()
+            for position, no in by_position.items()
+            if line in set(DEPOT_IN)
+            and self.repair_process(self.fixed_by_no[no]).startswith("厂")
+        )
+        outer_base_loads = tuple(
+            (
+                line,
+                self.placement_length_units(sum(
+                    float(car["Length"])
+                    for car in self.fixed_cars
+                    if car["Line"] == line
+                )),
+            )
+            for line in STAGE4_STAGING_LINES
+        )
+        active_inner_gate_demand = {
+            line
+            for no in self.active_nos
+            for line in (
+                {self.meta[no]["Line"]}
+                if no in self.restoration_nos
+                and self.meta[no]["Line"] in set(DEPOT_IN)
+                else self.inner_target_lines(no)
+            )
+        }
+
+        def staging_gate_conflict(line: str) -> int:
+            paired_inner = DEPOT_IN_BY_OUT.get(line)
+            return int(
+                paired_inner is not None
+                and paired_inner in active_inner_gate_demand
+            )
+
+        for no in sorted(self.active_nos):
+            car = self.meta[no]
+            atoms: list[placement.Atom] = []
+            restoration_line: str | None = None
+            restoration_position: int | None = None
+            if no in self.restoration_nos:
+                line = car["Line"]
+                if line not in set(POSITIONED_LINES) | {UNWHEEL}:
+                    fixed_assignments[no] = line
+                    continue
+                restoration_line = line
+                position = int(car.get("Position") or 0)
+                restoration_position = position if line in set(POSITIONED_LINES) and position > 0 else None
+                atoms.append(placement.Atom(
+                    "inner" if line in set(DEPOT_IN) else "outer",
+                    line,
+                    restoration_position,
+                    (0, 0),
+                ))
+            elif self.is_stage4_deferred(no):
+                initial_line = car["Line"]
+                initial_position = int(car.get("Position") or 0)
+
+                def staging_cost(line: str) -> int:
+                    if line == initial_line and line in set(STAGE4_STAGING_LINES):
+                        return 0
+                    if initial_line == UNWHEEL:
+                        return 100 + initial_position + self.line_rank_for_deferred(line)
+                    if line == UNWHEEL:
+                        return 10
+                    return 1_000 + self.line_rank_for_deferred(line)
+
+                atoms.extend(
+                    placement.Atom(
+                        "outer",
+                        line,
+                        None,
+                        (staging_gate_conflict(line), staging_cost(line)),
+                    )
+                    for line in STAGE4_STAGING_LINES
+                )
+            else:
+                forced = tuple(int(value) for value in car.get("_ForcePositions") or () if int(value) > 0)
+                for line in sorted(self.inner_target_lines(no)):
+                    if DEPOT_OUT_BY_IN[line] in self.fixed_outer_lines:
+                        continue
+                    fixed_positions = sorted(self.fixed_positioned_positions.get(line, {}))
+                    usable_limit = min(fixed_positions) - 1 if fixed_positions else self.caps[line]
+                    for position in range(1, usable_limit + 1):
+                        if self.slot_allowed_for_car(car, line, position, self.caps[line]):
+                            atoms.append(placement.Atom(
+                                "inner",
+                                line,
+                                position,
+                                (
+                                    0,
+                                    self.slot_preference_cost(
+                                        no,
+                                        (line, position),
+                                        template,
+                                    ),
+                                ),
+                            ))
+                for line in sorted(self.outer_target_lines(no)):
+                    positions = forced or (None,)
+                    atoms.extend(
+                        placement.Atom(
+                            "outer",
+                            line,
+                            position,
+                            (0, self.line_number(line)),
+                        )
+                        for position in positions
+                    )
+            if not atoms:
+                raise ValueError(f"stage3_terminal_domain_empty:{no}")
+            domains.append(placement.CarDomain(
+                no=no,
+                length=self.placement_length_units(float(car["Length"])),
+                process=self.repair_process(car),
+                atoms=tuple(dict.fromkeys(atoms)),
+                restoration_line=restoration_line,
+                restoration_position=restoration_position,
+            ))
+
+        domain_nos = {domain.no for domain in domains}
+        exposure = tuple(
+            no for no in self.template_exposure_order(template) if no in domain_nos
+        )
+        if template == "A":
+            first = tuple(no for no in exposure if self.meta[no]["Line"] != TEMPLATE_A_SECOND_LINE)
+            second = tuple(no for no in exposure if self.meta[no]["Line"] == TEMPLATE_A_SECOND_LINE)
+            exposure_segments = tuple(segment for segment in (first, second) if segment)
+        else:
+            exposure_segments = (exposure,) if exposure else ()
+        problem = placement.Problem(
+            cars=tuple(domains),
+            inner_capacities=tuple((line, self.caps[line]) for line in DEPOT_IN),
+            outer_capacities=tuple(
+                (line, self.placement_length_units(float(rv.TRACK_LEN[line])))
+                for line in STAGE4_STAGING_LINES
+            ),
+            inner_fixed_positions=tuple(
+                item for item in positioned_fixed if item[0] in set(DEPOT_IN)
+            ),
+            inner_fixed_factory_positions=fixed_factory,
+            outer_base_loads=outer_base_loads,
+            outer_fixed_positions=tuple(
+                item for item in positioned_fixed if item[0] in set(DEPOT_OUT)
+            ),
+            exposure_segments=exposure_segments,
+        )
+        return problem, fixed_assignments
+
+    def unified_placements(self, template: str) -> placement.SolveResult:
+        problem, fixed_assignments = self.build_placement_problem(template)
+        solved = placement.solve(
+            problem,
+            max_plans=PLACEMENT_MAX_PLANS,
+            node_budget=PLACEMENT_NODE_BUDGET,
+        )
+        self.placement_results[template] = solved
+        for index, plan in enumerate(solved.plans):
+            layout = f"unified:{template}:{index:02d}"
+            line_by_no = dict(fixed_assignments)
+            slot_by_no: dict[str, tuple[str, int]] = {}
+            for no, atom in plan.assignments:
+                line_by_no[no] = atom.line
+                if atom.position is not None:
+                    slot_by_no[no] = (atom.line, atom.position)
+            self.assignment_cache[(template, layout)] = (line_by_no, slot_by_no, ())
+        return solved
+
+    def build_assigned_line_by_no(self, template: str, layout: str) -> dict[str, str]:
         cache_key = (template, layout)
         cached = self.assignment_cache.get(cache_key)
-        if cached is not None:
-            assigned, slots, reasons = cached
-            self.assigned_slot_by_no = dict(slots)
-            self.assignment_reasons = reasons
-            return dict(assigned)
-        if layout == "cohesive":
-            assigned = self.build_cohesive_assigned_line_by_no(template)
-        elif layout == "cost":
-            assigned = self.build_cost_assigned_line_by_no(template)
-        else:
-            raise ValueError(f"unknown_stage3_layout:{layout}")
-        self.assignment_cache[cache_key] = (
-            dict(assigned),
-            dict(self.assigned_slot_by_no),
-            self.assignment_reasons,
-        )
-        return assigned
-
-    def build_cost_assigned_line_by_no(self, template: str) -> dict[str, str]:
-        self.assignment_reasons = ()
-        self.assigned_slot_by_no = {}
-        exposure = self.template_exposure_order(template)
-        exposure_time = {no: index for index, no in enumerate(exposure)}
-        inner_nos = sorted(
-            no for no in self.active_nos - self.restoration_nos if self.inner_target_lines(no)
-        )
-        outer_nos = sorted(
-            no
-            for no in self.active_nos - self.restoration_nos
-            if not self.inner_target_lines(no) and self.outer_target_lines(no)
-        )
-        deferred_nos = sorted(
-            no for no in self.active_nos - self.restoration_nos if self.is_stage4_deferred(no)
-        )
-        slots: list[tuple[str, int]] = []
-        for line in DEPOT_IN:
-            if DEPOT_OUT_BY_IN[line] in self.fixed_outer_lines:
-                continue
-            fixed_positions = sorted(self.fixed_positioned_positions.get(line, {}))
-            capacity = self.caps[line]
-            usable_limit = (min(fixed_positions) - 1) if fixed_positions else capacity
-            for position in range(1, usable_limit + 1):
-                slots.append((line, position))
-
-        candidates: dict[str, list[tuple[str, int]]] = {}
-        for no in inner_nos:
-            car = self.meta[no]
-            allowed = []
-            for line, position in slots:
-                if line not in set(car.get("TargetLines") or []):
-                    continue
-                if self.slot_allowed_for_car(car, line, position, self.caps[line]):
-                    allowed.append((line, position))
-            candidates[no] = allowed
-
-        ordered_nos = sorted(
-            inner_nos,
-            key=lambda no: (
-                len(candidates.get(no, ())),
-                not self.repair_process(self.meta[no]).startswith("厂"),
-                float(self.meta[no]["Length"]) < 17.6,
-                exposure_time.get(no, 10**6),
-                no,
-            ),
-        )
-        assigned_inner = self.minimum_cost_slot_assignment(ordered_nos, candidates, template)
-        missing_inner = tuple(sorted(no for no in inner_nos if no not in assigned_inner))
-        assigned_outer, assigned_outer_slots, missing_outer = self.assign_outer_targets(
-            outer_nos,
-            set(line for line, _pos in assigned_inner.values()),
-        )
-        assigned_lines = {no: line for no, (line, _position) in assigned_inner.items()}
-        assigned_lines.update(assigned_outer)
-        restoration_lines = {no: self.meta[no]["Line"] for no in self.restoration_nos}
-        assigned_deferred, missing_deferred = self.assign_deferred_stage4_targets(
-            deferred_nos,
-            reserved_load=self.assigned_loads({**assigned_outer, **restoration_lines}),
-            used_inner_lines=set(line for line, _position in assigned_inner.values()),
-        )
-        assigned_lines.update(assigned_deferred)
-        assigned_lines.update(restoration_lines)
-        if missing_inner or missing_outer:
-            reasons: list[str] = []
-            if missing_inner:
-                reasons.append(f"inner_assignment_incomplete:{template}:{','.join(missing_inner)}")
-                certificate = self.inner_slot_capacity_certificate(inner_nos, candidates)
-                if certificate:
-                    reasons.append(certificate)
-            if missing_outer:
-                reasons.append(f"outer_assignment_incomplete:{template}:{','.join(missing_outer)}")
-                certificate = self.outer_capacity_certificate(outer_nos)
-                if certificate:
-                    reasons.append(certificate)
-            if missing_deferred:
-                reasons.append(f"stage4_defer_staging_incomplete:{template}:{','.join(missing_deferred)}")
-            self.assignment_reasons = tuple(reasons)
-            return assigned_lines
-        if missing_deferred:
-            self.assignment_reasons = (f"stage4_defer_staging_incomplete:{template}:{','.join(missing_deferred)}",)
-            return assigned_lines
-
-        self.assigned_slot_by_no = {**assigned_inner, **assigned_outer_slots}
-        return assigned_lines
-
-    def inner_slot_capacity_certificate(
-        self,
-        nos: list[str],
-        candidates: dict[str, list[tuple[str, int]]],
-    ) -> str:
-        reachable = {slot for no in nos for slot in candidates.get(no, ())}
-        if len(reachable) >= len(nos):
-            return ""
-        return (
-            f"inner_slot_capacity_infeasible:cars={len(nos)}>"
-            f"reachable_slots={len(reachable)}"
-        )
-
-    def outer_capacity_certificate(self, nos: list[str]) -> str:
-        if not nos:
-            return ""
-        remaining = {
-            line: float(rv.TRACK_LEN[line])
-            - sum(float(car["Length"]) for car in self.fixed_cars if car["Line"] == line)
-            for line in DEPOT_OUT
-        }
-        allowed = {no: self.outer_target_lines(no) for no in nos}
-        for count in range(1, len(DEPOT_OUT) + 1):
-            for mask in range(1, 1 << len(DEPOT_OUT)):
-                lines = {
-                    DEPOT_OUT[index]
-                    for index in range(len(DEPOT_OUT))
-                    if mask & (1 << index)
-                }
-                if len(lines) != count:
-                    continue
-                constrained = [
-                    no for no in nos
-                    if allowed[no] and allowed[no] <= lines
-                ]
-                demand = self.length(constrained)
-                capacity = sum(remaining[line] for line in lines)
-                if demand > capacity + rv.TOL:
-                    return (
-                        f"outer_capacity_infeasible:{','.join(sorted(lines))}:"
-                        f"demand={demand:.1f}>capacity={capacity:.1f}:"
-                        f"cars={','.join(sorted(constrained))}"
-                    )
-        return ""
-
-    def minimum_cost_slot_assignment(
-        self,
-        ordered_nos: list[str],
-        candidates: dict[str, list[tuple[str, int]]],
-        template: str,
-    ) -> dict[str, tuple[str, int]]:
-        """Return an exact minimum-cost feasible car-to-slot matching."""
-        if not ordered_nos or any(not candidates.get(no) for no in ordered_nos):
-            return {}
-        slots = sorted({slot for no in ordered_nos for slot in candidates[no]})
-        car_count = len(ordered_nos)
-        slot_count = len(slots)
-        source = 0
-        car_start = 1
-        slot_start = car_start + car_count
-        sink = slot_start + slot_count
-        graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
-
-        def add_edge(left: int, right: int, capacity: int, cost: int) -> list[int]:
-            forward = [right, len(graph[right]), capacity, cost]
-            reverse = [left, len(graph[left]), 0, -cost]
-            graph[left].append(forward)
-            graph[right].append(reverse)
-            return forward
-
-        for car_index in range(car_count):
-            add_edge(source, car_start + car_index, 1, 0)
-        for slot_index in range(slot_count):
-            add_edge(slot_start + slot_index, sink, 1, 0)
-
-        slot_index_by_value = {slot: index for index, slot in enumerate(slots)}
-        assignment_edges: list[tuple[str, tuple[str, int], list[int]]] = []
-        # Slot rank is a deterministic tie-break only; 1000 keeps the summed
-        # tie cost below one unit of the business preference cost.
-        for car_index, no in enumerate(ordered_nos):
-            for slot in sorted(candidates[no]):
-                slot_index = slot_index_by_value[slot]
-                cost = self.slot_preference_cost(no, slot, template) * 1000 + slot_index
-                edge = add_edge(car_start + car_index, slot_start + slot_index, 1, cost)
-                assignment_edges.append((no, slot, edge))
-
-        flow = 0
-        node_count = sink + 1
-        while flow < car_count:
-            distance = [INF_COST * 1000] * node_count
-            previous: list[tuple[int, int] | None] = [None] * node_count
-            distance[source] = 0
-            for _iteration in range(node_count - 1):
-                changed = False
-                for left in range(node_count):
-                    if distance[left] >= INF_COST * 1000:
-                        continue
-                    for edge_index, edge in enumerate(graph[left]):
-                        right, _reverse_index, capacity, cost = edge
-                        candidate = distance[left] + cost
-                        if capacity > 0 and candidate < distance[right]:
-                            distance[right] = candidate
-                            previous[right] = (left, edge_index)
-                            changed = True
-                if not changed:
-                    break
-            if previous[sink] is None:
-                break
-            node = sink
-            while node != source:
-                left, edge_index = previous[node] or (-1, -1)
-                if left < 0:
-                    break
-                edge = graph[left][edge_index]
-                reverse_index = edge[1]
-                edge[2] -= 1
-                graph[node][reverse_index][2] += 1
-                node = left
-            if node != source:
-                break
-            flow += 1
-        if flow != car_count:
-            return {}
-        return {
-            no: slot
-            for no, slot, edge in assignment_edges
-            if edge[2] == 0
-        }
-
-    def build_cohesive_assigned_line_by_no(self, template: str) -> dict[str, str]:
-        """Assign direct-unloadable contiguous blocks in pickup exposure order.
-
-        The cost-oriented matcher only answers whether every car has a legal
-        slot.  This dynamic program additionally preserves the order in which
-        cars become exposed from the locomotive consist.  Its primary cost is
-        the number of target-line runs, which is also the direct lower bound on
-        depot puts.  Slot legality is checked at the final position while the
-        sequence is built from deep to shallow.
-        """
-        self.assignment_reasons = ()
-        self.assigned_slot_by_no = {}
-        exposure = self.template_exposure_order(template)
-        inner_nos = [no for no in exposure if self.inner_target_lines(no)]
-        missing_exposure = sorted(
-            no
-            for no in self.active_nos - self.restoration_nos
-            if self.inner_target_lines(no) and no not in set(inner_nos)
-        )
-        if missing_exposure:
-            self.assignment_reasons = (
-                f"cohesive_exposure_incomplete:{template}:{','.join(missing_exposure)}",
-            )
-            return {}
-
-        usable_limits: list[int] = []
-        for line in DEPOT_IN:
-            if DEPOT_OUT_BY_IN[line] in self.fixed_outer_lines:
-                usable_limits.append(0)
-                continue
-            fixed_positions = sorted(self.fixed_positioned_positions.get(line, {}))
-            capacity = self.caps[line]
-            usable_limits.append((min(fixed_positions) - 1) if fixed_positions else capacity)
-
-        outer_nos = sorted(
-            no
-            for no in self.active_nos - self.restoration_nos
-            if not self.inner_target_lines(no) and self.outer_target_lines(no)
-        )
-        reserved_gate_inners = {
-            DEPOT_IN_BY_OUT[min(self.outer_target_lines(no), key=lambda line: (self.line_number(line), line))]
-            for no in outer_nos
-            if self.outer_target_lines(no)
-        }
-
-        # A non-inner car or the second trip breaks a direct target-line run,
-        # even when the same inner line is selected on both sides.
-        segment_by_no: dict[str, int] = {}
-        segment = 0
-        prior_was_inner = False
-        prior_phase = -1
-        for no in exposure:
-            phase = 1 if template == "A" and self.meta[no]["Line"] == TEMPLATE_A_SECOND_LINE else 0
-            is_inner = bool(self.inner_target_lines(no))
-            if is_inner and (not prior_was_inner or phase != prior_phase):
-                segment += 1
-            elif not is_inner:
-                segment += 1
-            if is_inner:
-                segment_by_no[no] = segment
-            prior_was_inner = is_inner
-            prior_phase = phase
-
-        # key = counts per line, last line, last exposure segment, lines on
-        # which a deeper section-repair car has already been assigned.
-        start_key = ((0, 0, 0, 0), -1, -1, 0)
-        plans: dict[
-            tuple[tuple[int, int, int, int], int, int, int],
-            tuple[tuple[int, int, int], tuple[str, ...]],
-        ] = {
-            start_key: ((0, 0, 0), ())
-        }
-        for exposure_index, no in enumerate(inner_nos):
-            car = self.meta[no]
-            next_plans: dict[
-                tuple[tuple[int, int, int, int], int, int, int],
-                tuple[tuple[int, int, int], tuple[str, ...]],
-            ] = {}
-            current_segment = segment_by_no[no]
-            for (counts, last_line, last_segment, section_mask), (score, path) in plans.items():
-                for line_index, line in enumerate(DEPOT_IN):
-                    if line not in self.inner_target_lines(no):
-                        continue
-                    if counts[line_index] >= usable_limits[line_index]:
-                        continue
-                    # Exposure order is deep-to-shallow for a direct unload.
-                    position = usable_limits[line_index] - counts[line_index]
-                    if not self.slot_allowed_for_car(car, line, position, self.caps[line]):
-                        continue
-                    is_factory = self.repair_process(car).startswith("厂")
-                    is_section = self.repair_process(car).startswith("段")
-                    if is_factory and section_mask & (1 << line_index):
-                        continue
-                    next_counts = list(counts)
-                    next_counts[line_index] += 1
-                    next_mask = section_mask | ((1 << line_index) if is_section else 0)
-                    run_delta = int(last_line != line_index or last_segment != current_segment)
-                    next_score = (
-                        score[0] + run_delta,
-                        score[1] + (
-                            len(inner_nos) - exposure_index
-                            if line in reserved_gate_inners
-                            else 0
-                        ),
-                        score[2] + self.slot_preference_cost(no, (line, position), template),
-                    )
-                    next_key = (tuple(next_counts), line_index, current_segment, next_mask)
-                    incumbent = next_plans.get(next_key)
-                    candidate = (next_score, (*path, line))
-                    if incumbent is None or candidate < incumbent:
-                        next_plans[next_key] = candidate
-            plans = next_plans
-            if not plans:
-                self.assignment_reasons = (
-                    f"cohesive_direct_unload_order_infeasible:{template}:{no}",
-                )
-                return {}
-
-        _best_key, (best_score, best_path) = min(
-            plans.items(),
-            key=lambda item: (item[1][0], item[1][1]),
-        )
-        del best_score
-        assigned_lines = dict(zip(inner_nos, best_path))
-        seen_per_line = Counter()
-        for no, line in zip(inner_nos, best_path):
-            line_index = DEPOT_IN.index(line)
-            position = usable_limits[line_index] - seen_per_line[line]
-            seen_per_line[line] += 1
-            self.assigned_slot_by_no[no] = (line, position)
-
-        assigned_outer, assigned_outer_slots, missing_outer = self.assign_outer_targets(
-            outer_nos,
-            set(best_path),
-        )
-        assigned_lines.update(assigned_outer)
-        self.assigned_slot_by_no.update(assigned_outer_slots)
-        deferred_nos = sorted(
-            no for no in self.active_nos - self.restoration_nos if self.is_stage4_deferred(no)
-        )
-        restoration_lines = {no: self.meta[no]["Line"] for no in self.restoration_nos}
-        assigned_deferred, missing_deferred = self.assign_deferred_stage4_targets(
-            deferred_nos,
-            reserved_load=self.assigned_loads({**assigned_outer, **restoration_lines}),
-            used_inner_lines=set(best_path),
-        )
-        assigned_lines.update(assigned_deferred)
-        assigned_lines.update(restoration_lines)
-        reasons: list[str] = []
-        if missing_outer:
-            reasons.append(f"outer_assignment_incomplete:{template}:{','.join(missing_outer)}")
-        if missing_deferred:
-            reasons.append(f"stage4_defer_staging_incomplete:{template}:{','.join(missing_deferred)}")
-        self.assignment_reasons = tuple(reasons)
-        return assigned_lines
+        if cached is None:
+            raise ValueError(f"unified_stage3_layout_not_built:{template}:{layout}")
+        assigned, slots, reasons = cached
+        self.assigned_slot_by_no = dict(slots)
+        self.assignment_reasons = reasons
+        return dict(assigned)
 
     def slot_preference_cost(self, no: str, slot: tuple[str, int], template: str) -> int:
         car = self.meta[no]
@@ -815,67 +645,6 @@ class Stage3Solver:
             return "油漆线"
         return sorted(targets)[0] if targets else ""
 
-    def assign_deferred_stage4_targets(
-        self,
-        deferred_nos: list[str],
-        *,
-        reserved_load: dict[str, float],
-        used_inner_lines: set[str],
-    ) -> tuple[dict[str, str], tuple[str, ...]]:
-        if not deferred_nos:
-            return {}, ()
-        remaining = {
-            line: float(rv.TRACK_LEN.get(line) or 0.0)
-            - sum(float(car["Length"]) for car in self.fixed_cars if car["Line"] == line)
-            - reserved_load.get(line, 0.0)
-            for line in STAGE4_STAGING_LINES
-        }
-        assigned: dict[str, str] = {}
-        for no in deferred_nos:
-            line = self.meta[no]["Line"]
-            can_stay = (
-                line == UNWHEEL
-                or line in set(DEPOT_OUT)
-                and DEPOT_IN_BY_OUT[line] not in used_inner_lines
-            )
-            if line not in set(STAGE4_STAGING_LINES) or not can_stay:
-                continue
-            car_length = self.length((no,))
-            if remaining[line] + rv.TOL < car_length:
-                return assigned, tuple(sorted(item for item in deferred_nos if item not in assigned))
-            assigned[no] = line
-            remaining[line] -= car_length
-        for target in ("存4线", "油漆线"):
-            group = [
-                no
-                for no in self.deferred_stage4_order(deferred_nos)
-                if no not in assigned and self.deferred_stage4_target(no) == target
-            ]
-            if not group:
-                continue
-            packed = self.pack_deferred_stage4_group(group, remaining)
-            if packed is None:
-                return assigned, tuple(sorted(no for no in deferred_nos if no not in assigned))
-            for line, chunk in packed:
-                for no in chunk:
-                    assigned[no] = line
-                remaining[line] -= self.length(chunk)
-        missing = tuple(sorted(no for no in deferred_nos if no not in assigned))
-        return assigned, missing
-
-    def deferred_stage4_order(self, nos: Iterable[str]) -> tuple[str, ...]:
-        return tuple(
-            sorted(
-                nos,
-                key=lambda no: (
-                    0 if self.deferred_stage4_target(no) == "存4线" else 1,
-                    self.line_rank_for_deferred(self.meta[no]["Line"]),
-                    int(self.meta[no].get("Position") or 0),
-                    no,
-                ),
-            )
-        )
-
     def line_rank_for_deferred(self, line: str) -> int:
         order = {
             "卸轮线": 0,
@@ -889,208 +658,6 @@ class Stage3Solver:
             "修4库外": 42,
         }
         return order.get(line, 100)
-
-    def pack_deferred_stage4_group(
-        self,
-        ordered_nos: list[str],
-        remaining: dict[str, float],
-    ) -> list[tuple[str, tuple[str, ...]]] | None:
-        n = len(ordered_nos)
-        lengths = [self.length((no,)) for no in ordered_nos]
-        prefix = [0.0]
-        for value in lengths:
-            prefix.append(prefix[-1] + value)
-
-        def chunk_len(left: int, right: int) -> float:
-            return prefix[right] - prefix[left]
-
-        line_order = tuple(
-            sorted(
-                STAGE4_STAGING_LINES,
-                key=lambda line: (
-                    0 if line == UNWHEEL else 1,
-                    self.line_number(line),
-                    line,
-                ),
-            )
-        )
-        best: tuple[tuple[int, int, float, tuple[str, ...]], list[tuple[str, tuple[str, ...]]]] | None = None
-
-        def rec(index: int, available: tuple[str, ...], chunks: list[tuple[str, tuple[str, ...]]]) -> None:
-            nonlocal best
-            if index >= n:
-                used = tuple(line for line, _chunk in chunks)
-                score = (
-                    len(chunks),
-                    sum(1 for line in used if line != UNWHEEL),
-                    round(sum(remaining[line] for line in used), 3),
-                    used,
-                )
-                candidate = (score, list(chunks))
-                if best is None or candidate[0] < best[0]:
-                    best = candidate
-                return
-            if best is not None and len(chunks) >= best[0][0]:
-                return
-            for line in available:
-                limit = remaining.get(line, 0.0)
-                if limit <= rv.TOL:
-                    continue
-                for end in range(n, index, -1):
-                    size = chunk_len(index, end)
-                    if size > limit + rv.TOL:
-                        continue
-                    chunk = tuple(ordered_nos[index:end])
-                    next_available = tuple(item for item in available if item != line)
-                    chunks.append((line, chunk))
-                    rec(end, next_available, chunks)
-                    chunks.pop()
-
-        rec(0, line_order, [])
-        return best[1] if best else None
-
-    def assigned_loads(
-        self,
-        assigned_lines: dict[str, str],
-    ) -> dict[str, float]:
-        loads: Counter[str] = Counter()
-        for no, line in assigned_lines.items():
-            loads[line] += float(self.meta[no]["Length"])
-        return dict(loads)
-
-    def assign_outer_targets(
-        self,
-        outer_nos: list[str],
-        used_inner_lines: set[str],
-    ) -> tuple[dict[str, str], dict[str, tuple[str, int]], tuple[str, ...]]:
-        if not outer_nos:
-            return {}, {}, ()
-        fixed_load = {
-            line: sum(float(car["Length"]) for car in self.fixed_cars if car["Line"] == line)
-            for line in DEPOT_OUT
-        }
-        remaining = {
-            line: float(rv.TRACK_LEN.get(line) or 0.0) - fixed_load.get(line, 0.0)
-            for line in DEPOT_OUT
-        }
-        candidates = {
-            no: tuple(sorted(self.outer_target_lines(no)))
-            for no in outer_nos
-        }
-        ordered = sorted(
-            outer_nos,
-            key=lambda no: (len(candidates.get(no, ())), -self.length((no,)), no),
-        )
-        initial_stayers = {
-            line
-            for no in outer_nos
-            for line in (self.meta[no]["Line"],)
-            if line in set(DEPOT_OUT) and self.terminal_line_satisfied(no, line)
-        }
-        best: tuple[
-            tuple[int, tuple[tuple[str, str], ...], tuple[tuple[str, tuple[str, int]], ...]],
-            dict[str, str],
-            dict[str, tuple[str, int]],
-        ] | None = None
-        current: dict[str, str] = {}
-
-        def assign_forced_positions() -> dict[str, tuple[str, int]] | None:
-            assigned: dict[str, tuple[str, int]] = {}
-            for line in DEPOT_OUT:
-                line_nos = [
-                    no
-                    for no in outer_nos
-                    if current.get(no) == line and self.meta[no].get("_ForcePositions")
-                ]
-                if not line_nos:
-                    continue
-                fixed_positions = set(self.fixed_positioned_positions.get(line, {}))
-                options = {
-                    no: tuple(
-                        int(position)
-                        for position in self.meta[no]["_ForcePositions"]
-                        if int(position) > 0 and int(position) not in fixed_positions
-                    )
-                    for no in line_nos
-                }
-                ordered_line_nos = sorted(
-                    line_nos,
-                    key=lambda no: (len(options[no]), no),
-                )
-                used: set[int] = set()
-                selected: dict[str, int] = {}
-
-                def match(index: int) -> bool:
-                    if index == len(ordered_line_nos):
-                        return True
-                    no = ordered_line_nos[index]
-                    for position in options[no]:
-                        if position in used:
-                            continue
-                        used.add(position)
-                        selected[no] = position
-                        if match(index + 1):
-                            return True
-                        selected.pop(no)
-                        used.remove(position)
-                    return False
-
-                if not match(0):
-                    return None
-                assigned.update(
-                    {no: (line, selected[no]) for no in ordered_line_nos}
-                )
-            return assigned
-
-        def rec(index: int, cost: int) -> None:
-            nonlocal best
-            if best is not None and cost >= best[0][0]:
-                return
-            if index == len(ordered):
-                forced_slots = assign_forced_positions()
-                if forced_slots is None:
-                    return
-                assignment = dict(current)
-                candidate_key = (
-                    cost,
-                    tuple(sorted(assignment.items())),
-                    tuple(sorted(forced_slots.items())),
-                )
-                if best is None or candidate_key < best[0]:
-                    best = (candidate_key, assignment, forced_slots)
-                return
-            no = ordered[index]
-            car_len = self.length((no,))
-            car = self.meta[no]
-            initial_line = car["Line"]
-            is_stayer = initial_line in set(DEPOT_OUT) and self.terminal_line_satisfied(
-                no,
-                initial_line,
-            )
-            for line in candidates.get(no, ()):
-                if remaining.get(line, -1.0) + rv.TOL < car_len:
-                    continue
-                remaining[line] -= car_len
-                current[no] = line
-                line_cost = self.outer_line_cost(line, used_inner_lines) * 100
-                if is_stayer and line != initial_line:
-                    line_cost += 10_000
-                elif not is_stayer and line in initial_stayers:
-                    line_cost += 1_000
-                rec(index + 1, cost + line_cost)
-                current.pop(no, None)
-                remaining[line] += car_len
-
-        rec(0, 0)
-        if best is None:
-            return {}, {}, tuple(sorted(outer_nos))
-        assigned, forced_slots = best[1], best[2]
-        missing = tuple(sorted(no for no in outer_nos if no not in assigned))
-        return assigned, forced_slots, missing
-
-    def outer_line_cost(self, line: str, used_inner_lines: set[str]) -> int:
-        inner = DEPOT_IN_BY_OUT[line]
-        return (10 if inner in used_inner_lines else 0) + self.line_number(line)
 
     def template_exposure_order(self, template: str) -> tuple[str, ...]:
         line_map = self.initial_source_pickup_map()
@@ -1127,112 +694,197 @@ class Stage3Solver:
             )
             return self.result(empty, [empty])
 
-        clear_modes = (
-            (True, False)
-            if any(self.is_stage4_deferred(no) for no in self.active_nos)
-            else (True,)
-        )
-        search_specs = tuple(
-            (template, layout, deferred_clear, terminal_merge, inner_clear_policy)
-            for template, layout in (
-                ("B", "cohesive"),
-                ("A", "cohesive"),
-                ("B", "cost"),
-                ("A", "cost"),
-            )
-            for deferred_clear in clear_modes
-            for terminal_merge in (True, False)
-            for inner_clear_policy in ("eager", "just_in_time")
-        )
-        results = [
-            self.validate_candidate(self.solve_template(
-                template,
-                layout=layout,
-                deferred_clear=deferred_clear,
-                terminal_merge=terminal_merge,
-                inner_clear_policy=inner_clear_policy,
-                allow_search=False,
-            ))
-            for template, layout, deferred_clear, terminal_merge, inner_clear_policy in search_specs
-        ]
+        placement_specs: list[PlacementSpec] = []
+        placement_reasons: list[str] = []
+        for template in ("B", "A"):
+            solved = self.unified_placements(template)
+            if not solved.complete or solved.frontier_truncated:
+                self.search_space_evaluation_incomplete = True
+            if not solved.plans:
+                if solved.hall_witness is not None:
+                    witness = solved.hall_witness
+                    placement_reasons.append(
+                        "inner_hall_infeasible:"
+                        f"cars={','.join(witness.cars)}:"
+                        f"slots={','.join(f'{line}#{position}' for line, position in witness.slots)}:"
+                        f"deficit={witness.deficit}"
+                    )
+                elif solved.outer_capacity_witness is not None:
+                    witness = solved.outer_capacity_witness
+                    placement_reasons.append(
+                        "outer_subset_capacity_infeasible:"
+                        f"cars={','.join(witness.cars)}:"
+                        f"lines={','.join(witness.lines)}:"
+                        f"demand={witness.demand}:capacity={witness.capacity}:"
+                        f"deficit={witness.deficit}"
+                    )
+                else:
+                    placement_reasons.append(f"{solved.reason}:{template}")
+                continue
+            for index, plan in enumerate(solved.plans):
+                layout = f"unified:{template}:{index:02d}"
+                self.assigned_line_by_no = self.build_assigned_line_by_no(
+                    template,
+                    layout,
+                )
+                lower_bound = sum(
+                    self.template_operation_lower_bound_components(template).values()
+                )
+                placement_specs.append(PlacementSpec(
+                    operation_lower_bound=lower_bound,
+                    placement_score=plan.score,
+                    signature=plan.signature,
+                    template=template,
+                    layout=layout,
+                ))
 
-        # Exact search is an explicit small-state mode in the same search
-        # space. Larger cases stay on the block planner so diagnostics and
-        # memory use remain bounded.
-        if len(self.active_nos) <= EXACT_SEARCH_ACTIVE_LIMIT:
-            exact_specs = tuple(dict.fromkeys(
-                (template, layout, deferred_clear)
-                for template, layout, deferred_clear, _merge, _policy in search_specs
-            ))
-            for offset, (template, layout, deferred_clear) in enumerate(exact_specs):
-                remaining_time = max(0.0, self.global_deadline - time.monotonic())
-                remaining_specs = len(exact_specs) - offset
-                if remaining_time <= 0.0:
+        placement_specs.sort(
+            key=lambda item: (
+                item.operation_lower_bound,
+                item.placement_score,
+                0 if item.template == "B" else 1,
+                item.layout,
+            )
+        )
+
+        if not placement_specs:
+            failed = SearchResult(
+                status="partial",
+                template="unified",
+                state=None,
+                ops=(),
+                cost=(INF_COST, 0, 0, 0),
+                reasons=tuple(dict.fromkeys(placement_reasons)) or ("placement_infeasible",),
+                expansions=0,
+                elapsed_seconds=round(time.monotonic() - self.started_at, 3),
+                layout="unified",
+                deferred_clear=False,
+                terminal_merge=True,
+                inner_clear_policy="transaction",
+            )
+            return self.result(failed, [failed])
+
+        results_by_spec: dict[tuple[str, str], SearchResult] = {}
+        self.deadline = self.global_deadline
+        for level_index, expansion_limit in enumerate(TRANSACTION_EXPANSION_LEVELS):
+            completed_group: tuple[int, tuple[int, ...]] | None = None
+            incumbent_cost = min(
+                (
+                    item.cost
+                    for item in results_by_spec.values()
+                    if item.status == "complete"
+                ),
+                default=None,
+            )
+            strict_improvement = False
+            level_specs = placement_specs
+            if level_index > 0:
+                seen_signatures: set[tuple[tuple[str, str, str, int], ...]] = set()
+                diverse: list[PlacementSpec] = []
+                variants: list[PlacementSpec] = []
+                for spec in placement_specs:
+                    target = diverse if spec.signature not in seen_signatures else variants
+                    target.append(spec)
+                    seen_signatures.add(spec.signature)
+                level_specs = [*diverse, *variants]
+            if level_index == 1:
+                level_specs = self.select_screen_specs(
+                    level_specs,
+                    results_by_spec,
+                )
+            if level_index >= 2:
+                level_specs = self.select_finalist_specs(
+                    placement_specs,
+                    results_by_spec,
+                )
+            for spec_index, spec in enumerate(level_specs):
+                if (
+                    level_index == 0
+                    and completed_group is not None
+                    and spec.shallow_group != completed_group
+                ):
+                    break
+                if self.deadline_reached():
                     self.search_space_evaluation_incomplete = True
                     break
-                self.deadline = min(
-                    self.global_deadline,
-                    time.monotonic() + remaining_time / remaining_specs,
+                prior = results_by_spec.get((spec.template, spec.layout))
+                if prior is not None and prior.status == "complete":
+                    continue
+                candidate = self.solve_template(
+                    spec.template,
+                    layout=spec.layout,
+                    transaction_expansion_limit=expansion_limit,
                 )
-                results.append(self.validate_candidate(self.solve_template(
-                    template,
-                    layout=layout,
-                    deferred_clear=deferred_clear,
-                    terminal_merge=False,
-                    inner_clear_policy="exact",
-                    allow_search=True,
-                )))
-
-        if any(item.status == "complete" for item in results) and len(self.active_nos) > EXACT_SEARCH_ACTIVE_LIMIT:
-            best_result = self.choose_result(results)
-            incumbent_hooks = self.business_hook_count(best_result.ops)
-            search_space_lower_bound = min(
-                (item.lower_bound for item in results if item.lower_bound is not None),
-                default=incumbent_hooks,
-            )
-            improvable = tuple(dict.fromkeys(
-                (item.template, item.layout, item.deferred_clear)
-                for item in results
-                if item.lower_bound is not None
-                and item.lower_bound < incumbent_hooks
-                and incumbent_hooks - item.lower_bound <= 2
-                and (item.status == "complete" or item.reasons == ("greedy_no_completion",))
-            ))
-            improvement_deadline = min(
-                self.global_deadline,
-                time.monotonic() + IMPROVEMENT_TIME_BUDGET_SECONDS,
-            )
-            remaining_expansions = MAX_IMPROVEMENT_EXPANSIONS
-            for offset, (template, layout, deferred_clear) in enumerate(improvable):
-                if incumbent_hooks <= search_space_lower_bound:
-                    break
-                remaining_time = improvement_deadline - time.monotonic()
-                remaining_candidates = len(improvable) - offset
-                if remaining_time <= 0.0 or remaining_expansions <= 0:
-                    self.optimization_budget_exhausted = True
-                    break
-                self.optimization_attempted += 1
-                expansion_share = max(1, remaining_expansions // remaining_candidates)
-                self.deadline = time.monotonic() + remaining_time / remaining_candidates
-                improved = self.validate_candidate(self.solve_template(
-                    template,
-                    layout=layout,
-                    deferred_clear=deferred_clear,
-                    terminal_merge=False,
-                    inner_clear_policy="exact",
-                    allow_search=True,
-                    improve_below_hooks=incumbent_hooks,
-                    search_expansion_limit=expansion_share,
-                ))
-                results.append(improved)
-                self.optimization_expansions += improved.expansions
-                remaining_expansions -= improved.expansions
+                validated = self.validate_candidate(candidate)
+                results_by_spec[(spec.template, spec.layout)] = (
+                    validated
+                    if prior is None
+                    else self.choose_result([prior, validated])
+                )
+                if validated.status == "complete":
+                    if incumbent_cost is not None and validated.cost < incumbent_cost:
+                        strict_improvement = True
+                    if incumbent_cost is None or validated.cost < incumbent_cost:
+                        incumbent_cost = validated.cost
                 if (
-                    improved.status == "complete"
-                    and self.business_hook_count(improved.ops) < incumbent_hooks
+                    level_index == 0
+                    and validated.status == "complete"
+                    and completed_group is None
                 ):
-                    incumbent_hooks = self.business_hook_count(improved.ops)
-        self.deadline = self.global_deadline
+                    # Complete the whole lower-bound/proxy tie group before deciding
+                    # whether the shallow search has enough independent plans.
+                    completed_group = spec.shallow_group
+                complete_count = sum(
+                    item.status == "complete"
+                    for item in results_by_spec.values()
+                )
+                static_pair_evaluated = (
+                    level_index >= 2
+                    and spec_index + 1 >= min(
+                        STATIC_FINALIST_PLAN_BUDGET,
+                        len(level_specs),
+                    )
+                )
+                deep_complete_after_static_pair = (
+                    static_pair_evaluated and complete_count > 0
+                )
+                if level_index > 0 and (
+                    deep_complete_after_static_pair
+                    or strict_improvement
+                    or complete_count >= SCREEN_COMPLETE_QUORUM
+                ):
+                    break
+            if self.deadline_reached():
+                break
+            complete_count = sum(
+                item.status == "complete" for item in results_by_spec.values()
+            )
+            if level_index == 0 and complete_count >= SHALLOW_COMPLETE_QUORUM:
+                break
+            if level_index > 0 and complete_count:
+                break
+        results = [
+            results_by_spec[(spec.template, spec.layout)]
+            for spec in placement_specs
+            if (spec.template, spec.layout) in results_by_spec
+        ]
+        if len(results) != len(placement_specs):
+            self.search_space_evaluation_incomplete = True
+        if not results:
+            failed = SearchResult(
+                status="partial",
+                template="unified",
+                state=None,
+                ops=(),
+                cost=(INF_COST, 0, 0, 0),
+                reasons=("stage3_global_time_budget_exhausted",),
+                expansions=0,
+                elapsed_seconds=round(time.monotonic() - self.started_at, 3),
+                layout="unified",
+                inner_clear_policy="transaction",
+                search_spec_evaluated=False,
+            )
+            return self.result(failed, [failed])
         chosen = self.choose_result(results)
         return self.result(chosen, results)
 
@@ -1317,19 +969,23 @@ class Stage3Solver:
             and not bool(car["_Weighed"])
         )
 
+    def clear_state_materialization_caches(self) -> None:
+        """Release state-derived rows between independent layout searches."""
+
+        self.cars_cache.clear()
+        self.line_map_cache.clear()
+
     def solve_template(
         self,
         template: str,
         *,
-        layout: str = "cost",
-        deferred_clear: bool = True,
-        terminal_merge: bool = True,
-        inner_clear_policy: str = "eager",
-        allow_search: bool = True,
-        improve_below_hooks: int | None = None,
-        search_expansion_limit: int = MAX_EXPANSIONS,
+        layout: str,
+        transaction_expansion_limit: int = TRANSACTION_EXPANSION_LEVELS[-1],
     ) -> SearchResult:
         started = time.monotonic()
+        if transaction_expansion_limit <= 0:
+            raise ValueError("transaction_expansion_limit_must_be_positive")
+        self.clear_state_materialization_caches()
         if self.deadline_reached():
             return SearchResult(
                 status="partial",
@@ -1341,9 +997,9 @@ class Stage3Solver:
                 expansions=0,
                 elapsed_seconds=round(time.monotonic() - started, 3),
                 layout=layout,
-                deferred_clear=deferred_clear,
-                terminal_merge=terminal_merge,
-                inner_clear_policy=inner_clear_policy,
+                deferred_clear=False,
+                terminal_merge=True,
+                inner_clear_policy="transaction",
                 search_spec_evaluated=False,
             )
         self.assigned_line_by_no = self.build_assigned_line_by_no(template, layout)
@@ -1358,31 +1014,23 @@ class Stage3Solver:
                 expansions=0,
                 elapsed_seconds=round(time.monotonic() - started, 3),
                 layout=layout,
-                deferred_clear=deferred_clear,
-                terminal_merge=terminal_merge,
-                inner_clear_policy=inner_clear_policy,
+                deferred_clear=False,
+                terminal_merge=True,
+                inner_clear_policy="transaction",
             )
-        lower_bound_components = (
-            self.exact_operation_lower_bound_components(template)
-            if inner_clear_policy == "exact"
-            else self.template_operation_lower_bound_components(template)
-        )
+        lower_bound_components = self.template_operation_lower_bound_components(template)
         lower_bound = sum(lower_bound_components.values())
 
         def annotate(result: SearchResult) -> SearchResult:
             return replace(
                 result,
                 layout=layout,
-                deferred_clear=deferred_clear,
-                terminal_merge=terminal_merge,
-                inner_clear_policy=inner_clear_policy,
+                deferred_clear=False,
+                terminal_merge=True,
+                inner_clear_policy="transaction",
                 lower_bound=lower_bound,
                 lower_bound_components=tuple(sorted(lower_bound_components.items())),
-                lower_bound_scope=(
-                    "assignment_independent_relaxation"
-                    if inner_clear_policy == "exact"
-                    else "fixed_template_layout_relaxation"
-                ),
+                lower_bound_scope="fixed_template_layout_relaxation",
             )
         if template == "B":
             pickup_order = TEMPLATE_B_ORDER
@@ -1393,14 +1041,13 @@ class Stage3Solver:
         else:
             raise ValueError(f"unknown_template:{template}")
 
-        pickup_key = (template, layout, deferred_clear)
+        pickup_key = (template, layout)
         built = self.pickup_cache.get(pickup_key)
         if built is None:
             built_raw = self.apply_pickup_template(
                 pickup_order,
                 phase=phase,
                 template=template,
-                deferred_clear=deferred_clear,
             )
             built = (
                 (built_raw[0], tuple(built_raw[1]))
@@ -1421,50 +1068,710 @@ class Stage3Solver:
                 reasons=(),
                 expansions=0,
                 elapsed_seconds=round(time.monotonic() - started, 3),
+                committed_count=len(self.active_nos),
             ))
-        if inner_clear_policy == "exact":
-            if not allow_search:
-                raise ValueError("exact_mode_requires_search")
-            return annotate(self.search(
-                template,
-                state,
-                tuple(pickup_ops),
-                started,
-                hook_limit=improve_below_hooks,
-                expansion_limit=search_expansion_limit,
-            ))
-        greedy = self.greedy_finish(
+        return annotate(self.plan_transactions(
             template,
             state,
-            list(pickup_ops),
+            tuple(pickup_ops),
             started,
-            terminal_merge=terminal_merge,
-            inner_clear_policy=inner_clear_policy,
+            expansion_limit=transaction_expansion_limit,
+        ))
+
+    def stable_closure(
+        self,
+        state: State,
+        seed: frozenset[str],
+    ) -> frozenset[str]:
+        line_map = self.line_map(state)
+        line_by_no = {
+            no: line
+            for line, nos in line_map.items()
+            for no in nos
+        }
+        position_by_no = dict(state.positioned_positions)
+        closure = set(seed)
+        changed = True
+        while changed:
+            changed = False
+            for no in self.active_nos - closure:
+                if no in set(state.held):
+                    continue
+                assigned = self.assigned_line_by_no.get(no, "")
+                line = line_by_no.get(no, "")
+                if not assigned or line != assigned:
+                    continue
+                slot = self.assigned_slot_by_no.get(no)
+                if slot is not None and position_by_no.get(no) != slot[1]:
+                    continue
+                if line in set(DEPOT_IN):
+                    deeper = {
+                        other
+                        for other, other_slot in self.assigned_slot_by_no.items()
+                        if other_slot[0] == line and other_slot[1] > (slot[1] if slot else 0)
+                    }
+                    if not deeper <= closure:
+                        continue
+                elif line in set(DEPOT_OUT):
+                    paired_inner = DEPOT_IN_BY_OUT[line]
+                    pending_inner = {
+                        other
+                        for other, target in self.assigned_line_by_no.items()
+                        if target == paired_inner
+                    }
+                    if not pending_inner <= closure:
+                        continue
+                elif no in self.restoration_position_nos:
+                    initial_position = int(self.meta[no].get("Position") or 0)
+                    if line_map.get(line, ()).index(no) + 1 != initial_position:
+                        continue
+                closure.add(no)
+                changed = True
+        return frozenset(closure)
+
+    def committed_projection(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[tuple[str, str, int], ...]:
+        line_map = self.line_map(state)
+        position_by_no = dict(state.positioned_positions)
+        rows: list[tuple[str, str, int]] = []
+        for no in sorted(committed):
+            found = [line for line, nos in line_map.items() if no in nos]
+            if not found:
+                rows.append((no, "", 0))
+                continue
+            line = found[0]
+            if line in set(DEPOT_OUT) and self.assigned_slot_by_no.get(no) is None:
+                committed_order = tuple(
+                    item for item in line_map[line] if item in committed
+                )
+                position = committed_order.index(no) + 1
+            else:
+                position = position_by_no.get(no, line_map[line].index(no) + 1)
+            rows.append((no, line, position))
+        return tuple(rows)
+
+    def transaction_neighbors(
+        self,
+        state: State,
+        template: str,
+    ) -> Iterable[transactions.LegalTransition[State, Op]]:
+        emitted: set[State] = set()
+        for op, next_state, reject in self.neighbors(state, template):
+            if reject:
+                continue
+            if next_state in emitted:
+                continue
+            emitted.add(next_state)
+            yield transactions.LegalTransition(op, next_state)
+
+    def capacity_exchange_transactions(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[transactions.Transaction[State, Op, str], ...]:
+        """Atomically exchange an accessible staging prefix for one pending car."""
+
+        line_map = self.line_map(state)
+        before = self.stable_closure(state, committed)
+        before_projection = self.committed_projection(state, before)
+        out: list[transactions.Transaction[State, Op, str]] = []
+        for no in sorted(self.active_nos - before):
+            if not self.is_stage4_deferred(no) or no in set(state.held):
+                continue
+            target = self.assigned_line_by_no.get(no, "")
+            if target not in set(STAGE4_STAGING_LINES):
+                continue
+            source = next(
+                (line for line, nos in line_map.items() if no in nos),
+                "",
+            )
+            if not source or source == target:
+                continue
+            ordered_target = tuple(line_map.get(target, ()))
+            required = self.length((no,))
+            free = float(rv.TRACK_LEN[target]) - self.length(ordered_target) - sum(
+                float(car["Length"]) for car in self.fixed_cars if car["Line"] == target
+            )
+            release: list[str] = []
+            released = 0.0
+            for blocker in ordered_target:
+                if blocker in before:
+                    break
+                blocker_target = self.assigned_line_by_no.get(blocker, "")
+                if blocker_target == target:
+                    break
+                release.append(blocker)
+                released += self.length((blocker,))
+                if free + released + rv.TOL >= required:
+                    break
+            if free + released + rv.TOL < required or not release:
+                continue
+            release_move = tuple(release)
+            release_target = self.common_assigned_target(release_move)
+            if release_target not in set(STAGE4_STAGING_LINES) or release_target == target:
+                continue
+            working = state
+            macro_ops: list[Op] = []
+            get_release, working, reject = self.apply_get(working, target, release_move)
+            if reject:
+                continue
+            macro_ops.append(replace(get_release, note=f"transaction_release_capacity:{target}"))
+            put_release, working, reject = self.apply_put(working, release_target, release_move)
+            if reject:
+                continue
+            macro_ops.append(replace(put_release, note=f"transaction_rehome_prefix:{release_target}"))
+            current_source = tuple(self.line_map(working).get(source, ()))
+            if not current_source or current_source[0] != no:
+                continue
+            get_pending, working, reject = self.apply_get(working, source, (no,))
+            if reject:
+                continue
+            macro_ops.append(replace(get_pending, note=f"transaction_collect_deferred:{target}"))
+            put_pending, working, reject = self.apply_put(working, target, (no,))
+            if reject:
+                continue
+            macro_ops.append(replace(put_pending, note=f"transaction_commit_deferred:{target}"))
+            after = self.stable_closure(working, before)
+            if not before < after:
+                continue
+            if self.committed_projection(working, before) != before_projection:
+                continue
+            out.append(transactions.Transaction(
+                start_state=state,
+                end_state=working,
+                actions=tuple(macro_ops),
+                committed_before=before,
+                committed_after=after,
+                cost=self.ops_cost(macro_ops),
+            ))
+        return tuple(out)
+
+    def direct_put_transactions(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[transactions.Transaction[State, Op, str], ...]:
+        """Return one-Put transactions that immediately enlarge stable closure."""
+
+        if not state.held:
+            return ()
+        before = self.stable_closure(state, committed)
+        before_projection = self.committed_projection(state, before)
+        out: list[transactions.Transaction[State, Op, str]] = []
+        emitted: set[tuple[State, frozenset[str]]] = set()
+        for line, move in self.put_suffixes(state):
+            op, end_state, reject = self.apply_put(state, line, move)
+            if reject:
+                continue
+            after = self.stable_closure(end_state, before)
+            key = (end_state, after)
+            if (
+                not before < after
+                or key in emitted
+                or self.committed_projection(end_state, before) != before_projection
+            ):
+                continue
+            emitted.add(key)
+            action = replace(op, note=f"transaction_direct_put:{line}")
+            out.append(transactions.Transaction(
+                start_state=state,
+                end_state=end_state,
+                actions=(action,),
+                committed_before=before,
+                committed_after=after,
+                cost=self.delta(action),
+            ))
+        return tuple(out)
+
+    def gate_chain_transactions(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[transactions.Transaction[State, Op, str], ...]:
+        """Build arbitrary-depth acyclic door chains and commit them atomically."""
+
+        before = self.stable_closure(state, committed)
+        before_projection = self.committed_projection(state, before)
+        results: list[transactions.Transaction[State, Op, str]] = []
+
+        def close_inner(
+            working: State,
+            move: tuple[str, ...],
+            target: str,
+            seen_targets: frozenset[str],
+        ) -> tuple[tuple[Op, ...], State] | None:
+            if target in seen_targets or not self.depot_move_is_ready(working, target, move):
+                return None
+            outer = DEPOT_OUT_BY_IN[target]
+            gate = tuple(self.line_map(working).get(outer, ()))
+            ops: list[Op] = []
+            if gate:
+                get_gate, working, reject = self.apply_get(working, outer, gate)
+                if reject:
+                    return None
+                ops.append(replace(get_gate, note=f"transaction_gate_chain_get:{target}"))
+                gate_target = self.common_assigned_target(gate)
+                if gate_target in set(DEPOT_IN):
+                    nested = close_inner(
+                        working,
+                        gate,
+                        gate_target,
+                        seen_targets | {target},
+                    )
+                    if nested is None:
+                        return None
+                    nested_ops, working = nested
+                    ops.extend(nested_ops)
+                elif gate_target in set(STAGE4_STAGING_LINES) and gate_target != outer:
+                    put_gate, working, reject = self.apply_put(working, gate_target, gate)
+                    if reject:
+                        return None
+                    ops.append(replace(
+                        put_gate,
+                        note=f"transaction_gate_chain_rehome:{gate_target}",
+                    ))
+                else:
+                    return None
+            put_inner, working, reject = self.apply_put(working, target, move)
+            if reject:
+                return None
+            ops.append(replace(put_inner, note=f"transaction_gate_chain_commit:{target}"))
+            return tuple(ops), working
+
+        for start in range(len(state.held)):
+            move = state.held[start:]
+            target = self.common_assigned_target(move)
+            if target not in set(DEPOT_IN):
+                continue
+            closed = close_inner(state, move, target, frozenset())
+            if closed is None:
+                continue
+            macro_ops, end_state = closed
+            after = self.stable_closure(end_state, before)
+            if not before < after:
+                continue
+            if self.committed_projection(end_state, before) != before_projection:
+                continue
+            results.append(transactions.Transaction(
+                start_state=state,
+                end_state=end_state,
+                actions=macro_ops,
+                committed_before=before,
+                committed_after=after,
+                cost=self.ops_cost(macro_ops),
+            ))
+        return tuple(results)
+
+    def alignment_transactions(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[transactions.Transaction[State, Op, str], ...]:
+        """Enumerate staging sequences that expose and commit a deepest slot."""
+
+        if not state.held:
+            return ()
+        before = self.stable_closure(state, committed)
+        before_projection = self.committed_projection(state, before)
+        position_by_no = {
+            no: position
+            for no, (_line, position) in self.assigned_slot_by_no.items()
+        }
+        results: list[transactions.Transaction[State, Op, str]] = []
+        for inner in DEPOT_IN:
+            pending = [
+                no
+                for no, slot in self.assigned_slot_by_no.items()
+                if slot[0] == inner
+                and no not in before
+                and no in set(state.held)
+            ]
+            if not pending:
+                continue
+            deepest = max(pending, key=lambda no: (position_by_no[no], no))
+            index = state.held.index(deepest)
+            if index == len(state.held) - 1:
+                continue
+            serial = itertools.count()
+            staging_frontier: list[
+                tuple[
+                    int,
+                    tuple[int, int, int, int],
+                    int,
+                    State,
+                    tuple[Op, ...],
+                ]
+            ] = [(len(state.held), (0, 0, 0, 0), next(serial), state, ())]
+            best_staging_cost = {state: (0, 0, 0, 0)}
+            expanded = 0
+            while staging_frontier and expanded < ALIGNMENT_STATE_BUDGET:
+                if self.deadline_reached():
+                    self.search_space_evaluation_incomplete = True
+                    break
+                _held_count, staged_cost, _serial, working, staged_ops = heapq.heappop(
+                    staging_frontier
+                )
+                if best_staging_cost.get(working) != staged_cost:
+                    continue
+                expanded += 1
+                if not working.held or deepest not in set(working.held):
+                    continue
+                deepest_index = working.held.index(deepest)
+                if deepest_index == len(working.held) - 1:
+                    for chain in self.gate_chain_transactions(working, before):
+                        if deepest not in chain.newly_committed:
+                            continue
+                        macro_ops = (*staged_ops, *chain.actions)
+                        after = self.stable_closure(chain.end_state, before)
+                        if not before < after:
+                            continue
+                        if (
+                            self.committed_projection(chain.end_state, before)
+                            != before_projection
+                        ):
+                            continue
+                        results.append(transactions.Transaction(
+                            start_state=state,
+                            end_state=chain.end_state,
+                            actions=macro_ops,
+                            committed_before=before,
+                            committed_after=after,
+                            cost=self.ops_cost(macro_ops),
+                        ))
+                    continue
+
+                run_target = self.assigned_line_by_no.get(working.held[-1], "")
+                run_start = len(working.held) - 1
+                while (
+                    run_start > deepest_index + 1
+                    and self.assigned_line_by_no.get(working.held[run_start - 1], "")
+                    == run_target
+                ):
+                    run_start -= 1
+                for chunk_start in range(run_start, len(working.held)):
+                    move = working.held[chunk_start:]
+                    pending_inners = self.pending_inner_targets(
+                        working,
+                        exclude=set(move),
+                    )
+                    candidate_lines = sorted(
+                        STAGE4_STAGING_LINES,
+                        key=lambda line: (
+                            line != UNWHEEL and DEPOT_IN_BY_OUT[line] in pending_inners,
+                            line != run_target,
+                            line != UNWHEEL,
+                            self.line_number(line),
+                        ),
+                    )
+                    for line in candidate_lines:
+                        if not self.put_candidate_allowed(working, line, move):
+                            continue
+                        op, next_state, reject = self.apply_put(working, line, move)
+                        if reject:
+                            continue
+                        if (
+                            self.committed_projection(next_state, before)
+                            != before_projection
+                        ):
+                            continue
+                        next_ops = (*staged_ops, replace(
+                            op,
+                            note=f"transaction_align_stage:{inner}",
+                        ))
+                        next_cost = self.ops_cost(next_ops)
+                        incumbent = best_staging_cost.get(next_state)
+                        if incumbent is not None and incumbent <= next_cost:
+                            continue
+                        best_staging_cost[next_state] = next_cost
+                        heapq.heappush(
+                            staging_frontier,
+                            (
+                                len(next_state.held),
+                                next_cost,
+                                next(serial),
+                                next_state,
+                                next_ops,
+                            ),
+                        )
+            if staging_frontier:
+                self.search_space_evaluation_incomplete = True
+
+        best_results: dict[
+            tuple[State, frozenset[str]],
+            transactions.Transaction[State, Op, str],
+        ] = {}
+        for candidate in results:
+            key = (candidate.end_state, candidate.committed_after)
+            incumbent = best_results.get(key)
+            if incumbent is None or candidate.cost < incumbent.cost:
+                best_results[key] = candidate
+        return tuple(best_results.values())
+
+    def transaction_progress_key(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[int, int, int, int, int]:
+        """Order planner states by monotone closure progress, then obstruction."""
+
+        line_by_no = {
+            no: line
+            for line, nos in self.line_map(state).items()
+            for no in nos
+        }
+        pending = self.active_nos - committed
+        trapped_inner_sources = sum(
+            line_by_no.get(no) in set(DEPOT_IN)
+            and line_by_no.get(no) != self.assigned_line_by_no.get(no)
+            for no in pending
         )
-        return annotate(greedy)
+        pending_inner_slots = sum(
+            self.assigned_line_by_no.get(no) in set(DEPOT_IN)
+            for no in pending
+        )
+        misplaced_staged_cars = sum(
+            line_by_no.get(no) in set(STAGE4_STAGING_LINES)
+            and line_by_no.get(no) != self.assigned_line_by_no.get(no)
+            for no in pending
+        )
+        return (
+            len(pending),
+            trapped_inner_sources,
+            pending_inner_slots,
+            misplaced_staged_cars,
+            len(state.held),
+        )
 
-    def template_operation_lower_bound(self, template: str) -> int:
-        return sum(self.template_operation_lower_bound_components(template).values())
+    def plan_transactions(
+        self,
+        template: str,
+        start: State,
+        prefix_ops: tuple[Op, ...],
+        started: float,
+        *,
+        expansion_limit: int,
+    ) -> SearchResult:
+        initial_committed = self.stable_closure(start, frozenset())
+        initial_cost = self.ops_cost(prefix_ops)
+        initial_progress = self.transaction_progress_key(start, initial_committed)
 
-    def exact_operation_lower_bound_components(self, template: str) -> dict[str, int]:
-        """Assignment-independent relaxation for exact-search candidates."""
-        must_move = {
-            no
-            for no in self.active_nos
-            if not self.terminal_line_satisfied(no, self.meta[no]["Line"])
-        }
-        inner_epochs = {
-            1 if template == "A" and self.meta[no]["Line"] == TEMPLATE_A_SECOND_LINE else 0
-            for no in must_move
-            if self.inner_target_lines(no)
-        }
-        non_inner = [no for no in must_move if not self.inner_target_lines(no)]
-        return {
-            "source_gets": len({self.meta[no]["Line"] for no in must_move}),
-            "inner_puts": len(inner_epochs),
-            "non_inner_puts": self.minimum_non_inner_terminal_lines(non_inner),
-            "frontier_rehandle": 0,
-        }
+        serial = itertools.count()
+        frontier: list[
+            tuple[
+                int,
+                int,
+                int,
+                int,
+                int,
+                tuple[int, int, int, int],
+                int,
+                State,
+                frozenset[str],
+                tuple[Op, ...],
+            ]
+        ] = [
+            (
+                *initial_progress,
+                initial_cost,
+                next(serial),
+                start,
+                initial_committed,
+                prefix_ops,
+            )
+        ]
+        best_cost: dict[
+            tuple[State, frozenset[str]], tuple[int, int, int, int]
+        ] = {(start, initial_committed): initial_cost}
+        best_partial = (start, initial_committed, prefix_ops)
+        best_budgeted_progress = initial_progress
+        expansions = 0
+        post_budget_states = 0
+        search_complete = True
+        exhaustion_reason = ""
+
+        while frontier:
+            if self.deadline_reached():
+                return SearchResult(
+                    status="partial",
+                    template=template,
+                    state=best_partial[0],
+                    ops=best_partial[2],
+                    cost=(INF_COST, 0, 0, 0),
+                    reasons=("stage3_global_time_budget_exhausted",),
+                    expansions=expansions,
+                    elapsed_seconds=round(time.monotonic() - started, 3),
+                    search_spec_evaluated=False,
+                    committed_count=len(best_partial[1]),
+                    budgeted_progress_key=best_budgeted_progress,
+                )
+            (
+                _remaining,
+                _trapped_inner_sources,
+                _pending_inner_slots,
+                _misplaced_staged_cars,
+                _held_count,
+                path_cost,
+                _serial,
+                state,
+                committed,
+                ops,
+            ) = heapq.heappop(frontier)
+            if best_cost.get((state, committed)) != path_cost:
+                continue
+            if self.complete(state):
+                return SearchResult(
+                    status="complete",
+                    template=template,
+                    state=state,
+                    ops=ops,
+                    cost=self.ops_cost(ops),
+                    reasons=(),
+                    expansions=expansions,
+                    elapsed_seconds=round(time.monotonic() - started, 3),
+                    # This is the first feasible planner goal under a progress
+                    # potential, not an exhausted cost-ordered frontier.
+                    search_spec_evaluated=False,
+                    committed_count=len(committed),
+                    budgeted_progress_key=(0, 0, 0, 0, 0),
+                )
+            search_budget_open = expansions < expansion_limit
+            if not search_budget_open:
+                if post_budget_states >= POST_BUDGET_FRONTIER_WIDTH:
+                    search_complete = False
+                    exhaustion_reason = "transaction_post_budget_frontier_exhausted"
+                    break
+                post_budget_states += 1
+            closed_form = (
+                *self.direct_put_transactions(state, committed),
+                *self.capacity_exchange_transactions(state, committed),
+                *self.gate_chain_transactions(state, committed),
+            )
+            structural = (
+                *closed_form,
+                *(
+                    self.alignment_transactions(state, committed)
+                    if search_budget_open
+                    else ()
+                ),
+            )
+            searched_transactions: tuple[
+                transactions.Transaction[State, Op, str], ...
+            ] = ()
+            if search_budget_open:
+                remaining_expansions = expansion_limit - expansions
+                searched = transactions.enumerate_minimal_transactions(
+                    start_state=state,
+                    committed=committed,
+                    legal_neighbors=lambda current: self.transaction_neighbors(current, template),
+                    stable_closure=self.stable_closure,
+                    committed_projection=self.committed_projection,
+                    action_cost=self.delta,
+                    is_closed=lambda _state: True,
+                    state_key=lambda current: current,
+                    zero_cost=(0, 0, 0, 0),
+                    budget=transactions.SearchBudget(
+                        deadline=self.deadline,
+                        max_expansions=min(
+                            remaining_expansions,
+                            500 if structural else remaining_expansions,
+                        ),
+                    ),
+                )
+                expansions += searched.expansions
+                searched_transactions = searched.transactions
+                if not searched.search_spec_evaluated:
+                    search_complete = False
+                    exhaustion_reason = searched.termination.value
+            else:
+                search_complete = False
+                exhaustion_reason = "transaction_expansion_budget_exhausted"
+            candidates_by_state: dict[
+                tuple[State, frozenset[str]],
+                transactions.Transaction[State, Op, str],
+            ] = {}
+            for candidate in (*structural, *searched_transactions):
+                key = (candidate.end_state, candidate.committed_after)
+                incumbent = candidates_by_state.get(key)
+                if incumbent is None or candidate.cost < incumbent.cost:
+                    candidates_by_state[key] = candidate
+            candidates = tuple(candidates_by_state.values())
+            if not candidates:
+                if expansions >= expansion_limit:
+                    search_complete = False
+                    exhaustion_reason = "transaction_expansion_budget_exhausted"
+                continue
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    -len(item.newly_committed),
+                    self.unsatisfied_active_count(item.end_state),
+                    item.cost,
+                    tuple((op.action, op.line, op.move) for op in item.actions),
+                ),
+            )
+            for candidate in ordered:
+                if not committed < candidate.committed_after:
+                    raise RuntimeError("transaction_did_not_expand_stable_closure")
+                candidate_ops = (*ops, *candidate.actions)
+                candidate_cost = self.ops_cost(candidate_ops)
+                key = (candidate.end_state, candidate.committed_after)
+                incumbent = best_cost.get(key)
+                if incumbent is not None and incumbent <= candidate_cost:
+                    continue
+                best_cost[key] = candidate_cost
+                candidate_remaining = len(
+                    self.active_nos - candidate.committed_after
+                )
+                if (
+                    search_budget_open
+                    and candidate_remaining < len(self.active_nos - best_partial[1])
+                ):
+                    best_partial = (
+                        candidate.end_state,
+                        candidate.committed_after,
+                        candidate_ops,
+                    )
+                candidate_progress = self.transaction_progress_key(
+                    candidate.end_state,
+                    candidate.committed_after,
+                )
+                if search_budget_open:
+                    best_budgeted_progress = min(
+                        best_budgeted_progress,
+                        candidate_progress,
+                    )
+                heapq.heappush(
+                    frontier,
+                    (
+                        *candidate_progress,
+                        candidate_cost,
+                        next(serial),
+                        candidate.end_state,
+                        candidate.committed_after,
+                        candidate_ops,
+                    ),
+                )
+
+        return SearchResult(
+            status="partial",
+            template=template,
+            state=best_partial[0],
+            ops=best_partial[2],
+            cost=(INF_COST, 0, 0, 0),
+            reasons=(
+                exhaustion_reason
+                if not search_complete and exhaustion_reason
+                else "no_strict_progress_transaction",
+            ),
+            expansions=expansions,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            search_spec_evaluated=search_complete,
+            committed_count=len(best_partial[1]),
+            budgeted_progress_key=best_budgeted_progress,
+        )
 
     def template_operation_lower_bound_components(self, template: str) -> dict[str, int]:
         """Cheap admissible hook bound for one fixed template/layout search spec."""
@@ -1564,6 +1871,21 @@ class Stage3Solver:
     def minimum_non_inner_terminal_lines(self, nos: list[str]) -> int:
         if not nos:
             return 0
+        fixed_return_lines = {
+            self.assigned_line_by_no[no]
+            for no in nos
+            if no in self.restoration_nos
+            and self.assigned_line_by_no[no] not in set(STAGE4_STAGING_LINES)
+        }
+        packing_nos = [
+            no
+            for no in nos
+            if no not in self.restoration_nos
+            or self.assigned_line_by_no[no] in set(STAGE4_STAGING_LINES)
+        ]
+        fixed_return_puts = len(fixed_return_lines)
+        if not packing_nos:
+            return fixed_return_puts
         fixed_load = {
             line: sum(
                 float(car["Length"])
@@ -1578,13 +1900,18 @@ class Stage3Solver:
         }
         allowed = {
             no: (
-                set(STAGE4_STAGING_LINES)
+                {self.assigned_line_by_no[no]}
+                if no in self.restoration_nos
+                else set(STAGE4_STAGING_LINES)
                 if self.is_stage4_deferred(no)
                 else self.outer_target_lines(no)
             )
-            for no in nos
+            for no in packing_nos
         }
-        ordered = sorted(nos, key=lambda no: (len(allowed[no]), -self.length((no,)), no))
+        ordered = sorted(
+            packing_nos,
+            key=lambda no: (len(allowed[no]), -self.length((no,)), no),
+        )
 
         def pack(index: int, chosen: frozenset[str]) -> bool:
             if index == len(ordered):
@@ -1608,601 +1935,12 @@ class Stage3Solver:
                     continue
                 snapshot = dict(remaining)
                 if pack(0, chosen):
-                    return count
+                    return fixed_return_puts + count
                 remaining.update(snapshot)
-        return len(lines)
+        return fixed_return_puts + len(lines)
 
     def deadline_reached(self) -> bool:
         return time.monotonic() >= self.deadline
-
-    def greedy_finish(
-        self,
-        template: str,
-        state: State,
-        ops: list[Op],
-        started: float,
-        *,
-        terminal_merge: bool,
-        inner_clear_policy: str,
-    ) -> SearchResult:
-        if inner_clear_policy not in {"eager", "just_in_time"}:
-            raise ValueError(f"unknown_inner_clear_policy:{inner_clear_policy}")
-        seen: set[State] = set()
-        for _step in range(120):
-            if self.deadline_reached():
-                break
-            if self.complete(state):
-                return SearchResult(
-                    status="complete",
-                    template=template,
-                    state=state,
-                    ops=tuple(ops),
-                    cost=self.ops_cost(ops),
-                    reasons=(),
-                    expansions=0,
-                    elapsed_seconds=round(time.monotonic() - started, 3),
-                )
-            if state in seen:
-                break
-            seen.add(state)
-
-            if template == "A" and state.phase == 0 and not state.held:
-                applied_wash = self.greedy_get_template_a_second(state)
-                if applied_wash:
-                    op, state = applied_wash
-                    ops.append(op)
-                    continue
-                if any(
-                    no in self.task_nos
-                    for no in self.line_map(state).get(TEMPLATE_A_SECOND_LINE, ())
-                ):
-                    break
-                state = State(
-                    lines=state.lines,
-                    held=state.held,
-                    loco=state.loco,
-                    phase=1,
-                    positioned_positions=state.positioned_positions,
-                )
-                continue
-
-            if state.held:
-                if inner_clear_policy == "eager":
-                    applied = self.greedy_get_blocking_inner(state)
-                    if applied:
-                        op, state = applied
-                        ops.append(op)
-                        continue
-                gate_macro = self.greedy_clear_gate_macro(state)
-                if gate_macro:
-                    macro_ops, state = gate_macro
-                    ops.extend(macro_ops)
-                    continue
-                if inner_clear_policy == "just_in_time":
-                    applied = self.greedy_get_tail_blocking_inner(state)
-                    if applied:
-                        op, state = applied
-                        ops.append(op)
-                        continue
-                last_op = ops[-1] if ops else None
-                applied = self.greedy_put_ready_inner(state)
-                if not applied:
-                    applied = self.greedy_put_terminal_without_new_door_debt(
-                        state,
-                        last_op=last_op,
-                    )
-                if not applied:
-                    applied = self.greedy_put_alignment_blockers(
-                        state,
-                        avoid_line=(
-                            last_op.line
-                            if last_op and last_op.action == "Get"
-                            else ""
-                        ),
-                    )
-                if not applied and terminal_merge:
-                    applied = self.greedy_put_terminal_compatible_suffix(state)
-                if not applied:
-                    applied = self.greedy_put(state, last_op=last_op)
-                if not applied and inner_clear_policy == "just_in_time":
-                    applied = self.greedy_get_blocking_inner(state)
-                if not applied:
-                    applied = self.greedy_get_blocking_outer(state)
-                if not applied:
-                    break
-                op, state = applied
-                ops.append(op)
-                continue
-
-            applied_get = self.greedy_get_outer(state)
-            if not applied_get:
-                break
-            op, state = applied_get
-            ops.append(op)
-
-        return SearchResult(
-            status="partial",
-            template=template,
-            state=None,
-            ops=tuple(ops),
-            cost=(INF_COST, 0, 0, 0),
-            reasons=("greedy_no_completion",),
-            expansions=0,
-            elapsed_seconds=round(time.monotonic() - started, 3),
-        )
-
-    def greedy_get_template_a_second(self, state: State) -> tuple[Op, State] | None:
-        line_map = self.line_map(state)
-        pickup_nos = set(
-            self.initial_source_pickup_map().get(TEMPLATE_A_SECOND_LINE, ())
-        )
-        wash = tuple(
-            no for no in line_map.get(TEMPLATE_A_SECOND_LINE, ()) if no in pickup_nos
-        )
-        for cut in range(len(wash), 0, -1):
-            move = wash[:cut]
-            next_phase = 1 if cut == len(wash) else 0
-            op, next_state, reject = self.apply_get(
-                state,
-                TEMPLATE_A_SECOND_LINE,
-                move,
-                allow_source=True,
-                next_phase=next_phase,
-            )
-            if not reject:
-                return op, next_state
-        return None
-
-    def greedy_put(self, state: State, *, last_op: Op | None = None) -> tuple[Op, State] | None:
-        held = state.held
-        avoid_outer_line = last_op.line if last_op and last_op.action == "Get" and last_op.line in set(DEPOT_OUT) else ""
-        for start in range(len(held)):
-            move = held[start:]
-            target = self.common_assigned_target(move)
-            if not target:
-                continue
-            preferred_lines = self.greedy_preferred_put_lines(
-                state,
-                target,
-                move,
-                held[:start],
-                avoid_outer_line=avoid_outer_line,
-            )
-            for line in preferred_lines:
-                if not self.put_candidate_allowed(state, line, move):
-                    continue
-                op, next_state, reject = self.apply_put(state, line, move)
-                if not reject:
-                    return op, next_state
-        return None
-
-    def greedy_put_ready_inner(self, state: State) -> tuple[Op, State] | None:
-        for start in range(len(state.held)):
-            move = state.held[start:]
-            target = self.common_assigned_target(move)
-            if target not in set(DEPOT_IN):
-                continue
-            if not self.depot_move_is_ready(state, target, move):
-                continue
-            if not self.put_candidate_allowed(state, target, move):
-                continue
-            op, next_state, reject = self.apply_put(state, target, move)
-            if not reject:
-                return op, next_state
-        return None
-
-    def greedy_put_terminal_without_new_door_debt(
-        self,
-        state: State,
-        *,
-        last_op: Op | None,
-    ) -> tuple[Op, State] | None:
-        """Commit a terminal suffix when it cannot create another door-clear cycle."""
-        line_map = self.line_map(state)
-        for start in range(len(state.held)):
-            move = state.held[start:]
-            pending_inner = self.pending_inner_targets(state, exclude=set(move))
-            candidates = [
-                line
-                for line in STAGE4_STAGING_LINES
-                if all(self.terminal_line_satisfied(no, line) for no in move)
-                and self.line_has_capacity(state, line, move)
-                and not any(
-                    self.assigned_line_by_no.get(no) == line
-                    for no in state.held[:start]
-                )
-                and (
-                    line == UNWHEEL
-                    or DEPOT_IN_BY_OUT[line] not in pending_inner
-                    or bool(line_map.get(line))
-                )
-            ]
-            if candidates:
-                shared = self.greedy_put_shared_retrieved_block(
-                    state,
-                    terminal_start=start,
-                    last_op=last_op,
-                )
-                if shared:
-                    return shared
-                shared = self.greedy_put_shared_noninner_block(state, start)
-                if shared:
-                    return shared
-            for line in sorted(
-                candidates,
-                key=lambda candidate: (
-                    not bool(line_map.get(candidate)),
-                    candidate == UNWHEEL,
-                    self.line_number(candidate),
-                    candidate,
-                ),
-            ):
-                op, next_state, reject = self.apply_put(state, line, move)
-                if not reject:
-                    return replace(op, note=f"commit_terminal_without_new_door_debt:{line}"), next_state
-        return None
-
-    def greedy_put_shared_retrieved_block(
-        self,
-        state: State,
-        *,
-        terminal_start: int,
-        last_op: Op | None,
-    ) -> tuple[Op, State] | None:
-        if (
-            last_op is None
-            or last_op.action != "Get"
-            or last_op.line not in set(STAGE4_STAGING_LINES)
-            or len(last_op.move) <= len(state.held) - terminal_start
-            or state.held[-len(last_op.move):] != last_op.move
-        ):
-            return None
-        move = last_op.move
-        pending_inner = self.pending_inner_targets(state, exclude=set(move))
-        for line in sorted(
-            STAGE4_STAGING_LINES,
-            key=lambda candidate: (
-                candidate != UNWHEEL and DEPOT_IN_BY_OUT[candidate] in pending_inner,
-                candidate != UNWHEEL,
-                self.line_number(candidate),
-                candidate,
-            ),
-        ):
-            if line == last_op.line or not self.line_is_empty(state, line):
-                continue
-            if not self.line_has_capacity(state, line, move):
-                continue
-            op, next_state, reject = self.apply_put(state, line, move)
-            if not reject:
-                return replace(op, note=f"preserve_retrieved_block:{line}"), next_state
-        return None
-
-    def greedy_put_shared_noninner_block(
-        self,
-        state: State,
-        terminal_start: int,
-    ) -> tuple[Op, State] | None:
-        block_start = terminal_start
-        while block_start > 0:
-            prior = state.held[block_start - 1]
-            if self.assigned_line_by_no.get(prior, "") in set(DEPOT_IN):
-                break
-            block_start -= 1
-        if block_start == terminal_start:
-            return None
-        move = state.held[block_start:]
-
-        keep_inner_open = ""
-        if block_start > 0:
-            candidate = self.assigned_line_by_no.get(state.held[block_start - 1], "")
-            if candidate in set(DEPOT_IN):
-                keep_inner_open = candidate
-        pending_inner = self.pending_inner_targets(state, exclude=set(move))
-        candidate_lines = tuple(
-            line
-            for line in sorted(
-                STAGE4_STAGING_LINES,
-                key=lambda line: (
-                    line != UNWHEEL and DEPOT_IN_BY_OUT[line] in pending_inner,
-                    line != UNWHEEL,
-                    self.line_number(line),
-                    line,
-                ),
-            )
-            if (not keep_inner_open or line != DEPOT_OUT_BY_IN[keep_inner_open])
-            and self.line_is_empty(state, line)
-            and self.line_has_capacity(state, line, move)
-        )
-        for line in candidate_lines:
-            op, next_state, reject = self.apply_put(state, line, move)
-            if not reject:
-                return replace(op, note=f"share_noninner_finish:{line}"), next_state
-        return None
-
-    def greedy_put_alignment_blockers(
-        self,
-        state: State,
-        *,
-        avoid_line: str = "",
-    ) -> tuple[Op, State] | None:
-        """Buffer only the tail that hides a target line's next deepest car."""
-        next_no_by_line = self.next_assigned_no_by_line(state)
-        for index in range(len(state.held) - 2, -1, -1):
-            no = state.held[index]
-            target = self.assigned_line_by_no.get(no, "")
-            if target not in set(DEPOT_IN) or next_no_by_line.get(target) != no:
-                continue
-            move = state.held[index + 1:]
-            for line in self.alignment_buffer_lines(
-                state,
-                move,
-                keep_inner_open=target,
-                avoid_line=avoid_line,
-            ):
-                op, next_state, reject = self.apply_put(state, line, move)
-                if not reject:
-                    return replace(op, note=f"stage_alignment_block:{target}"), next_state
-        return None
-
-    def alignment_buffer_lines(
-        self,
-        state: State,
-        move: tuple[str, ...],
-        *,
-        keep_inner_open: str,
-        avoid_line: str,
-    ) -> tuple[str, ...]:
-        pending = self.pending_inner_targets(state, exclude=set(move))
-        return tuple(
-            line
-            for line in sorted(
-                STAGE4_STAGING_LINES,
-                key=lambda candidate: (
-                    candidate != UNWHEEL and DEPOT_IN_BY_OUT[candidate] in pending,
-                    candidate != UNWHEEL,
-                    self.line_number(candidate),
-                    candidate,
-                ),
-            )
-            if line not in {avoid_line, DEPOT_OUT_BY_IN[keep_inner_open]}
-            and self.line_is_empty(state, line)
-            and self.put_candidate_allowed(state, line, move)
-        )
-
-    def greedy_put_buffer_block(
-        self,
-        state: State,
-        move: tuple[str, ...],
-        *,
-        keep_inner_open: str,
-        avoid_line: str,
-    ) -> tuple[Op, State] | None:
-        for line in self.alignment_buffer_lines(
-            state,
-            move,
-            keep_inner_open=keep_inner_open,
-            avoid_line=avoid_line,
-        ):
-            op, next_state, reject = self.apply_put(state, line, move)
-            if not reject:
-                return replace(op, note=f"relocate_gate_block:{keep_inner_open}"), next_state
-        return None
-
-    def next_assigned_no_by_line(self, state: State) -> dict[str, str]:
-        line_map = self.line_map(state)
-        return {
-            line: max(
-                (
-                    (slot[1], no)
-                    for no, slot in self.assigned_slot_by_no.items()
-                    if slot[0] == line and no not in set(line_map.get(line, ()))
-                ),
-                default=(0, ""),
-            )[1]
-            for line in DEPOT_IN
-        }
-
-    def greedy_put_terminal_compatible_suffix(self, state: State) -> tuple[Op, State] | None:
-        """Put the longest mixed tail that can legally share one terminal line."""
-        held = state.held
-        for start in range(len(held)):
-            move = held[start:]
-            if len({self.assigned_line_by_no.get(no, "") for no in move}) <= 1:
-                continue
-            pending_before = held[:start]
-            pending_inner_targets = {
-                self.assigned_line_by_no.get(no, "")
-                for no in pending_before
-                if self.assigned_line_by_no.get(no, "") in set(DEPOT_IN)
-            }
-            candidate_lines = sorted(
-                STAGE4_STAGING_LINES,
-                key=lambda line: (
-                    line != UNWHEEL and DEPOT_IN_BY_OUT.get(line, "") in pending_inner_targets,
-                    line == UNWHEEL,
-                    self.line_number(line),
-                    line,
-                ),
-            )
-            for line in candidate_lines:
-                if not self.line_is_empty(state, line):
-                    continue
-                if not all(self.terminal_line_satisfied(no, line) for no in move):
-                    continue
-                if not self.put_candidate_allowed(state, line, move):
-                    continue
-                op, next_state, reject = self.apply_put(state, line, move)
-                if not reject:
-                    return replace(op, note=f"merge_terminal_blocks:{line}"), next_state
-        return None
-
-    def greedy_preferred_put_lines(
-        self,
-        state: State,
-        target: str,
-        move: tuple[str, ...],
-        pending_before: tuple[str, ...],
-        *,
-        avoid_outer_line: str = "",
-    ) -> tuple[str, ...]:
-        if target in set(STAGE3_SOURCE_LINES) and all(
-            no in self.restoration_nos for no in move
-        ):
-            return (target,)
-        if target in set(DEPOT_IN) and all(self.is_stage4_deferred(no) for no in move):
-            line_map = self.line_map(state)
-            outer = DEPOT_OUT_BY_IN[target]
-            pending_inner_targets = {
-                self.assigned_line_by_no.get(no)
-                for no in pending_before
-                if self.assigned_line_by_no.get(no) in set(DEPOT_IN)
-                and not self.is_stage4_deferred(no)
-            }
-            reusable_outers = tuple(
-                line
-                for line in DEPOT_OUT
-                if line != outer
-                and (
-                    not line_map.get(line)
-                    or all(self.terminal_line_satisfied(no, line) for no in line_map.get(line, ()))
-                )
-            )
-            nonblocking_outers = tuple(
-                line for line in reusable_outers if DEPOT_IN_BY_OUT[line] not in pending_inner_targets
-            )
-            blocking_outers = tuple(
-                line for line in reusable_outers if DEPOT_IN_BY_OUT[line] in pending_inner_targets
-            )
-            alternates = (UNWHEEL, *nonblocking_outers, *blocking_outers)
-            pending_same_inner = any(
-                self.assigned_line_by_no.get(no) == target and not self.is_stage4_deferred(no)
-                for no in pending_before
-            )
-            if pending_same_inner:
-                return (*alternates, outer, target)
-            return (target, *alternates, outer)
-        if target in set(DEPOT_OUT) and not all(self.is_stage4_deferred(no) for no in move):
-            pending_inner_targets = {
-                self.assigned_line_by_no.get(no)
-                for no in pending_before
-                if self.assigned_line_by_no.get(no) in set(DEPOT_IN)
-            }
-            line_map = self.line_map(state)
-            mergeable_staged_lines = tuple(
-                line
-                for line in DEPOT_OUT
-                if line != avoid_outer_line
-                and self.line_has_stage4_deferred(state, line)
-                and all(line in self.outer_target_lines(no) for no in move)
-                and self.line_has_capacity(state, line, move)
-            )
-            temporary_lines = tuple(
-                line
-                for line in STAGE4_STAGING_LINES
-                if line != target and line not in set(mergeable_staged_lines)
-                and self.line_is_empty(state, line)
-                and self.line_has_capacity(state, line, move)
-            )
-            nonblocking_alternates = tuple(
-                line
-                for line in temporary_lines
-                if line == UNWHEEL or DEPOT_IN_BY_OUT[line] not in pending_inner_targets
-            )
-            blocking_alternates = tuple(
-                line
-                for line in temporary_lines
-                if line != UNWHEEL and DEPOT_IN_BY_OUT[line] in pending_inner_targets
-            )
-            blocking_inner = DEPOT_IN_BY_OUT[target]
-            pending_same_target = any(
-                self.assigned_line_by_no.get(no) == target for no in pending_before
-            )
-            target_first_allowed = (
-                target != avoid_outer_line
-                and blocking_inner not in pending_inner_targets
-                and not pending_same_target
-            )
-            target_first = (target,) if target_first_allowed else ()
-            target_later = (target,) if target != avoid_outer_line and not target_first_allowed else ()
-            if any(self.assigned_line_by_no.get(no) == blocking_inner for no in pending_before):
-                return (
-                    *mergeable_staged_lines,
-                    *target_first,
-                    *nonblocking_alternates,
-                    *blocking_alternates,
-                    *target_later,
-                    blocking_inner,
-                )
-            return (
-                *mergeable_staged_lines,
-                *target_first,
-                *nonblocking_alternates,
-                *blocking_alternates,
-                *target_later,
-                blocking_inner,
-            )
-        if target in set(STAGE4_DEFER_LINES) and target not in set(DEPOT_IN):
-            line_map = self.line_map(state)
-            pending_inner_targets = {
-                self.assigned_line_by_no.get(no)
-                for no in pending_before
-                if self.assigned_line_by_no.get(no) in set(DEPOT_IN)
-                and not self.is_stage4_deferred(no)
-            }
-            alternates = tuple(
-                line
-                for line in STAGE4_STAGING_LINES
-                if line != target
-                and (
-                    not line_map.get(line)
-                    or all(self.terminal_line_satisfied(no, line) for no in line_map.get(line, ()))
-                )
-            )
-            def nonblocking(line: str) -> bool:
-                return line == UNWHEEL or DEPOT_IN_BY_OUT.get(line, "") not in pending_inner_targets
-
-            immediate_inner = ""
-            for no in reversed(pending_before):
-                if self.is_stage4_deferred(no):
-                    continue
-                candidate = self.assigned_line_by_no.get(no, "")
-                if candidate in set(DEPOT_IN):
-                    immediate_inner = candidate
-                    break
-            immediate_outer = DEPOT_OUT_BY_IN.get(immediate_inner, "")
-            target_first = (target,) if target in set(STAGE4_STAGING_LINES) and nonblocking(target) else ()
-            target_later = (target,) if target in set(STAGE4_STAGING_LINES) and not nonblocking(target) else ()
-            safe = tuple(line for line in alternates if nonblocking(line))
-            blocking = tuple(
-                sorted(
-                    (line for line in alternates if not nonblocking(line)),
-                    key=lambda line: (line == immediate_outer, self.line_number(line), line),
-                )
-            )
-            return (*target_first, *safe, *blocking, *target_later)
-        outer = DEPOT_OUT_BY_IN[target]
-        pending_inner_targets = self.pending_inner_targets(state, exclude=set(move))
-        buffers = tuple(
-            sorted(
-                (
-                    line
-                    for line in STAGE4_STAGING_LINES
-                    if line != outer
-                    and line != avoid_outer_line
-                    and self.line_is_empty(state, line)
-                    and self.line_has_capacity(state, line, move)
-                ),
-                key=lambda line: (
-                    line != UNWHEEL and DEPOT_IN_BY_OUT[line] in pending_inner_targets,
-                    line != UNWHEEL,
-                    self.line_number(line),
-                    line,
-                ),
-            )
-        )
-        if self.depot_move_is_ready(state, target, move):
-            return (target, *buffers, outer)
-        return (*buffers, outer, target)
 
     def common_assigned_target(self, nos: tuple[str, ...]) -> str:
         if not nos:
@@ -2214,370 +1952,12 @@ class Stage3Solver:
         allowed = set(DEPOT_TARGETS) | set(STAGE4_DEFER_LINES) | set(STAGE3_SOURCE_LINES)
         return target if target in allowed else ""
 
-    def greedy_get_outer(self, state: State) -> tuple[Op, State] | None:
-        line_map = self.line_map(state)
-        next_no_by_line = self.next_assigned_no_by_line(state)
-        ready_prefixes: list[tuple[int, str, str, tuple[str, ...]]] = []
-        for line in STAGE4_STAGING_LINES:
-            ordered = tuple(line_map.get(line, ()))
-            for index, no in enumerate(ordered):
-                target = self.assigned_line_by_no.get(no, "")
-                if target in set(DEPOT_IN) and next_no_by_line.get(target) == no:
-                    ready_prefixes.append((index + 1, target, line, ordered[: index + 1]))
-        for _length, target, line, move in sorted(ready_prefixes):
-            op, next_state, reject = self.apply_get(state, line, move)
-            if not reject:
-                return replace(op, note=f"retrieve_alignment_ready:{target}"), next_state
-        for line in (*DEPOT_OUT, UNWHEEL, *DEPOT_IN):
-            nos = tuple(line_map.get(line, ()))
-            if not nos:
-                continue
-            if (
-                self.line_can_stay_terminal(state, line, nos)
-                and not self.outer_blocks_held_inner(state, line)
-                and not self.outer_blocks_held_position(state, line)
-            ):
-                continue
-            op, next_state, reject = self.apply_get(state, line, nos)
-            if not reject:
-                return op, next_state
-        return None
-
-    def greedy_get_blocking_outer(self, state: State) -> tuple[Op, State] | None:
-        if state.held:
-            tail_target = self.assigned_line_by_no.get(state.held[-1], "")
-            if tail_target in set(DEPOT_IN):
-                outer = DEPOT_OUT_BY_IN[tail_target]
-                nos = tuple(self.line_map(state).get(outer, ()))
-                if nos:
-                    op, next_state, reject = self.apply_get(state, outer, nos)
-                    if not reject:
-                        return op, next_state
-        target = self.common_assigned_target(state.held)
-        if target in set(DEPOT_IN):
-            outer = DEPOT_OUT_BY_IN[target]
-            nos = tuple(self.line_map(state).get(outer, ()))
-            if nos:
-                op, next_state, reject = self.apply_get(state, outer, nos)
-                if not reject:
-                    return op, next_state
-        return self.greedy_get_outer(state)
-
-    def greedy_get_blocking_inner(self, state: State) -> tuple[Op, State] | None:
-        for line, move in self.blocking_inner_get_prefixes(state):
-            op, next_state, reject = self.apply_get(state, line, move)
-            if not reject:
-                return op, next_state
-        return None
-
-    def greedy_get_tail_blocking_inner(self, state: State) -> tuple[Op, State] | None:
-        """Clear only the inner line needed by the currently exposed tail.
-
-        A blocker for a deeper train group is not urgent while another tail
-        group can complete a different repair line.  Delaying that Get lets
-        the completed line's outer lead become permanent stage-4 staging,
-        avoiding the Get/Put rehandle created by eager clearing.
-        """
-        if not state.held:
-            return None
-        target = self.assigned_line_by_no.get(state.held[-1], "")
-        if target not in set(DEPOT_IN):
-            return None
-        for line, move in self.blocking_inner_get_prefixes(state):
-            if line != target:
-                continue
-            op, next_state, reject = self.apply_get(state, line, move)
-            if not reject:
-                return op, next_state
-        return None
-
-    def greedy_clear_gate_macro(
-        self,
-        state: State,
-    ) -> tuple[tuple[Op, ...], State] | None:
-        """Prove and atomically commit one bounded gate-clear transaction."""
-        if not state.held:
-            return None
-        ready = next(
-            (
-                (target, move)
-                for start in range(len(state.held))
-                for move in (state.held[start:],)
-                for target in (self.common_assigned_target(move),)
-                if target in set(DEPOT_IN)
-                and self.depot_move_is_ready(state, target, move)
-                and not self.plan_depot_put_positions(state, target, move)[1]
-            ),
-            None,
-        )
-        if ready is None:
-            return None
-        target, move = ready
-        outer = DEPOT_OUT_BY_IN[target]
-        outer_nos = tuple(self.line_map(state).get(outer, ()))
-        if not outer_nos:
-            return None
-        get_op, after_get, reject = self.apply_get(state, outer, outer_nos)
-        if reject:
-            return None
-
-        def is_original_commit(op: Op) -> bool:
-            return op.line == target and op.move == move
-
-        def committed(
-            prefix: tuple[Op, ...],
-            candidate: tuple[Op, State] | None,
-        ) -> tuple[tuple[Op, ...], State] | None:
-            if candidate is None:
-                return None
-            op, next_state = candidate
-            if not is_original_commit(op):
-                return None
-            return (
-                (
-                    replace(get_op, note=f"atomic_gate_clear:{target}"),
-                    *prefix,
-                    replace(op, note=f"atomic_inner_commit:{target}"),
-                ),
-                next_state,
-            )
-
-        permanent = self.greedy_put_ready_inner(after_get)
-        direct = committed((), permanent)
-        if direct:
-            return direct
-        if permanent:
-            permanent_op, after_permanent = permanent
-            direct = committed(
-                (replace(permanent_op, note=f"atomic_gate_permanent:{permanent_op.line}"),),
-                self.greedy_put_ready_inner(after_permanent),
-            )
-            if direct:
-                return direct
-
-        terminal = self.greedy_put_exposed_terminal_suffix(
-            after_get,
-            outer_nos,
-            avoid_line=outer,
-        )
-        if terminal:
-            terminal_op, after_terminal = terminal
-            terminal_prefix = (
-                replace(terminal_op, note=f"atomic_gate_terminal:{terminal_op.line}"),
-            )
-            ready_after_terminal = self.greedy_put_ready_inner(after_terminal)
-            direct = committed(terminal_prefix, ready_after_terminal)
-            if direct:
-                return direct
-            if ready_after_terminal:
-                ready_op, after_ready = ready_after_terminal
-                direct = committed(
-                    (
-                        *terminal_prefix,
-                        replace(ready_op, note=f"atomic_gate_permanent:{ready_op.line}"),
-                    ),
-                    self.greedy_put_ready_inner(after_ready),
-                )
-                if direct:
-                    return direct
-
-        relocated = self.greedy_put_buffer_block(
-            after_get,
-            outer_nos,
-            keep_inner_open=target,
-            avoid_line=outer,
-        )
-        relocation_creates_door_debt = bool(
-            relocated
-            and relocated[0].line in set(DEPOT_OUT)
-            and DEPOT_IN_BY_OUT[relocated[0].line]
-            in self.pending_inner_targets(after_get, exclude=set(outer_nos))
-        )
-        nested_dependency = (
-            self.nested_gate_dependency(
-                after_get,
-                original_target=target,
-                original_outer=outer,
-                first_gate=outer_nos,
-            )
-            if relocation_creates_door_debt
-            else None
-        )
-        if nested_dependency is not None:
-            nested = self.greedy_nested_gate_swap(
-                after_get,
-                original_target=target,
-                original_move=move,
-                original_outer=outer,
-                first_gate=outer_nos,
-                dependency=nested_dependency,
-            )
-            if nested is None:
-                return None
-            nested_ops, final_state = nested
-            return (
-                (
-                    replace(get_op, note=f"atomic_gate_clear:{target}"),
-                    *nested_ops,
-                ),
-                final_state,
-            )
-        if not relocated:
-            return None
-        relocate_op, after_relocate = relocated
-        direct = self.greedy_put_ready_inner(after_relocate)
-        if not direct:
-            return None
-        direct_op, final_state = direct
-        if direct_op.line != target or direct_op.move != move:
-            return None
-        return (
-            (
-                replace(get_op, note=f"atomic_gate_clear:{target}"),
-                replace(relocate_op, note=f"atomic_gate_relocate:{target}"),
-                replace(direct_op, note=f"atomic_inner_commit:{target}"),
-            ),
-            final_state,
-        )
-
-    def nested_gate_dependency(
-        self,
-        state: State,
-        *,
-        original_target: str,
-        original_outer: str,
-        first_gate: tuple[str, ...],
-    ) -> tuple[str, str, tuple[str, ...]] | None:
-        if not first_gate or state.held[-len(first_gate):] != first_gate:
-            raise ValueError("nested_gate_block_not_train_tail")
-        nested_target = self.common_assigned_target(first_gate)
-        if nested_target not in set(DEPOT_IN) or nested_target == original_target:
-            return None
-        if not self.depot_move_is_ready(state, nested_target, first_gate):
-            return None
-        if self.plan_depot_put_positions(state, nested_target, first_gate)[1]:
-            return None
-        nested_outer = DEPOT_OUT_BY_IN[nested_target]
-        second_gate = tuple(self.line_map(state).get(nested_outer, ()))
-        if not second_gate or nested_outer == original_outer:
-            return None
-        return nested_target, nested_outer, second_gate
-
-    def greedy_nested_gate_swap(
-        self,
-        state: State,
-        *,
-        original_target: str,
-        original_move: tuple[str, ...],
-        original_outer: str,
-        first_gate: tuple[str, ...],
-        dependency: tuple[str, str, tuple[str, ...]],
-    ) -> tuple[tuple[Op, ...], State] | None:
-        """Clear a proved two-door dependency and restore its inner gate atomically."""
-        if not first_gate or state.held[-len(first_gate):] != first_gate:
-            raise ValueError("nested_gate_block_not_train_tail")
-        nested_target, nested_outer, second_gate = dependency
-
-        get_nested, after_nested_get, reject = self.apply_get(
-            state,
-            nested_outer,
-            second_gate,
-        )
-        if reject:
-            return None
-        swap_out, after_swap_out, reject = self.apply_put(
-            after_nested_get,
-            original_outer,
-            second_gate,
-        )
-        if reject:
-            return None
-        nested_commit = self.greedy_put_ready_inner(after_swap_out)
-        if nested_commit is None:
-            return None
-        nested_put, after_nested_commit = nested_commit
-        if nested_put.line != nested_target or nested_put.move != first_gate:
-            return None
-
-        get_swapped, after_swapped_get, reject = self.apply_get(
-            after_nested_commit,
-            original_outer,
-            second_gate,
-        )
-        if reject:
-            return None
-        restore_gate, after_restore, reject = self.apply_put(
-            after_swapped_get,
-            nested_outer,
-            second_gate,
-        )
-        if reject:
-            return None
-        before_positions = dict(state.positioned_positions)
-        restored_positions = dict(after_restore.positioned_positions)
-        if any(
-            before_positions.get(no) != restored_positions.get(no)
-            for no in second_gate
-        ):
-            return None
-
-        original_commit = self.greedy_put_ready_inner(after_restore)
-        if original_commit is None:
-            return None
-        original_put, final_state = original_commit
-        if original_put.line != original_target or original_put.move != original_move:
-            return None
-        return (
-            (
-                replace(get_nested, note=f"atomic_nested_gate_clear:{nested_target}"),
-                replace(swap_out, note=f"atomic_nested_gate_swap_out:{nested_target}"),
-                replace(nested_put, note=f"atomic_nested_inner_commit:{nested_target}"),
-                replace(get_swapped, note=f"atomic_nested_gate_retrieve:{nested_target}"),
-                replace(restore_gate, note=f"atomic_nested_gate_restore:{nested_target}"),
-                replace(original_put, note=f"atomic_inner_commit:{original_target}"),
-            ),
-            final_state,
-        )
-
-    def greedy_put_exposed_terminal_suffix(
-        self,
-        state: State,
-        block: tuple[str, ...],
-        *,
-        avoid_line: str,
-    ) -> tuple[Op, State] | None:
-        if not block or state.held[-len(block):] != block:
-            raise ValueError("terminal_suffix_block_not_train_tail")
-        for start in range(len(block)):
-            move = block[start:]
-            pending_inner = self.pending_inner_targets(state, exclude=set(move))
-            for line in sorted(
-                STAGE4_STAGING_LINES,
-                key=lambda candidate: (
-                    candidate != UNWHEEL and DEPOT_IN_BY_OUT[candidate] in pending_inner,
-                    candidate != UNWHEEL,
-                    self.line_number(candidate),
-                    candidate,
-                ),
-            ):
-                if line == avoid_line:
-                    continue
-                if not all(self.terminal_line_satisfied(no, line) for no in move):
-                    continue
-                if not self.line_has_capacity(state, line, move):
-                    continue
-                op, next_state, reject = self.apply_put(state, line, move)
-                if not reject:
-                    return op, next_state
-        return None
-
     def apply_pickup_template(
         self,
         pickup_order: tuple[str, ...],
         *,
         phase: int,
         template: str,
-        deferred_clear: bool = True,
     ) -> tuple[State, list[Op]] | SearchResult:
         line_map = self.initial_active_line_map()
         pickup_map = self.initial_source_pickup_map()
@@ -2656,29 +2036,6 @@ class Stage3Solver:
             state = next_state
             line_map = self.line_map(state)
 
-        # This is an optional transactional macro.  It is attempted only
-        # after the standard pickup, so a successful clear does not strand the
-        # locomotive away from still-uncollected assembly lines.  If any step
-        # is infeasible, the immutable input state is retained unchanged.
-        if deferred_clear:
-            cleared = self.try_apply_deferred_clear_macro(state)
-            if cleared is not None:
-                clear_ops, cleared_state, reject = cleared
-                if reject:
-                    return SearchResult(
-                        status="partial",
-                        template=template,
-                        state=None,
-                        ops=tuple((*ops, *clear_ops)),
-                        cost=(INF_COST, 0, 0, 0),
-                        reasons=(f"deferred_clear_{reject}",),
-                        expansions=0,
-                        elapsed_seconds=0.0,
-                    )
-                ops.extend(clear_ops)
-                state = cleared_state
-                line_map = self.line_map(state)
-
         if template == "B":
             remaining = sorted(
                 no
@@ -2699,101 +2056,6 @@ class Stage3Solver:
                     elapsed_seconds=0.0,
                 )
         return state, ops
-
-    def try_apply_deferred_clear_macro(
-        self,
-        state: State,
-    ) -> tuple[list[Op], State, str] | None:
-        """Clear depot doors needed by stage 3 with the assembled train held.
-
-        Deferred stage-4 cars on different blocking lines are collected into
-        one train and put once when they share a staging destination.
-        Combining compatible blockers before putting either one saves a hook;
-        the caller commits the immutable state only when the whole macro works.
-        """
-        required_inner = {
-            line
-            for no, line in self.assigned_line_by_no.items()
-            if line in set(DEPOT_IN) and not self.is_stage4_deferred(no)
-        }
-        blocking_lines = set(required_inner) | {
-            DEPOT_OUT_BY_IN[line] for line in required_inner
-        }
-        groups: dict[str, list[str]] = {}
-        line_map = self.line_map(state)
-        source_order = (*reversed(DEPOT_OUT), *DEPOT_IN, UNWHEEL)
-        for line in source_order:
-            if line not in blocking_lines:
-                continue
-            ordered = tuple(line_map.get(line, ()))
-            if (
-                line in set(DEPOT_OUT)
-                and ordered
-                and all(self.is_stage4_deferred(no) for no in ordered)
-                and self.pending_outer_suffix_for_line(state, line)
-            ):
-                # Keep the staged block in place so the immediately exposed
-                # compatible outer-target block can be added and later moved
-                # with one shared Get.
-                continue
-            prefix: list[str] = []
-            target = ""
-            for no in ordered:
-                assigned = self.assigned_line_by_no.get(no, "")
-                if not self.is_stage4_deferred(no) or assigned not in set(STAGE4_STAGING_LINES):
-                    break
-                if target and assigned != target:
-                    break
-                target = assigned
-                prefix.append(no)
-            if not prefix or target == line:
-                continue
-            initial_reachable = self.active_prefix(self.initial_active_line_map(), line)
-            if initial_reachable[: len(prefix)] != tuple(prefix):
-                continue
-            groups.setdefault(target, []).append(line)
-        if not groups:
-            return None
-
-        ops: list[Op] = []
-        for target in sorted(groups, key=lambda line: (line != UNWHEEL, self.line_number(line), line)):
-            collected: list[str] = []
-            for line in groups[target]:
-                current = tuple(self.line_map(state).get(line, ()))
-                move: list[str] = []
-                for no in current:
-                    if self.is_stage4_deferred(no) and self.assigned_line_by_no.get(no) == target:
-                        move.append(no)
-                        continue
-                    break
-                if not move:
-                    continue
-                op, next_state, reject = self.apply_get(state, line, tuple(move))
-                if reject:
-                    return ops, state, reject
-                ops.append(replace(op, note=f"collect_deferred_for:{target}"))
-                state = next_state
-                collected.extend(move)
-            if not collected:
-                continue
-            move = tuple(collected)
-            op, next_state, reject = self.apply_put(state, target, move)
-            if reject:
-                return ops, state, reject
-            ops.append(replace(op, note=f"stage_deferred_to:{target}"))
-            state = next_state
-        return (ops, state, "") if ops else None
-
-    def pending_outer_suffix_for_line(self, state: State, line: str) -> tuple[str, ...]:
-        suffix: list[str] = []
-        for no in reversed(state.held):
-            if self.inner_target_lines(no) or line not in self.outer_target_lines(no):
-                break
-            suffix.append(no)
-        move = tuple(reversed(suffix))
-        if not move or not self.line_has_capacity(state, line, move):
-            return ()
-        return move
 
     def initial_active_line_map(self) -> dict[str, tuple[str, ...]]:
         by_line: dict[str, list[tuple[int, str]]] = {}
@@ -2865,7 +2127,7 @@ class Stage3Solver:
                 self.assigned_line_by_no.get(no) == line
                 and bool(self.inner_target_lines(no))
             )
-            if is_final_inner and self.has_exact_position(no):
+            if is_final_inner:
                 if assigned_slot is None or assigned_slot[0] != line:
                     return {}, f"depot_assigned_slot_missing:{no}:{line}"
                 candidates = [assigned_slot[1]]
@@ -3019,9 +2281,6 @@ class Stage3Solver:
                 reserved.add(int(forced[0]))
         return reserved
 
-    def has_exact_position(self, no: str) -> bool:
-        return len(tuple(self.meta[no].get("_ForcePositions") or ())) == 1
-
     def active_prefix(self, line_map: dict[str, tuple[str, ...]], line: str) -> tuple[str, ...]:
         active_on_line = set(line_map.get(line, ()))
         out: list[str] = []
@@ -3035,126 +2294,6 @@ class Stage3Solver:
             out.append(no)
         return tuple(out)
 
-    def search(
-        self,
-        template: str,
-        start: State,
-        prefix_ops: tuple[Op, ...],
-        started: float,
-        *,
-        hook_limit: int | None = None,
-        expansion_limit: int = MAX_EXPANSIONS,
-    ) -> SearchResult:
-        queue: list[tuple[tuple[int, int, int, int, int, int], tuple[int, int, int, int], int, State]] = []
-        start_cost = self.ops_cost(prefix_ops)
-        heapq.heappush(queue, (self.priority(start_cost, start), start_cost, 0, start))
-        best: dict[State, tuple[int, int, int, int]] = {start: start_cost}
-        prev: dict[State, tuple[State, Op]] = {}
-        sequence = 1
-        expansions = 0
-        rejections: Counter[str] = Counter()
-
-        while queue:
-            _priority, cost, _seq, state = heapq.heappop(queue)
-            if best.get(state) != cost:
-                continue
-            if hook_limit is not None and cost[0] >= hook_limit:
-                continue
-            if self.complete(state):
-                ops = (*prefix_ops, *self.reconstruct(prev, state))
-                return SearchResult(
-                    status="complete",
-                    template=template,
-                    state=state,
-                    ops=ops,
-                    cost=cost,
-                    reasons=(),
-                    expansions=expansions,
-                    elapsed_seconds=round(time.monotonic() - started, 3),
-                )
-            if self.deadline_reached():
-                return SearchResult(
-                    status="partial",
-                    template=template,
-                    state=None,
-                    ops=prefix_ops,
-                    cost=(INF_COST, 0, 0, 0),
-                    reasons=("stage3_global_time_budget_exhausted",),
-                    expansions=expansions,
-                    elapsed_seconds=round(time.monotonic() - started, 3),
-                )
-            expansions += 1
-            if expansions > expansion_limit:
-                return SearchResult(
-                    status="partial",
-                    template=template,
-                    state=None,
-                    ops=prefix_ops,
-                    cost=(INF_COST, 0, 0, 0),
-                    reasons=("stage3_expansion_budget_exhausted",),
-                    expansions=expansions,
-                    elapsed_seconds=round(time.monotonic() - started, 3),
-                )
-
-            yielded = False
-            for op, next_state, reject in self.neighbors(state, template):
-                if reject:
-                    rejections[reject] += 1
-                    continue
-                yielded = True
-                next_cost = tuple(cost[index] + self.delta(op)[index] for index in range(4))
-                if hook_limit is not None and next_cost[0] >= hook_limit:
-                    continue
-                if next_cost >= best.get(next_state, (INF_COST, INF_COST, INF_COST, INF_COST)):
-                    continue
-                best[next_state] = next_cost
-                prev[next_state] = (state, op)
-                heapq.heappush(queue, (self.priority(next_cost, next_state), next_cost, sequence, next_state))
-                sequence += 1
-            if not yielded:
-                rejections["no_neighbor_from_state"] += 1
-
-        reasons = tuple(f"{key}:{value}" for key, value in rejections.most_common(12))
-        return SearchResult(
-            status="partial",
-            template=template,
-            state=None,
-            ops=prefix_ops,
-            cost=(INF_COST, 0, 0, 0),
-            reasons=reasons or ("stage3_no_solution",),
-            expansions=expansions,
-            elapsed_seconds=round(time.monotonic() - started, 3),
-        )
-
-    def priority(self, cost: tuple[int, int, int, int], state: State) -> tuple[int, int, int, int, int, int]:
-        return (
-            cost[0] + self.remaining_put_lower_bound(state),
-            self.unsatisfied_active_count(state),
-            -len(state.held),
-            cost[1],
-            cost[2],
-            cost[3],
-        )
-
-    def remaining_put_lower_bound(self, state: State) -> int:
-        line_map = self.line_map(state)
-        if state.held:
-            assigned_targets = {self.assigned_line_by_no.get(no, "") for no in state.held}
-            return max(1, len({line for line in assigned_targets if line}))
-        if state.phase == 0 and line_map.get(TEMPLATE_A_SECOND_LINE):
-            return 1
-        buffer_debt = sum(
-            1
-            for line in DEPOT_OUT
-            if any(not self.terminal_line_satisfied(no, line) for no in line_map.get(line, ()))
-        )
-        pending_lines = {
-            line
-            for line, nos in line_map.items()
-            if nos and any(not self.terminal_line_satisfied(no, line) for no in nos)
-        }
-        return len(pending_lines) + buffer_debt
-
     def unsatisfied_active_count(self, state: State) -> int:
         line_map = self.line_map(state)
         count = len(state.held)
@@ -3163,15 +2302,6 @@ class Stage3Solver:
                 if not self.terminal_line_satisfied(no, line):
                     count += 1
         return count
-
-    def reconstruct(self, prev: dict[State, tuple[State, Op]], state: State) -> tuple[Op, ...]:
-        ops: list[Op] = []
-        while state in prev:
-            prior, op = prev[state]
-            ops.append(op)
-            state = prior
-        ops.reverse()
-        return tuple(ops)
 
     def neighbors(self, state: State, template: str) -> Iterable[tuple[Op, State, str]]:
         if template == "A" and state.phase == 0 and not state.held:
@@ -3295,29 +2425,24 @@ class Stage3Solver:
             if target in set(DEPOT_IN) and line == DEPOT_OUT_BY_IN[target]:
                 return True
             if target in set(DEPOT_IN) and line in set(STAGE4_STAGING_LINES):
-                return self.line_is_empty(state, line) and self.line_has_capacity(state, line, move)
+                return self.line_has_capacity(state, line, move)
             if target in set(DEPOT_OUT):
                 if line in set(DEPOT_OUT) and all(line in self.outer_target_lines(no) for no in move):
                     return True
                 if line == DEPOT_IN_BY_OUT[target]:
                     return True
                 if line in set(STAGE4_STAGING_LINES):
-                    return self.line_is_empty(state, line) and self.line_has_capacity(state, line, move)
+                    return self.line_has_capacity(state, line, move)
             return False
-        if not self.line_is_empty(state, line):
+        if line in set(STAGE3_SOURCE_LINES):
+            return all(
+                no in self.restoration_nos
+                and self.assigned_line_by_no.get(no) == line
+                for no in move
+            )
+        if line not in set(STAGE4_STAGING_LINES):
             return False
-        if line in set(DEPOT_IN) and DEPOT_OUT_BY_IN[line] in self.fixed_outer_lines:
-            return False
-        return self.length(move) <= float(rv.TRACK_LEN.get(line) or 0.0) + rv.TOL
-
-    def line_has_stage4_deferred(self, state: State, line: str) -> bool:
-        return any(self.is_stage4_deferred(no) for no in self.line_map(state).get(line, ()))
-
-    def line_is_empty(self, state: State, line: str) -> bool:
-        return (
-            not self.line_map(state).get(line)
-            and not any(car["Line"] == line for car in self.fixed_cars)
-        )
+        return self.line_has_capacity(state, line, move)
 
     def depot_move_is_ready(self, state: State, line: str, move: tuple[str, ...]) -> bool:
         if not move or line not in set(DEPOT_IN):
@@ -3336,14 +2461,6 @@ class Stage3Solver:
             for no, slot in self.assigned_slot_by_no.items()
             if slot[0] == line and no not in set(line_map.get(line, ()))
         )
-        if not any(self.has_exact_position(no) for _position, no in remaining):
-            if any(self.repair_process(self.meta[no]).startswith("厂") for no in move):
-                return True
-            return not any(
-                self.repair_process(self.meta[no]).startswith("厂")
-                for _position, no in remaining
-                if no not in set(move)
-            )
         if len(move) > len(remaining):
             return False
         ready = remaining[-len(move):]
@@ -3414,6 +2531,12 @@ class Stage3Solver:
             return False
         for no, position in zip(nos, positions):
             if not self.terminal_line_satisfied(no, line):
+                return False
+            if (
+                no not in self.restoration_nos
+                and not self.is_stage4_deferred(no)
+                and self.assigned_line_by_no.get(no) != line
+            ):
                 return False
             forced = tuple(self.meta[no].get("_ForcePositions") or ())
             if forced and position not in forced:
@@ -3638,6 +2761,16 @@ class Stage3Solver:
                 reasons.append(f"depot_weigh_pending:{no}")
             if not self.terminal_line_satisfied(no, line):
                 reasons.append(f"active_terminal_line_violation:{no}:{line}")
+            elif (
+                no not in self.restoration_nos
+                and not self.is_stage4_deferred(no)
+                and self.assigned_line_by_no.get(no)
+                and line != self.assigned_line_by_no[no]
+            ):
+                reasons.append(
+                    "assignment_line_contract_violation:"
+                    f"{no}:{line}!={self.assigned_line_by_no[no]}"
+                )
             elif no in self.restoration_position_nos:
                 initial_position = int(self.meta[no].get("Position") or 0)
                 if _index != initial_position:
@@ -3651,6 +2784,12 @@ class Stage3Solver:
                     continue
                 positions[no] = (line, position)
                 car = self.meta[no]
+                assigned_slot = self.assigned_slot_by_no.get(no)
+                if assigned_slot is not None and assigned_slot != (line, position):
+                    reasons.append(
+                        "assignment_position_contract_violation:"
+                        f"{no}:{line}:{position}!={assigned_slot[0]}:{assigned_slot[1]}"
+                    )
                 forced = tuple(int(value) for value in car.get("_ForcePositions") or () if int(value) > 0)
                 if forced and position not in forced:
                     reasons.append(f"outer_force_position_violation:{no}:{line}:{position}")
@@ -3724,6 +2863,12 @@ class Stage3Solver:
                     reasons.append(f"depot_target_line_violation:{no}:{line}")
                 if not self.slot_allowed_for_car(car, line, position, capacity):
                     reasons.append(f"depot_slot_rule_violation:{no}:{line}:{position}")
+                assigned_slot = self.assigned_slot_by_no.get(no)
+                if assigned_slot is not None and assigned_slot != (line, position):
+                    reasons.append(
+                        "assignment_position_contract_violation:"
+                        f"{no}:{line}:{position}!={assigned_slot[0]}:{assigned_slot[1]}"
+                    )
 
             depot_positions = [(no, positions[no][1]) for no in depot_active]
             for position, no in self.fixed_positioned_positions.get(line, {}).items():
@@ -3851,11 +2996,8 @@ class Stage3Solver:
             return line == self.meta[no]["Line"]
         if self.is_stage4_deferred(no):
             return line in set(STAGE4_STAGING_LINES)
-        if self.inner_target_lines(no):
-            return line in self.inner_target_lines(no)
-        if self.outer_target_lines(no):
-            return line in self.outer_target_lines(no)
-        return False
+        terminal_domain = self.inner_target_lines(no) | self.outer_target_lines(no)
+        return line in terminal_domain
 
     def inner_target_lines(self, no: str) -> set[str]:
         return set(self.meta[no].get("TargetLines") or []) & set(DEPOT_IN)
@@ -4001,6 +3143,134 @@ class Stage3Solver:
             reasons=reasons or ("candidate_validation_failed",),
         )
 
+    @staticmethod
+    def template_covered_prefix(
+        specs: list[PlacementSpec],
+        limit: int,
+    ) -> list[PlacementSpec]:
+        """Return a ranked prefix covering each template when the limit permits."""
+
+        if limit <= 0:
+            raise ValueError("placement_spec_limit_must_be_positive")
+        selected = list(specs[:limit])
+        if len(selected) < limit:
+            return selected
+        rank = {spec: index for index, spec in enumerate(specs)}
+        all_templates = {spec.template for spec in specs}
+        if limit < len(all_templates):
+            return selected
+        selected_counts = Counter(spec.template for spec in selected)
+        for template in sorted(all_templates - set(selected_counts)):
+            candidate = next(spec for spec in specs if spec.template == template)
+            replace_index = next(
+                index
+                for index in range(len(selected) - 1, -1, -1)
+                if selected_counts[selected[index].template] > 1
+            )
+            removed = selected[replace_index]
+            selected_counts[removed.template] -= 1
+            selected[replace_index] = candidate
+            selected_counts[template] += 1
+        return sorted(selected, key=rank.__getitem__)
+
+    def select_screen_specs(
+        self,
+        specs: list[PlacementSpec],
+        results_by_spec: dict[tuple[str, str], SearchResult],
+    ) -> list[PlacementSpec]:
+        """Select a fair screening cohort from rank and shallow progress."""
+
+        if not specs:
+            return []
+
+        def progress_key(spec: PlacementSpec) -> tuple[Any, ...]:
+            prior = results_by_spec.get((spec.template, spec.layout))
+            progress = self.partial_progress_key(prior) if prior is not None else (
+                INF_COST,
+            ) * 7
+            return (
+                *progress,
+                spec.operation_lower_bound,
+                spec.placement_score,
+                spec.template,
+                spec.layout,
+            )
+
+        base_limit = min(
+            SCREEN_BASE_PLAN_BUDGET,
+            SCREEN_PLAN_BUDGET,
+            len(specs),
+        )
+        selected = self.template_covered_prefix(specs, base_limit)
+        selected_set = set(selected)
+        for spec in sorted(
+            (item for item in specs if item not in selected_set),
+            key=progress_key,
+        ):
+            if len(selected) >= SCREEN_PLAN_BUDGET:
+                break
+            selected.append(spec)
+            selected_set.add(spec)
+        return sorted(selected, key=progress_key)
+
+    def partial_progress_key(self, item: SearchResult) -> tuple[int, ...]:
+        progress = item.budgeted_progress_key or (
+            len(self.active_nos) - item.committed_count,
+            INF_COST,
+            INF_COST,
+            INF_COST,
+            INF_COST,
+        )
+        return (
+            *progress,
+            self.business_hook_count(item.ops),
+            len(item.ops),
+        )
+
+    def select_finalist_specs(
+        self,
+        specs: list[PlacementSpec],
+        results_by_spec: dict[tuple[str, str], SearchResult],
+    ) -> list[PlacementSpec]:
+        """Keep two distinct static leaders and one budgeted-search leader."""
+
+        eligible = [
+            spec
+            for spec in specs
+            if (
+                prior := results_by_spec.get((spec.template, spec.layout))
+            ) is not None
+            and prior.status != "complete"
+        ]
+        if not eligible:
+            return []
+        selected: list[PlacementSpec] = []
+        signatures: set[tuple[tuple[str, str, str, int], ...]] = set()
+        for spec in eligible:
+            if spec.signature in signatures:
+                continue
+            selected.append(spec)
+            signatures.add(spec.signature)
+            if len(selected) >= STATIC_FINALIST_PLAN_BUDGET:
+                break
+        if len(selected) >= FINALIST_PLAN_BUDGET:
+            return selected[:FINALIST_PLAN_BUDGET]
+        selected_set = set(selected)
+        progress_ranked = sorted(
+            (spec for spec in eligible if spec not in selected_set),
+            key=lambda spec: (
+                *self.partial_progress_key(
+                    results_by_spec[(spec.template, spec.layout)]
+                ),
+                spec.operation_lower_bound,
+                spec.placement_score,
+                spec.template,
+                spec.layout,
+            ),
+        )
+        selected.extend(progress_ranked[: FINALIST_PLAN_BUDGET - len(selected)])
+        return selected
+
     def choose_result(self, results: list[SearchResult]) -> SearchResult:
         complete = [item for item in results if item.status == "complete"]
         if complete:
@@ -4008,23 +3278,18 @@ class Stage3Solver:
                 complete,
                 key=lambda item: (
                     item.cost,
-                    0 if item.layout == "cohesive" else 1,
-                    0 if item.deferred_clear else 1,
-                    0 if item.terminal_merge else 1,
-                    0 if item.inner_clear_policy == "eager" else 1,
                     0 if item.template == "B" else 1,
+                    item.layout,
                 ),
             )
         return min(
             results,
             key=lambda item: (
+                *self.partial_progress_key(item),
                 len(item.reasons),
                 -item.expansions,
                 item.template,
                 item.layout,
-                not item.deferred_clear,
-                not item.terminal_merge,
-                item.inner_clear_policy,
             ),
         )
 
@@ -4141,6 +3406,12 @@ class Stage3Solver:
                     else None
                 ),
                 "search_spec_evaluated": item.search_spec_evaluated,
+                "stable_committed_count": item.committed_count,
+                "budgeted_progress_key": (
+                    list(item.budgeted_progress_key)
+                    if item.budgeted_progress_key is not None
+                    else None
+                ),
                 "blocking_reasons": list(item.reasons),
                 "expansions": item.expansions,
                 "elapsed_seconds": item.elapsed_seconds,
@@ -4177,6 +3448,12 @@ class Stage3Solver:
             "operations": self.business_hook_count(executable_ops),
             "business_hooks": self.business_hook_count(executable_ops),
             "attempted_operations": self.business_hook_count(chosen.ops),
+            "stable_committed_count": chosen.committed_count,
+            "budgeted_progress_key": (
+                list(chosen.budgeted_progress_key)
+                if chosen.budgeted_progress_key is not None
+                else None
+            ),
             "partial_response_safe": not any(
                 violation.kind in {"schema", "physical", "state"}
                 for violation in replay_bad
@@ -4184,7 +3461,7 @@ class Stage3Solver:
             "operation_lower_bound": lower_bound,
             "operation_lower_bound_components": lower_bound_components,
             "operation_lower_bound_scope": chosen.lower_bound_scope,
-            "evaluated_search_space_bound_scope": "template_layout_clear_merge_policy_modes",
+            "evaluated_search_space_bound_scope": "unified_placement_transaction_specs",
             "operation_lower_bound_gap": optimality_gap,
             "evaluated_search_space_lower_bound": search_space_lower_bound,
             "evaluated_search_space_gap": search_space_gap,
@@ -4467,6 +3744,8 @@ def diagnostic_summary(
         "operations": 0,
         "business_hooks": 0,
         "attempted_operations": 0,
+        "stable_committed_count": 0,
+        "budgeted_progress_key": None,
         "partial_response_safe": True,
         "operation_lower_bound": None,
         "operation_lower_bound_components": {},
@@ -4584,7 +3863,9 @@ def aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 3 simple exact-ish depot inbound solver.")
+    parser = argparse.ArgumentParser(
+        description="Stage 3 unified placement and transaction solver."
+    )
     parser.add_argument("input", type=Path, help="request JSON file or directory")
     parser.add_argument(
         "--stage2-out",
@@ -4607,23 +3888,14 @@ def main() -> int:
     for path in case_files(args.input):
         case_id = case_id_from_path(path)
         print(case_id, flush=True)
-        try:
-            summaries.append(
-                solve_one(
-                    path,
-                    args.stage2_out,
-                    args.out,
-                    time_budget_seconds=args.time_budget_seconds,
-                )
+        summaries.append(
+            solve_one(
+                path,
+                args.stage2_out,
+                args.out,
+                time_budget_seconds=args.time_budget_seconds,
             )
-        except Exception as exc:
-            summary = diagnostic_summary(
-                case_id,
-                f"solver_exception:{type(exc).__name__}:{exc}",
-                status="error",
-            )
-            summaries.append(summary)
-            write_json(args.out / f"{case_id}_summary.json", summary)
+        )
     agg = aggregate(summaries)
     write_json(args.out / "aggregate_summary.json", agg)
     print(

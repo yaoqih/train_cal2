@@ -30,18 +30,22 @@ from stage4_simple.search import Stage4Problem  # noqa: E402
 
 
 DEFAULT_TIME_BUDGET_SECONDS = 300.0
-DEFAULT_MAX_LABELS = 64
+DEFAULT_MAX_LABELS = 128
 DEFAULT_MAX_EXPANSIONS = 30_000
 HARD_REPLAY_KINDS = {"schema", "physical", "business", "state"}
 MOVE_MODEL = (
-    "dynamic_car_blocks_with_target_rank_intervals",
+    "dynamic_car_blocks_with_target_rank_ledger",
     "and_or_access_dependencies",
     "monotone_owned_staging_stacks",
-    "target_window_readiness_certificates",
+    "semantic_open_sealed_target_windows",
     "retained_consist_cross_source_digestion",
+    "paired_event_open_carry_projection",
+    "bounded_skeleton_shortest_path",
     "topology_resource_leases_with_exit_certificates",
+    "admissible_source_target_weigh_bound",
+    "ordered_block_flow_label_estimate",
     "incremental_get_put_weigh_physics",
-    "closed_session_block_flow_label_setting",
+    "single_budget_block_flow_label_setting",
     "independent_full_planlet_and_replay_validation",
 )
 
@@ -331,7 +335,7 @@ class Stage4Solver:
         summary = {
             "case_id": self.case_id,
             "status": "complete" if complete else "partial",
-            "stage4_strategy": "closed_session_block_flow_label_setting",
+            "stage4_strategy": "open_carry_episode_block_flow",
             "depot_rehook_mode": classify_depot_rehook(self.problem).mode.value,
             "stage3_final_loco": self.initial_loco.line,
             "stage4_start_loco": self.initial_loco.line,
@@ -346,6 +350,15 @@ class Stage4Solver:
             ],
             "hook_lower_bound": lower_bound,
             "hook_optimality_gap": max(0, hooks - lower_bound),
+            "episode_contractions": sum(
+                row.get("event") == "episode_contraction"
+                for row in optimization.plan.trace
+            ),
+            "episode_saved_hooks": sum(
+                int(row.get("removed_hooks") or 0)
+                for row in optimization.plan.trace
+                if row.get("event") == "episode_contraction"
+            ),
             "flow_relaxation": {
                 "block_count": len(diagnostics.blocks),
                 "access_alternative_count": len(diagnostics.alternatives),
@@ -522,7 +535,7 @@ def diagnostic_summary(
     return {
         "case_id": case_id,
         "status": status,
-        "stage4_strategy": "closed_session_block_flow_label_setting",
+        "stage4_strategy": "open_carry_episode_block_flow",
         "operations": 0,
         "business_hooks": 0,
         "optimality": "not_proved",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from stage4_simple.contracts import (  # noqa: E402
     DEPOT_REHOOK_ID,
     build_contract_graph,
     classify_depot_rehook,
+    mandatory_rehook_prefix_hooks,
 )
 from stage4_simple.domain import (  # noqa: E402
     CarrySegment,
@@ -32,6 +34,7 @@ from stage4_simple.domain import (  # noqa: E402
     DepotRehookMode,
     OwnedStack,
 )
+from stage4_simple.episode import OpenCarryEpisodeOptimizer  # noqa: E402
 from stage4_simple.optimizer import (  # noqa: E402
     BlockFlowOptimizer,
     OptimizationConfig,
@@ -41,6 +44,7 @@ from stage4_simple.search import (  # noqa: E402
     OperationTransitions,
     SearchNode,
     Stage4Problem,
+    WindowStatus,
 )
 from stage4_simple.solve import Stage4Solver  # noqa: E402
 from stage4_simple.topology import (  # noqa: E402
@@ -193,6 +197,61 @@ def test_incremental_transition_matches_full_planlet_validation() -> None:
     assert problem.complete(node)
 
 
+def test_target_window_seals_only_after_its_debt_is_complete() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "存1线"),
+            ("B", "存3线", 1, "调梁棚"),
+        ),
+        loco="存2线",
+    )
+    transitions = OperationTransitions(problem)
+    node = SearchNode(physical.initial_planlet_state(
+        problem.cars,
+        problem.loco_location,
+    ))
+    node = transitions.apply_step(
+        node,
+        physical.plan_step("Get", "存2线", ("A",)),
+    )
+    assert node is not None
+    positions = transitions.planned_positions(node.state, "存1线", ("A",))
+    assert positions is not None
+    node = transitions.apply_step(
+        node,
+        physical.plan_step("Put", "存1线", ("A",), positions),
+    )
+    assert node is not None
+    assert dict(node.target_windows)["存1线"] == WindowStatus.SEALED
+
+    node = transitions.apply_step(
+        node,
+        physical.plan_step("Get", "存1线", ("A",)),
+    )
+    assert node is not None
+    assert node.cost.target_reopens == 1
+    assert dict(node.target_windows)["存1线"] == WindowStatus.OPEN
+
+
+def test_ordered_block_flow_bound_counts_unavoidable_owner_runs() -> None:
+    problem = make_problem(
+        (
+            ("A1", "存2线", 1, "存1线"),
+            ("B", "存2线", 2, "存3线"),
+            ("A2", "存2线", 3, "存1线"),
+        ),
+        loco="存2线",
+    )
+    state = physical.initial_planlet_state(problem.cars, problem.loco_location)
+
+    assert problem.hook_lower_bound(state) == 3
+    assert problem.ordered_block_estimate(state) == 4
+    assert Stage4Problem._minimum_owner_runs(
+        (),
+        (("A", "B", "A"), ("A", "B")),
+    ) == 4
+
+
 def test_contract_graph_has_one_explicit_predecessor_boundary() -> None:
     problem = make_problem(
         (("A", "存2线", 1, "存1线"),),
@@ -315,6 +374,273 @@ def test_source_window_splits_one_get_into_tail_first_puts() -> None:
     ]
 
 
+def optimize_steps(
+    problem: Stage4Problem,
+    steps: tuple[physical.PlanStep, ...],
+):
+    transitions = OperationTransitions(problem)
+    optimizer = OpenCarryEpisodeOptimizer(problem, transitions)
+    incumbent = optimizer.replay(steps)
+    assert incumbent is not None and problem.complete(incumbent)
+    return optimizer.optimize(incumbent)
+
+
+def test_episode_defers_unneeded_source_suffix() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "存1线"),
+            ("B", "存2线", 2, "存3线"),
+        ),
+        loco="存2线",
+    )
+    result = optimize_steps(problem, tuple(
+        physical.plan_step(action, line, move)
+        for action, line, move in (
+            ("Get", "存2线", ("A", "B")),
+            ("Put", "存2线", ("B",)),
+            ("Put", "存1线", ("A",)),
+            ("Get", "存2线", ("B",)),
+            ("Put", "存3线", ("B",)),
+        )
+    ))
+
+    assert result.node.cost.hooks == 4
+    assert [item.kind for item in result.contractions] == [
+        "skeleton_shortest_path"
+    ]
+
+
+def test_episode_retains_carry_across_another_source() -> None:
+    problem = make_problem(
+        (
+            ("A", "存3线", 1, "调梁棚"),
+            ("B", "存2线", 1, "存3线"),
+        ),
+        loco="存3线",
+    )
+    result = optimize_steps(problem, tuple(
+        physical.plan_step(action, line, move)
+        for action, line, move in (
+            ("Get", "存3线", ("A",)),
+            ("Put", "存1线", ("A",)),
+            ("Get", "存2线", ("B",)),
+            ("Put", "存3线", ("B",)),
+            ("Get", "存1线", ("A",)),
+            ("Put", "调梁棚", ("A",)),
+        )
+    ))
+
+    assert result.node.cost.hooks == 4
+    assert [item.kind for item in result.contractions] == [
+        "skeleton_shortest_path"
+    ]
+
+
+def test_episode_fuses_adjacent_puts_to_the_same_line() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "存1线"),
+            ("B", "存2线", 2, "存1线"),
+        ),
+        loco="存2线",
+    )
+    result = optimize_steps(problem, (
+        physical.plan_step("Get", "存2线", ("A", "B")),
+        physical.plan_step("Put", "存1线", ("B",)),
+        physical.plan_step("Put", "存1线", ("A",)),
+    ))
+
+    assert result.node.cost.hooks == 2
+    assert [item.kind for item in result.contractions] == [
+        "skeleton_shortest_path"
+    ]
+
+
+def test_episode_eliminates_identity_round_trip() -> None:
+    problem = make_problem(
+        (
+            ("STAY", "存2线", 1, "存2线"),
+            ("MOVE", "存3线", 1, "存1线"),
+        ),
+        loco="存2线",
+    )
+    result = optimize_steps(problem, (
+        physical.plan_step("Get", "存2线", ("STAY",)),
+        physical.plan_step("Put", "存2线", ("STAY",)),
+        physical.plan_step("Get", "存3线", ("MOVE",)),
+        physical.plan_step("Put", "存1线", ("MOVE",)),
+    ))
+
+    assert result.node.cost.hooks == 2
+    assert [item.kind for item in result.contractions] == [
+        "skeleton_shortest_path"
+    ]
+
+    protected = OpenCarryEpisodeOptimizer(
+        problem,
+        OperationTransitions(problem),
+        mandatory_get_prefix_hooks=2,
+    )
+    incumbent = protected.replay((
+        physical.plan_step("Get", "存2线", ("STAY",)),
+        physical.plan_step("Put", "存2线", ("STAY",)),
+        physical.plan_step("Get", "存3线", ("MOVE",)),
+        physical.plan_step("Put", "存1线", ("MOVE",)),
+    ))
+    assert incumbent is not None
+    assert protected.optimize(incumbent).node.cost.hooks == 4
+
+
+def test_episode_fuses_adjacent_gets_from_the_same_line() -> None:
+    problem = make_problem(
+        (
+            ("A", "存2线", 1, "存1线"),
+            ("B", "存2线", 2, "存1线"),
+        ),
+        loco="存2线",
+    )
+    result = optimize_steps(problem, (
+        physical.plan_step("Get", "存2线", ("A",)),
+        physical.plan_step("Get", "存2线", ("B",)),
+        physical.plan_step("Put", "存1线", ("A", "B")),
+    ))
+
+    assert result.node.cost.hooks == 2
+    assert [item.kind for item in result.contractions] == [
+        "skeleton_shortest_path"
+    ]
+
+
+def test_episode_commits_a_final_target_suffix_without_recovery() -> None:
+    problem = make_problem(
+        (
+            ("A1", "存2线", 1, "调梁棚"),
+            ("A2", "存3线", 1, "调梁棚"),
+        ),
+        loco="存3线",
+    )
+    initial = physical.initial_planlet_state(
+        problem.cars,
+        problem.loco_location,
+    )
+
+    assert problem.committed_target_suffix_positions(
+        initial,
+        "调梁棚",
+        ("A2",),
+    ) == {"A2": 2}
+    assert problem.committed_target_suffix_positions(
+        initial,
+        "调梁棚",
+        ("A1",),
+    ) is None
+
+    steps = (
+        physical.plan_step("Get", "存3线", ("A2",)),
+        physical.plan_step("Put", "存1线", ("A2",)),
+        physical.plan_step("Get", "存2线", ("A1",)),
+        physical.plan_step("Get", "存1线", ("A2",)),
+        physical.plan_step("Put", "调梁棚", ("A1", "A2")),
+    )
+    optimizer = OpenCarryEpisodeOptimizer(
+        problem,
+        OperationTransitions(problem),
+    )
+    cheap_screen = OpenCarryEpisodeOptimizer(
+        problem,
+        OperationTransitions(problem),
+        max_labels=1,
+        include_aligned_macros=False,
+    )
+    incumbent = optimizer.replay(steps)
+    first = optimizer.replay(steps[:1])
+    assert incumbent is not None and first is not None
+    assert all(
+        not candidate.fixed_positions
+        for candidate in cheap_screen._paired_projection_steps(steps)
+    )
+    projection = optimizer._target_suffix_projection(steps, 1, first)
+    assert projection is not None
+    projected = optimizer.replay(
+        projection.steps,
+        fixed_positions={
+            index: dict(positions)
+            for index, positions in projection.fixed_positions
+        },
+    )
+
+    assert projected is not None and problem.complete(projected)
+    assert projected.cost.hooks == 4
+    assert physical.line_access_order(
+        problem.cars_list(projected.state),
+        "调梁棚",
+    ) == ["A1", "A2"]
+    assert optimizer.optimize(incumbent).node.cost.hooks <= 4
+
+
+def test_episode_preserves_rehook_acquisitions_but_optimizes_its_window() -> None:
+    problem = make_problem(
+        (
+            ("BACKBONE", "存4线", 1, "存4线"),
+            ("PAINT", "卸轮线", 1, "油漆线"),
+            ("OUT", "油漆线", 1, "存4线"),
+        ),
+        loco="存4线",
+    )
+    steps = tuple(
+        physical.plan_step(action, line, move)
+        for action, line, move in (
+            ("Get", "存4线", ("BACKBONE",)),
+            ("Get", "卸轮线", ("PAINT",)),
+            ("Put", "存4线", ("PAINT",)),
+            ("Get", "油漆线", ("OUT",)),
+            ("Put", "存2线", ("OUT",)),
+            ("Get", "存4线", ("PAINT",)),
+            ("Put", "油漆线", ("PAINT",)),
+            ("Put", "存4线", ("BACKBONE",)),
+            ("Get", "存2线", ("OUT",)),
+            ("Put", "存4线", ("OUT",)),
+        )
+    )
+    mandatory = mandatory_rehook_prefix_hooks(problem, steps)
+    optimizer = OpenCarryEpisodeOptimizer(
+        problem,
+        OperationTransitions(problem),
+        mandatory_get_prefix_hooks=mandatory,
+    )
+    incumbent = optimizer.replay(steps)
+
+    assert mandatory == 2
+    assert incumbent is not None and problem.complete(incumbent)
+    result = optimizer.optimize(incumbent)
+    assert result.node.steps[:mandatory] == steps[:mandatory]
+    assert result.node.cost.hooks == 7
+
+
+def test_episode_budget_stop_returns_the_explicit_incumbent() -> None:
+    problem = make_problem(
+        (("A", "存2线", 1, "存1线"),),
+        loco="存2线",
+    )
+    transitions = OperationTransitions(problem)
+    optimizer = OpenCarryEpisodeOptimizer(
+        problem,
+        transitions,
+        deadline=time.monotonic() - 1.0,
+    )
+    incumbent = OpenCarryEpisodeOptimizer(problem, transitions).replay((
+        physical.plan_step("Get", "存2线", ("A",)),
+        physical.plan_step("Put", "存1线", ("A",)),
+    ))
+
+    assert incumbent is not None
+    result = optimizer.optimize(incumbent)
+    assert result.node == incumbent
+    assert result.time_budget_exhausted
+    with pytest.raises(ValueError, match="max_labels"):
+        OpenCarryEpisodeOptimizer(problem, transitions, max_labels=0)
+
+
 def test_optimizer_returns_a_closed_physically_valid_plan() -> None:
     problem = make_problem(
         (
@@ -339,7 +665,7 @@ def test_optimizer_returns_a_closed_physically_valid_plan() -> None:
     assert problem.complete(optimized.plan.node)
 
 
-def test_source_search_deepens_only_inside_terminal_recovery_domain() -> None:
+def test_source_search_preserves_handled_car_history_in_its_signature() -> None:
     problem = make_problem(
         (("A", "存3线", 1, "存1线"),),
         loco="存3线",
@@ -358,20 +684,74 @@ def test_source_search_deepens_only_inside_terminal_recovery_domain() -> None:
         goal_owners=(),
     )
 
-    assert optimizer._source_attempt_limit(()) == 64
-    assert optimizer._source_attempt_limit((checkpoint,)) == 6
-
-    staged = replace(
+    assert optimizer.config.max_labels == 128
+    assert optimizer._choice_priority(()) < optimizer._choice_priority((1,))
+    assert checkpoint.node.state.carried_order == ()
+    handled = replace(
         checkpoint,
-        stacks=((
-            "存3线",
-            OwnedStack(
-                "存3线",
-                (CarrySegment("存1线", ("A",), (1,)),),
-            ),
-        ),),
+        node=replace(checkpoint.node, handled_nos=frozenset({"A"})),
     )
-    assert optimizer._source_attempt_limit((staged,)) == 128
+    assert optimizer._signature(checkpoint) != optimizer._signature(handled)
+
+
+def test_fragmented_initial_source_budget_is_reserved_for_one_source_line() -> None:
+    rows = tuple(
+        (
+            f"A{position}",
+            "存3线",
+            position,
+            "调梁棚" if position % 2 else "机库线",
+        )
+        for position in range(1, 8)
+    )
+    one_source = make_problem(rows, loco="存3线")
+    one_checkpoint = PlanningCheckpoint(
+        node=SearchNode(physical.initial_planlet_state(
+            one_source.cars,
+            one_source.loco_location,
+        )),
+        contracts=build_contract_graph(one_source),
+        stacks=(),
+        leases=(),
+        trace=(),
+        expansions=0,
+        goal_owners=(),
+    )
+    one_optimizer = BlockFlowOptimizer(
+        one_source,
+        OptimizationConfig(max_labels=128),
+    )
+
+    assert one_source.source_fragmentation(one_checkpoint.node.state) == (1, 7)
+    one_optimizer._initialize_source_budget(one_checkpoint)
+    assert one_optimizer._source_label_budget(one_checkpoint) == 128
+
+    multiple_sources = make_problem(
+        (*rows, ("B", "存2线", 1, "洗油线北")),
+        loco="存3线",
+    )
+    multiple_checkpoint = PlanningCheckpoint(
+        node=SearchNode(physical.initial_planlet_state(
+            multiple_sources.cars,
+            multiple_sources.loco_location,
+        )),
+        contracts=build_contract_graph(multiple_sources),
+        stacks=(),
+        leases=(),
+        trace=(),
+        expansions=0,
+        goal_owners=(),
+    )
+    multiple_optimizer = BlockFlowOptimizer(
+        multiple_sources,
+        OptimizationConfig(max_labels=128),
+    )
+
+    assert multiple_sources.source_fragmentation(
+        multiple_checkpoint.node.state
+    ) == (2, 7)
+    multiple_optimizer._initialize_source_budget(multiple_checkpoint)
+    assert multiple_optimizer._source_label_budget(multiple_checkpoint) == 16
 
 
 def test_source_label_rank_refresh_is_isolated_from_the_problem() -> None:

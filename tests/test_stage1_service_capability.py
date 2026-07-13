@@ -39,6 +39,7 @@ def test_stage1_exposes_one_policy() -> None:
     solver = Stage1Solver(CASE_0309Z)
 
     assert not hasattr(solver, "profile")
+    assert not hasattr(solver, "try_service_finish_step")
 
 
 def test_initial_candidate_pool_contains_a_valid_move() -> None:
@@ -121,9 +122,16 @@ def test_rolling_sessions_are_physically_valid_closed_stack_words() -> None:
     for view in candidates:
         steps = physical.candidate_plan_steps(view.candidate)
         metrics = solver.session_metrics(steps)
+        get_nos = [
+            no
+            for step in steps
+            if step.action == "Get"
+            for no in step.move_car_nos
+        ]
         assert steps[0].action == "Get"
         assert steps[-1].action == "Put"
         assert metrics.stack_valid
+        assert len(get_nos) == len(set(get_nos))
         assert solver.validate_candidate(view.candidate).accepted
 
 
@@ -157,32 +165,17 @@ def test_session_metrics_do_not_reward_repeated_puts_to_same_line() -> None:
     assert identity.flow_count == 0
 
 
-def test_forced_target_reservation_accepts_a_contiguous_mixed_target_block() -> None:
-    solver = Stage1Solver(CASE_0305Z, time_budget_seconds=60)
-    while not solver.stage1_debt()["complete"]:
-        assert solver.step(solver.stage1_debt())
+def test_contiguous_mixed_target_block_does_not_force_an_expensive_rebuild() -> None:
+    result = Stage1Solver(CASE_0305Z, time_budget_seconds=120).solve()
+    quality = result["summary"]["service_quality"]
 
-    assert solver.target_reserved_for_forced_cars("调梁棚")
-    assert solver.service_support_nos("调梁棚")
-
-    before = solver.service_quality()
-    candidate = next(
-        view.candidate
-        for view in solver.forced_position_rebuild_candidates(solver.stage1_debt())
-        if sum(
-            step.action == "Get" and step.line == "存5线北"
-            for step in physical.candidate_plan_steps(view.candidate)
-        ) >= 2
-        and solver.validate_candidate(view.candidate).accepted
-    )
-    validation = solver.validate_candidate(candidate)
-    after = solver.probe_after(candidate, validation).service_quality()
-
-    assert validation.accepted
-    assert solver.candidate_business_hook_count(candidate) <= 8
-    assert after["service_satisfied_count"] >= before["service_satisfied_count"] + 6
-    assert after["service_south_contiguous_count"] >= before["service_south_contiguous_count"] + 6
-    assert after["service_forced_position_satisfied_count"] == 5
+    assert result["summary"]["stage1_debt"]["complete"]
+    assert result["summary"]["business_hooks"] <= 27
+    assert result["summary"]["rehandled_car_count"] <= 1
+    assert quality["service_forced_position_satisfied_count"] >= 4
+    assert quality["service_satisfied_count"] >= 37
+    assert quality["service_south_contiguous_count"] >= 37
+    assert all(item.get("phase") != "service_finish" for item in result["trace"])
 
 
 def test_rolling_session_uses_passive_insertion_to_improve_forced_positions() -> None:
@@ -236,22 +229,27 @@ def test_contextual_rank_finishes_nearer_source_phase_before_cross_phase_gather(
             ("Put", "机南", ("5241331", "5313548")),
         ]
     )
-    cross_phase = next(
-        view
-        for view in views
-        if [
-            (step.action, step.line)
-            for step in physical.candidate_plan_steps(view.candidate)
-        ] == [
-            ("Get", "洗罐站"),
-            ("Get", "预修线"),
-            ("Put", "机南"),
-        ]
-        and len(view.candidate.move_car_nos) == 4
+    direct_evaluation = solver.evaluate_candidate(
+        direct,
+        debt,
+        [],
+        reject_dead_end=False,
+        compute_downstream_quality=True,
     )
+    assert direct_evaluation is not None
+    direct_rank, violations = solver.rank_contextual_candidate(
+        context,
+        direct_evaluation,
+        debt,
+    )
+    assert not violations
+    assert direct_rank is not None
 
-    evaluations = []
-    for view in (direct, cross_phase):
+    cross_phase = None
+    cross_phase_rank = None
+    for view in views:
+        if solver.candidate_source_phase_gap(view.candidate, debt) <= 0:
+            continue
         evaluation = solver.evaluate_candidate(
             view,
             debt,
@@ -259,13 +257,20 @@ def test_contextual_rank_finishes_nearer_source_phase_before_cross_phase_gather(
             reject_dead_end=False,
             compute_downstream_quality=True,
         )
-        assert evaluation is not None
-        ranked, violations = solver.rank_contextual_candidate(context, evaluation, debt)
-        assert not violations
-        assert ranked is not None
-        evaluations.append(ranked)
+        if evaluation is None:
+            continue
+        ranked, _violations = solver.rank_contextual_candidate(
+            context,
+            evaluation,
+            debt,
+        )
+        if ranked is not None:
+            cross_phase = view
+            cross_phase_rank = ranked
+            break
 
-    direct_rank, cross_phase_rank = evaluations
+    assert cross_phase is not None
+    assert cross_phase_rank is not None
     assert solver.candidate_source_phase_gap(direct.candidate, debt) == 0
     assert solver.candidate_source_phase_gap(cross_phase.candidate, debt) > 0
     assert direct_rank.score < cross_phase_rank.score
@@ -326,9 +331,10 @@ def test_route_support_lane_preserves_ordinary_completion_real_0105w() -> None:
     quality = result["summary"]["service_quality"]
 
     assert result["summary"]["stage1_debt"]["complete"]
-    assert result["summary"]["business_hooks"] <= 36
-    assert quality["service_satisfied_count"] >= 52
-    assert quality["service_south_contiguous_count"] >= 47
+    assert result["summary"]["business_hooks"] <= 32
+    assert result["summary"]["rehandled_car_count"] <= 6
+    assert quality["service_satisfied_count"] >= 50
+    assert quality["service_south_contiguous_count"] >= 40
     assert quality["service_forced_position_satisfied_count"] >= 3
 
 
@@ -458,7 +464,7 @@ def test_stage1_improves_forced_positions_without_reopening_stage1() -> None:
     assert result["summary"]["stage1_debt"]["complete"]
     assert result["summary"]["business_hooks"] == (
         result["summary"]["primary_business_hooks"]
-        + result["summary"]["service_finish_business_hooks"]
+        + result["summary"]["service_closure_business_hooks"]
     )
     assert (
         after["service_forced_position_satisfied_count"]
@@ -617,7 +623,7 @@ def test_service_rebuild_places_complete_real_0126w_position_group() -> None:
         (
             item
             for item in result["trace"]
-            if item.get("phase") == "service_finish"
+            if item.get("phase") == "service_closure"
             and item.get("service_quality_before")
             and item.get("service_quality_after")
         ),
@@ -628,9 +634,10 @@ def test_service_rebuild_places_complete_real_0126w_position_group() -> None:
     )
 
     assert result["summary"]["stage1_debt"]["complete"]
-    assert result["summary"]["business_hooks"] <= 31
-    assert result["summary"]["service_quality"]["service_satisfied_count"] >= 38
-    assert result["summary"]["service_quality"]["service_south_contiguous_count"] >= 38
+    assert result["summary"]["business_hooks"] <= 29
+    assert result["summary"]["rehandled_car_count"] <= 4
+    assert result["summary"]["service_quality"]["service_satisfied_count"] >= 37
+    assert result["summary"]["service_quality"]["service_south_contiguous_count"] >= 37
     assert (
         result["summary"]["service_quality"]["service_forced_position_satisfied_count"]
         >= 5

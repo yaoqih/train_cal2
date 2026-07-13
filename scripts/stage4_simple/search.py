@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
 from solver_vnext import physical
 
 from .model import FlowDiagnostics, FlowModel
+from .topology import resource_gate_closure
 
 
 HOT_THROATS = frozenset({"渡10", "联7", "渡9", "渡8", "渡7", "渡4"})
@@ -22,13 +24,18 @@ class SearchCost:
     route_cost: int = 0
 
 
+class WindowStatus(str, Enum):
+    OPEN = "open"
+    SEALED = "sealed"
+
+
 @dataclass(frozen=True)
 class SearchNode:
     state: physical.PlanletState
     steps: tuple[physical.PlanStep, ...] = ()
     cost: SearchCost = SearchCost()
     handled_nos: frozenset[str] = frozenset()
-    sealed_targets: frozenset[str] = frozenset()
+    target_windows: tuple[tuple[str, WindowStatus], ...] = ()
     carry_origins: tuple[tuple[str, str], ...] = ()
 
 
@@ -66,12 +73,16 @@ class Stage4Problem:
         self.target_lines = frozenset(
             active_targets | protected_spotting_targets
         )
+        self.active_target_lines = frozenset(active_targets)
         self.final_rank_by_no = MappingProxyType(self._compute_final_ranks())
         self.owner_order_by_target = MappingProxyType(
             self._compute_owner_orders()
         )
         self._unsatisfied_cache: dict[tuple, frozenset[str]] = {}
         self._protected_cache: dict[tuple, frozenset[str]] = {}
+        self._hook_lb_cache: dict[tuple, int] = {}
+        self._robf_cache: dict[tuple, int] = {}
+        self._source_profile_cache: dict[tuple, tuple[int, int]] = {}
 
     def _compute_final_ranks(self) -> dict[str, int]:
         ranks: dict[str, int] = {}
@@ -187,6 +198,74 @@ class Stage4Problem:
     def owner_order(self, target: str) -> tuple[str, ...]:
         return self.owner_order_by_target.get(target, ())
 
+    def committed_target_suffix_positions(
+        self,
+        state: physical.PlanletState,
+        target: str,
+        move: tuple[str, ...],
+    ) -> dict[str, int] | None:
+        """Certify a final-rank suffix that never needs to be recovered."""
+
+        if not move or not physical.is_spotting_line(target):
+            return None
+        if any(
+            no not in self.active_nos or self.target_by_no.get(no) != target
+            for no in move
+        ):
+            return None
+        ranks = tuple(self.final_rank_by_no.get(no, 0) for no in move)
+        if (
+            any(rank <= 0 for rank in ranks)
+            or ranks != tuple(sorted(ranks))
+            or any(right != left + 1 for left, right in zip(ranks, ranks[1:]))
+        ):
+            return None
+
+        pending = {
+            no
+            for no in self.unsatisfied_active(state)
+            if self.target_by_no.get(no) == target
+        }
+        moved = set(move)
+        if not moved <= pending:
+            return None
+        remaining_ranks = {
+            self.final_rank_by_no.get(no, 0)
+            for no in pending - moved
+        }
+        if any(rank <= 0 or rank >= ranks[0] for rank in remaining_ranks):
+            return None
+
+        cars = self.cars_list(state)
+        by_no = {physical.car_no(car): car for car in cars}
+        target_order = physical.line_access_order(cars, target)
+        if any(
+            no in self.active_nos and self.target_by_no.get(no) != target
+            for no in target_order
+        ):
+            return None
+        existing_ranks = [
+            self.final_rank_by_no[no]
+            for no in target_order
+            if no in self.final_rank_by_no
+        ]
+        if existing_ranks != sorted(existing_ranks):
+            return None
+        if any(
+            int(by_no[no].get("Position") or 0) != self.final_rank_by_no[no]
+            for no in target_order
+            if no in self.final_rank_by_no
+        ):
+            return None
+        occupied = {
+            int(car.get("Position") or 0)
+            for car in cars
+            if car.get("Line") == target
+        }
+        if occupied.intersection(ranks):
+            return None
+        return dict(zip(move, ranks))
+
     @staticmethod
     def cars_list(state: physical.PlanletState) -> list[dict]:
         return list(state.cars)
@@ -249,21 +328,62 @@ class Stage4Problem:
         )
 
     def hook_lower_bound(self, state: physical.PlanletState) -> int:
-        """Admissible operation lower bound for the remaining active debt."""
+        """Admissible source/target/weigh lower bound."""
 
-        unsatisfied = self.unsatisfied_active(state)
-        if not unsatisfied:
-            return int(bool(state.carried_order))
+        key = self.physical_signature(state)
+        cached = self._hook_lb_cache.get(key)
+        if cached is not None:
+            return cached
+
+        debt = self.unsatisfied_active(state)
+        if not debt:
+            result = int(bool(state.carried_order))
+            self._hook_lb_cache[key] = result
+            return result
         by_no = {physical.car_no(car): car for car in state.cars}
         carried = set(state.carried_order)
-        source_lines: set[str] = set()
+        source_lines = {
+            str(by_no[no].get("Line") or "")
+            for no in debt - carried
+            if by_no[no].get("Line")
+        }
+        target_lines = {
+            self.target_by_no.get(no, "")
+            for no in debt
+            if self.target_by_no.get(no)
+            and (
+                by_no[no].get("Line") != self.target_by_no.get(no)
+                or physical.force_positions(by_no[no])
+            )
+        }
+        weigh_count = sum(
+            bool(by_no[no].get("IsWeigh") and not by_no[no].get("_Weighed"))
+            for no in debt
+        )
+        result = len(source_lines) + len(target_lines) + weigh_count
+        self._hook_lb_cache[key] = result
+        return result
+
+    def ordered_block_estimate(self, state: physical.PlanletState) -> int:
+        """Owner-run estimate used only to order labels, never to prune."""
+
+        key = self.physical_signature(state)
+        cached = self._robf_cache.get(key)
+        if cached is not None:
+            return cached
+
+        debt = self.unsatisfied_active(state)
+        if not debt:
+            result = int(bool(state.carried_order))
+            self._robf_cache[key] = result
+            return result
+        by_no = {physical.car_no(car): car for car in state.cars}
+        carried = set(state.carried_order)
         target_lines: set[str] = set()
         weigh_count = 0
-        for no in unsatisfied:
+        for no in debt:
             car = by_no[no]
-            target = self.target_by_no.get(no, "")
-            if no not in carried and car.get("Line"):
-                source_lines.add(str(car["Line"]))
+            target = self._debt_owner(no)
             if target and (
                 car.get("Line") != target
                 or physical.force_positions(car)
@@ -271,7 +391,135 @@ class Stage4Problem:
                 target_lines.add(target)
             if car.get("IsWeigh") and not car.get("_Weighed"):
                 weigh_count += 1
-        return len(source_lines) + len(target_lines) + weigh_count
+
+        source_words: list[tuple[str, ...]] = []
+        source_lines = sorted({
+            str(by_no[no].get("Line") or "")
+            for no in debt - carried
+            if by_no[no].get("Line")
+        })
+        for line in source_lines:
+            order = physical.line_access_order(self.cars_list(state), line)
+            deepest = max(
+                index for index, no in enumerate(order)
+                if no in debt
+            )
+            word = self._compress_word(
+                self._debt_owner(no)
+                for no in order[: deepest + 1]
+                if no in debt
+            )
+            if word:
+                source_words.append(word)
+        carry_word = self._compress_word(
+            self._debt_owner(no)
+            for no in state.carried_order
+            if no in debt
+        )
+        owner_runs = self._minimum_owner_runs(carry_word, tuple(source_words))
+        result = (
+            len(source_words)
+            + max(len(target_lines), owner_runs)
+            + weigh_count
+        )
+        self._robf_cache[key] = result
+        return result
+
+    def source_fragmentation(self, state: physical.PlanletState) -> tuple[int, int]:
+        """Return remaining source-line count and maximum owner-run count."""
+
+        key = self.physical_signature(state)
+        cached = self._source_profile_cache.get(key)
+        if cached is not None:
+            return cached
+        debt = self.unsatisfied_active(state)
+        carried = set(state.carried_order)
+        by_no = {physical.car_no(car): car for car in state.cars}
+        source_lines = sorted({
+            str(by_no[no].get("Line") or "")
+            for no in debt - carried
+            if by_no[no].get("Line")
+        })
+        max_runs = 0
+        cars = self.cars_list(state)
+        for line in source_lines:
+            order = physical.line_access_order(cars, line)
+            deepest = max(index for index, no in enumerate(order) if no in debt)
+            owners = self._compress_word(
+                self._debt_owner(no) if no in debt else f"restore:{line}"
+                for no in order[: deepest + 1]
+            )
+            max_runs = max(max_runs, len(owners))
+        result = (len(source_lines), max_runs)
+        self._source_profile_cache[key] = result
+        return result
+
+    def _debt_owner(self, no: str) -> str:
+        if no in self.active_nos:
+            return self.target_by_no.get(no, "")
+        return str(self.by_no[no].get("Line") or "")
+
+    @staticmethod
+    def _compress_word(owners: Iterable[str]) -> tuple[str, ...]:
+        result: list[str] = []
+        for owner in owners:
+            if owner and (not result or result[-1] != owner):
+                result.append(owner)
+        return tuple(result)
+
+    @staticmethod
+    def _minimum_owner_runs(
+        carry: tuple[str, ...],
+        sources: tuple[tuple[str, ...], ...],
+    ) -> int:
+        if not sources:
+            return len(carry)
+        count = len(sources)
+        frontier: dict[tuple[int, int], int] = {}
+        for index, word in enumerate(sources):
+            joins_carry = bool(carry and carry[-1] == word[0])
+            frontier[(1 << index, index)] = (
+                len(carry) + len(word) - int(joins_carry)
+            )
+        for mask_size in range(1, count):
+            next_frontier = dict(frontier)
+            for (mask, last), runs in frontier.items():
+                if mask.bit_count() != mask_size:
+                    continue
+                for index, word in enumerate(sources):
+                    if mask & (1 << index):
+                        continue
+                    joined = sources[last][-1] == word[0]
+                    key = (mask | (1 << index), index)
+                    candidate = runs + len(word) - int(joined)
+                    next_frontier[key] = min(
+                        candidate,
+                        next_frontier.get(key, candidate),
+                    )
+            frontier = next_frontier
+        full = (1 << count) - 1
+        return min(
+            runs for (mask, _last), runs in frontier.items()
+            if mask == full
+        )
+
+    def target_can_seal(
+        self,
+        state: physical.PlanletState,
+        target: str,
+    ) -> bool:
+        debt = self.unsatisfied_active(state) | self.protected_damage(state)
+        by_no = {physical.car_no(car): car for car in state.cars}
+        for no in debt:
+            owner = self._debt_owner(no)
+            line = str(by_no[no].get("Line") or "")
+            if owner == target or line == target:
+                return False
+            if target in resource_gate_closure(owner):
+                return False
+            if line and target in physical.operation_approach_lines(line):
+                return False
+        return True
 
     def diagnostics(self, state: physical.PlanletState) -> FlowDiagnostics:
         return FlowModel(
@@ -357,7 +605,6 @@ class OperationTransitions:
         step_index = len(node.steps) + 1
         cache_key = (
             self.problem.physical_signature(node.state),
-            step_index,
             step.action,
             step.line,
             step.move_car_nos,
@@ -388,9 +635,12 @@ class OperationTransitions:
                 self.problem.depot_assignment,
                 step_index=step_index,
             )
-            cached_state = replace(transition.state, operation_paths=())
-            cached = replace(transition, state=cached_state)
-            self._cache[cache_key] = cached
+            if transition.accepted:
+                cached_state = replace(transition.state, operation_paths=())
+                cached = replace(transition, state=cached_state)
+                self._cache[cache_key] = cached
+            else:
+                return replace(transition, state=node.state)
         if not cached.accepted:
             return replace(cached, state=node.state)
         return replace(
@@ -411,7 +661,7 @@ class OperationTransitions:
             return None
 
         handled = node.handled_nos
-        sealed = set(node.sealed_targets)
+        windows = dict(node.target_windows)
         origins = dict(node.carry_origins)
         repeated_gets = node.cost.repeated_gets
         target_reopens = node.cost.target_reopens
@@ -419,9 +669,9 @@ class OperationTransitions:
             repeated_gets += sum(no in handled for no in step.move_car_nos)
             handled = handled | frozenset(step.move_car_nos)
             origins.update((no, step.line) for no in step.move_car_nos)
-            if step.line in sealed:
+            if windows.get(step.line) == WindowStatus.SEALED:
                 target_reopens += 1
-                sealed.remove(step.line)
+                windows[step.line] = WindowStatus.OPEN
         elif step.action == "Put":
             moved = set(step.move_car_nos)
             origins = {
@@ -429,11 +679,14 @@ class OperationTransitions:
                 for no, line in origins.items()
                 if no not in moved
             }
-            if any(
-                step.line in self.problem.target_options(no)
-                for no in step.move_car_nos
+            if step.line in self.problem.active_target_lines:
+                windows[step.line] = WindowStatus.OPEN
+        for target, status in tuple(windows.items()):
+            if (
+                status == WindowStatus.OPEN
+                and self.problem.target_can_seal(transition.state, target)
             ):
-                sealed.add(step.line)
+                windows[target] = WindowStatus.SEALED
         path_cost = max(0, len(transition.path) - 1) + 2 * sum(
             line in HOT_THROATS
             for line in transition.path
@@ -449,6 +702,6 @@ class OperationTransitions:
             steps=(*node.steps, step),
             cost=cost,
             handled_nos=handled,
-            sealed_targets=frozenset(sealed),
+            target_windows=tuple(sorted(windows.items())),
             carry_origins=tuple(sorted(origins.items())),
         )
