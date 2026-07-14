@@ -43,6 +43,15 @@ def classify_depot_rehook(problem: Stage4Problem) -> DepotRehookContract:
         if no in problem.active_nos
         and problem.target_by_no.get(no) != "油漆线"
     )
+    active_c4 = tuple(no for no in c4 if no in problem.active_nos)
+    if not paint and not active_c4:
+        return DepotRehookContract(
+            mode=DepotRehookMode.NOT_REQUIRED,
+            c4_backbone=(),
+            paint_tail=(),
+            unload_prefix=(),
+            paint_outbound=(),
+        )
     combined = physical.pull_equivalent([
         problem.by_no[no] for no in (*c4, *unload_prefix)
     ])

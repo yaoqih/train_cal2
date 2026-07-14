@@ -57,6 +57,15 @@ class BlockFlowOptimizer:
         deadline = started + self.config.time_budget_seconds
         self.deadline = deadline
         head = ContractPlanner(self.problem, self._planning_config(deadline))
+        initial = head.builder.checkpoint()
+        if self._complete(initial):
+            return OptimizationResult(
+                plan=self._planning_result(initial, "complete", started),
+                evaluated_labels=1,
+                feasible_labels=1,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+                stop_reason="initial_state_complete",
+            )
         head.resolve_depot_rehook()
         initial = head.builder.checkpoint()
         self.mandatory_get_prefix_hooks = mandatory_rehook_prefix_hooks(

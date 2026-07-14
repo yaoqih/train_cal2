@@ -39,7 +39,11 @@ from stage4_simple.optimizer import (  # noqa: E402
     BlockFlowOptimizer,
     OptimizationConfig,
 )
-from stage4_simple.planner import PlanningCheckpoint  # noqa: E402
+from stage4_simple.planner import (  # noqa: E402
+    ContractPlanner,
+    PlanningCheckpoint,
+    PlanningConfig,
+)
 from stage4_simple.search import (  # noqa: E402
     OperationTransitions,
     SearchNode,
@@ -267,6 +271,71 @@ def test_contract_graph_has_one_explicit_predecessor_boundary() -> None:
     assert len(ready) == 1
     assert ready[0].target == "存1线"
     assert ready[0].status == ContractStatus.PENDING
+
+
+def test_satisfied_c4_backbone_does_not_create_a_rehook_obligation() -> None:
+    problem = make_problem(
+        (
+            ("BACKBONE", "存4线", 1, "存4线"),
+            ("ACTIVE", "存2线", 1, "存1线"),
+        ),
+        loco="存4线",
+    )
+
+    contract = classify_depot_rehook(problem)
+
+    assert contract.mode == DepotRehookMode.NOT_REQUIRED
+    assert contract.c4_backbone == ()
+
+
+def test_optimizer_checks_a_complete_initial_state_before_rehook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem = make_problem(
+        (("BACKBONE", "存4线", 1, "存4线"),),
+        loco="存4线",
+    )
+
+    def unexpected_rehook(_planner: ContractPlanner) -> None:
+        raise AssertionError("complete initial state entered depot rehook")
+
+    monkeypatch.setattr(ContractPlanner, "resolve_depot_rehook", unexpected_rehook)
+    optimized = BlockFlowOptimizer(problem, OptimizationConfig()).solve()
+
+    assert optimized.stop_reason == "initial_state_complete"
+    assert optimized.plan.complete
+    assert optimized.plan.node.cost.hooks == 0
+    assert optimized.plan.node.steps == ()
+
+
+def test_rehook_collects_accessible_paint_prefixes_before_one_target_put() -> None:
+    problem = make_problem(
+        (
+            ("BACKBONE", "存4线", 1, "存4线"),
+            ("DEPOT_PAINT", "卸轮线", 1, "油漆线"),
+            ("EXTERNAL_PAINT", "存2线", 1, "油漆线"),
+        ),
+        loco="存4线",
+    )
+    planner = ContractPlanner(
+        problem,
+        PlanningConfig(time_budget_seconds=5.0, max_expansions=1_000),
+    )
+
+    planner.resolve_depot_rehook()
+    steps = planner.builder.node.steps
+
+    assert tuple((step.action, step.line, step.move_car_nos) for step in steps) == (
+        ("Get", "存4线", ("BACKBONE",)),
+        ("Get", "卸轮线", ("DEPOT_PAINT",)),
+        ("Get", "存2线", ("EXTERNAL_PAINT",)),
+        ("Put", "油漆线", ("DEPOT_PAINT", "EXTERNAL_PAINT")),
+        ("Put", "存4线", ("BACKBONE",)),
+    )
+    assert sum(
+        step.action == "Put" and step.line == "油漆线"
+        for step in steps
+    ) == 1
 
 
 def test_owned_stack_distinguishes_ranked_and_restore_segments() -> None:

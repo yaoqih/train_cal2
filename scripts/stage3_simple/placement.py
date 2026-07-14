@@ -14,6 +14,9 @@ the same constraint as every other assigned car.
 
 from __future__ import annotations
 
+import bisect
+import heapq
+import itertools
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
@@ -21,6 +24,9 @@ from typing import Literal, TypeAlias
 TerminalKind: TypeAlias = Literal["inner", "outer"]
 Score: TypeAlias = tuple[int, ...]
 InnerSlot: TypeAlias = tuple[str, int]
+Choices: TypeAlias = tuple[tuple[int, str, int, tuple["Atom", ...]], ...]
+ZeroStagingAtom: TypeAlias = tuple[TerminalKind, str, int | None]
+ZeroStagingKey: TypeAlias = tuple[tuple[tuple[ZeroStagingAtom, ...], ...], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +100,38 @@ class Plan:
             for no, atom in self.assignments
         )
 
+    @property
+    def execution_signature(self) -> tuple[tuple[str, str, str, int], ...]:
+        """Return a coarse ordering key used only to diversify scheduling.
+
+        Absolute inner positions are deliberately omitted from this key, but
+        that does *not* make two plans interchangeable: free headroom can
+        change which temporary depot placements are executable.  Feasibility
+        dominance therefore always uses :attr:`signature` instead.
+        """
+
+        inner_rank: dict[str, int] = {}
+        by_line: dict[str, list[tuple[int, str]]] = {}
+        for no, atom in self.assignments:
+            if atom.kind == "inner" and atom.position is not None:
+                by_line.setdefault(atom.line, []).append((atom.position, no))
+        for rows in by_line.values():
+            for rank, (_position, no) in enumerate(sorted(rows), start=1):
+                inner_rank[no] = rank
+        return tuple(
+            (
+                no,
+                atom.kind,
+                atom.line,
+                inner_rank[no]
+                if atom.kind == "inner"
+                else atom.position
+                if atom.position is not None
+                else -1,
+            )
+            for no, atom in self.assignments
+        )
+
     def atom_by_no(self) -> dict[str, Atom]:
         return dict(self.assignments)
 
@@ -131,9 +169,9 @@ class SolveResult:
     ``complete`` means the search space was exhausted or the retained score
     prefix was proved by score-bound pruning.  It is false when ``node_budget``
     stopped the search.  ``frontier_truncated`` means the full feasible set was
-    not enumerated because ``max_plans`` either dropped candidates or enabled a
-    score-bound prune.  Equal-score plans are deterministic representatives,
-    not a claimed lexicographic enumeration of every tie.
+    not enumerated because ``max_plans`` dropped candidates or enabled a
+    score-bound prune.  Once the portfolio is full, equal-score layouts are
+    deterministic representatives under the complete readiness score.
     """
 
     plans: tuple[Plan, ...]
@@ -144,6 +182,7 @@ class SolveResult:
     hall_witness: HallWitness | None = None
     reason: str = ""
     outer_capacity_witness: OuterCapacityWitness | None = None
+    lower_bound: Score | None = None
 
 
 @dataclass(slots=True)
@@ -165,9 +204,12 @@ def solve(
 ) -> SolveResult:
     """Return up to ``max_plans`` deterministically ranked feasible placements.
 
-    Search uses MRV branching and component-wise lower-bound pruning.  The
-    explicit node budget is the only search cut-off; there is no alternate or
-    failure-driven placement path.
+    A bounded descent on the same admissible ordering seeds at most
+    ``max_plans`` distinct feasible leaves and stops as soon as that portfolio
+    is full.  OPEN then improves it, while a second heap tracks the minimum
+    full bound as the sole top-k termination certificate.  Expensive
+    zero-staging refinement is lazy.  There is one constraint tree, one node
+    budget and no failure-driven alternate solver.
     """
 
     if max_plans <= 0:
@@ -238,7 +280,7 @@ def solve(
             outer_capacity_witness=root_outer_capacity,
         )
 
-    state = _State(
+    root_state = _State(
         assignments={},
         inner_used={line: set(inner_fixed.get(line, ())) for line in inner_capacities},
         factory_min={
@@ -251,27 +293,37 @@ def solve(
         score=(0,) * score_dimensions,
     )
 
-    frontier: list[Plan] = []
+    plans: list[Plan] = []
     explored_nodes = 0
     budget_exhausted = False
     frontier_truncated = False
+    zero_staging_cache: dict[ZeroStagingKey, int | None] = {}
+    active_bounds: dict[int, Score] = {}
+    bound_frontier: list[tuple[Score, int]] = []
+    reverse_exposure_rank = {
+        no: rank
+        for segment in problem.exposure_segments
+        for rank, no in enumerate(reversed(segment))
+    }
 
-    def visit(current: _State) -> None:
-        nonlocal explored_nodes, budget_exhausted, frontier, frontier_truncated
-        if budget_exhausted:
-            return
-        if explored_nodes >= node_budget:
-            budget_exhausted = True
-            return
-        explored_nodes += 1
-
-        remaining = [index for index in range(len(problem.cars)) if index not in current.assignments]
-        if not remaining:
-            plan = _plan_from_state(problem, current)
-            frontier, truncated = _insert_frontier(frontier, plan, max_plans=max_plans)
-            frontier_truncated = frontier_truncated or truncated
-            return
-
+    def selected_choice(choices: Choices) -> tuple[int, str, int, tuple[Atom, ...]]:
+        return min(
+            choices,
+            key=lambda item: (
+                0 if item[0] == 1 else 1,
+                reverse_exposure_rank.get(item[1], len(problem.cars)),
+                item[0],
+                item[1],
+            ),
+        )
+    def analyze(
+        current: _State,
+    ) -> tuple[Score, Choices] | None:
+        remaining = [
+            index
+            for index in range(len(problem.cars))
+            if index not in current.assignments
+        ]
         choices: list[tuple[int, str, int, tuple[Atom, ...]]] = []
         for index in remaining:
             car = problem.cars[index]
@@ -284,43 +336,218 @@ def solve(
                 outer_capacities,
             )
             if not atoms:
-                return
+                return None
             choices.append((len(atoms), car.no, index, atoms))
-        _domain_size, _no, selected, atoms = min(choices)
+        packed_choices = tuple(choices)
+        if not _remaining_domains_feasible(
+            problem,
+            current,
+            packed_choices,
+            outer_capacities,
+        ):
+            return None
+        return (
+            _state_score_lower_bound(problem, current, packed_choices),
+            packed_choices,
+        )
 
-        lower_bound = current.score
-        for _size, _car_no, index, available in choices:
-            if index == selected:
+    root = analyze(root_state)
+
+    primal_node_limit = min(node_budget, 256)
+
+    def seed_candidates(current: _State, choices: Choices) -> bool:
+        nonlocal explored_nodes, plans
+        if explored_nodes >= primal_node_limit:
+            return False
+        explored_nodes += 1
+        if not choices:
+            plans, _truncated = _insert_frontier(
+                plans,
+                _plan_from_state(problem, current),
+                max_plans=max_plans,
+            )
+            return len(plans) >= max_plans
+
+        _domain_size, _no, selected, atoms = selected_choice(choices)
+        car = problem.cars[selected]
+        children: list[
+            tuple[Score, tuple[Score, str, str, int], _State, Choices]
+        ] = []
+        for atom in atoms:
+            next_state = _apply_atom(current, selected, car, atom)
+            analyzed = analyze(next_state)
+            if analyzed is None:
                 continue
-            lower_bound = _add_scores(lower_bound, _component_min_cost(available))
-        lower_bound = _add_scores(lower_bound, _component_min_cost(atoms))
-        scored_lower_bound = (0, 0, *lower_bound)
-        if len(frontier) >= max_plans and scored_lower_bound >= frontier[-1].score:
-            frontier_truncated = True
-            return
+            child_bound, child_choices = analyzed
+            children.append((
+                child_bound,
+                _atom_sort_key(atom),
+                next_state,
+                child_choices,
+            ))
+        for _bound, _atom_key, next_state, child_choices in sorted(
+            children,
+            key=lambda item: (item[0], item[1]),
+        ):
+            if seed_candidates(next_state, child_choices):
+                return True
+        return False
 
+    if root is not None:
+        _root_bound, root_choices = root
+        seed_candidates(root_state, root_choices)
+
+    search: list[
+        tuple[int, int, int, Score, int, Score, bool, _State, Choices]
+    ] = []
+    serial = itertools.count()
+
+    def enqueue(
+        lower_bound: Score,
+        *,
+        depth: int,
+        serial_id: int,
+        refined: bool,
+        state: _State,
+        choices: Choices,
+    ) -> None:
+        heapq.heappush(
+            search,
+            (
+                lower_bound[0],
+                lower_bound[1],
+                -depth,
+                lower_bound[2:],
+                serial_id,
+                lower_bound,
+                refined,
+                state,
+                choices,
+            ),
+        )
+        active_bounds[serial_id] = lower_bound
+        heapq.heappush(bound_frontier, (lower_bound, serial_id))
+
+    if root is not None:
+        root_bound, root_choices = root
+        enqueue(
+            root_bound,
+            depth=0,
+            serial_id=next(serial),
+            refined=False,
+            state=root_state,
+            choices=root_choices,
+        )
+
+    while search:
+        while (
+            bound_frontier
+            and active_bounds.get(bound_frontier[0][1]) != bound_frontier[0][0]
+        ):
+            heapq.heappop(bound_frontier)
+        if (
+            len(plans) >= max_plans
+            and bound_frontier
+            and bound_frontier[0][0] >= plans[-1].score
+        ):
+            frontier_truncated = True
+            break
+        if explored_nodes >= node_budget:
+            budget_exhausted = True
+            break
+
+        (
+            _hook_bound,
+            _staged_bound,
+            negative_depth,
+            _additive_bound,
+            serial_id,
+            lower_bound,
+            refined,
+            current,
+            choices,
+        ) = heapq.heappop(search)
+        if len(plans) >= max_plans and lower_bound >= plans[-1].score:
+            active_bounds.pop(serial_id)
+            frontier_truncated = True
+            continue
+        if (
+            choices
+            and lower_bound[1] == 0
+            and not refined
+        ):
+            refined_bound = _state_score_lower_bound(
+                problem,
+                current,
+                choices,
+                refine_zero_staging=True,
+                zero_staging_cache=zero_staging_cache,
+            )
+            if refined_bound < lower_bound:
+                raise AssertionError("zero_staging_refinement_lowered_bound")
+            if refined_bound > lower_bound:
+                enqueue(
+                    refined_bound,
+                    depth=-negative_depth,
+                    serial_id=serial_id,
+                    refined=True,
+                    state=current,
+                    choices=choices,
+                )
+                continue
+        active_bounds.pop(serial_id)
+
+        explored_nodes += 1
+        if not choices:
+            plan = _plan_from_state(problem, current)
+            plans, truncated = _insert_frontier(plans, plan, max_plans=max_plans)
+            frontier_truncated = frontier_truncated or truncated
+            continue
+
+        _domain_size, _no, selected, atoms = selected_choice(choices)
         car = problem.cars[selected]
         for atom in atoms:
             next_state = _apply_atom(current, selected, car, atom)
-            visit(next_state)
-            if budget_exhausted:
-                return
+            analyzed = analyze(next_state)
+            if analyzed is None:
+                continue
+            child_bound, child_choices = analyzed
+            if len(plans) >= max_plans and child_bound >= plans[-1].score:
+                frontier_truncated = True
+                continue
+            enqueue(
+                child_bound,
+                depth=len(next_state.assignments),
+                serial_id=next(serial),
+                refined=False,
+                state=next_state,
+                choices=child_choices,
+            )
 
-    visit(state)
-    ordered_frontier = sorted(frontier, key=lambda plan: (plan.score, plan.signature))
-    plans = tuple(ordered_frontier[:max_plans])
+    while (
+        bound_frontier
+        and active_bounds.get(bound_frontier[0][1]) != bound_frontier[0][0]
+    ):
+        heapq.heappop(bound_frontier)
+    certified_bounds = [plan.score for plan in plans]
+    if bound_frontier:
+        certified_bounds.append(bound_frontier[0][0])
+    placement_lower_bound = min(certified_bounds, default=None)
+
+    ordered_plans = tuple(sorted(plans, key=lambda plan: (plan.score, plan.signature)))
     reason = ""
     if budget_exhausted:
         reason = "placement_node_budget_exhausted"
-    elif not plans:
+    elif not ordered_plans:
         reason = "placement_infeasible"
     return SolveResult(
-        plans=plans,
+        plans=ordered_plans,
         explored_nodes=explored_nodes,
         complete=not budget_exhausted,
         budget_exhausted=budget_exhausted,
         frontier_truncated=frontier_truncated,
         reason=reason,
+        lower_bound=placement_lower_bound,
     )
 
 
@@ -530,6 +757,331 @@ def _add_scores(left: Score, right: Score) -> Score:
     return tuple(a + b for a, b in zip(left, right))
 
 
+def _state_score_lower_bound(
+    problem: Problem,
+    state: _State,
+    choices: Choices,
+    *,
+    refine_zero_staging: bool = False,
+    zero_staging_cache: dict[ZeroStagingKey, int | None] | None = None,
+) -> Score:
+    """Return a lexicographically admissible bound for every completion."""
+
+    assigned_by_no = {
+        problem.cars[index].no: atom
+        for index, atom in state.assignments.items()
+    }
+    available_lines_by_no = {
+        no: frozenset(atom.line for atom in atoms)
+        for _size, no, _index, atoms in choices
+    }
+    available_atoms_by_no = (
+        {
+            no: atoms
+            for _size, no, _index, atoms in choices
+        }
+        if refine_zero_staging
+        else None
+    )
+    hook_bound, staged_bound = _exposure_score_lower_bound(
+        problem,
+        assigned_by_no,
+        available_lines_by_no,
+        inner_remaining=_remaining_inner_slot_counts(problem, state),
+        available_atoms_by_no=available_atoms_by_no,
+        zero_staging_cache=zero_staging_cache,
+    )
+    additive_bound = state.score
+    for _size, _no, _index, atoms in choices:
+        additive_bound = _add_scores(
+            additive_bound,
+            _component_min_cost(atoms),
+        )
+    return (hook_bound, staged_bound, *additive_bound)
+
+
+def _remaining_domains_feasible(
+    problem: Problem,
+    state: _State,
+    choices: Choices,
+    outer_capacities: dict[str, int],
+) -> bool:
+    """Reject only Hall- or capacity-deficient remaining domains."""
+
+    forced_inner: list[tuple[InnerSlot, ...]] = []
+    forced_outer: list[tuple[int, frozenset[str]]] = []
+    for _size, _no, index, atoms in choices:
+        if all(atom.kind == "inner" for atom in atoms):
+            forced_inner.append(tuple(sorted({
+                (atom.line, int(atom.position))
+                for atom in atoms
+                if atom.position is not None
+            })))
+        elif all(atom.kind == "outer" for atom in atoms):
+            forced_outer.append((
+                problem.cars[index].length,
+                frozenset(atom.line for atom in atoms),
+            ))
+
+    slot_owner: dict[InnerSlot, int] = {}
+
+    def augment(car_index: int, seen: set[InnerSlot]) -> bool:
+        for slot in forced_inner[car_index]:
+            if slot in seen:
+                continue
+            seen.add(slot)
+            owner = slot_owner.get(slot)
+            if owner is None or augment(owner, seen):
+                slot_owner[slot] = car_index
+                return True
+        return False
+
+    if any(
+        not augment(car_index, set())
+        for car_index in range(len(forced_inner))
+    ):
+        return False
+
+    lines = tuple(sorted(outer_capacities))
+    residual = {
+        line: outer_capacities[line] - state.outer_load[line]
+        for line in lines
+    }
+    for mask in range(1, 1 << len(lines)):
+        subset = frozenset(
+            lines[index]
+            for index in range(len(lines))
+            if mask & (1 << index)
+        )
+        demand = sum(
+            length
+            for length, domain in forced_outer
+            if domain <= subset
+        )
+        if demand > sum(residual[line] for line in subset):
+            return False
+    return True
+
+
+def _exposure_score_lower_bound(
+    problem: Problem,
+    assigned_by_no: dict[str, Atom],
+    available_lines_by_no: dict[str, frozenset[str]],
+    *,
+    inner_remaining: dict[str, int] | None = None,
+    available_atoms_by_no: dict[str, tuple[Atom, ...]] | None = None,
+    zero_staging_cache: dict[ZeroStagingKey, int | None] | None = None,
+) -> tuple[int, int]:
+    """Relax unfinished exposure chains without undercounting fixed disorder.
+
+    Unassigned cars may choose any currently available line.  Remaining inner
+    slot counts constrain the run relaxation, while exact slot identities and
+    cross-segment sharing stay relaxed.  Assigned inner positions already form
+    a subsequence of every completion.  Its minimum deletions to become
+    strictly decreasing cannot be repaired by inserting more values.  The
+    primary hook bound charges one shared rehandle pair whenever staging is
+    proved necessary; staged-car count remains a separate lexicographic bound.
+    A second relaxation asks whether zero additional staging is possible and
+    tightens the hook bound when forced positions rule it out.
+    """
+
+    terminal_runs = 0
+    staged_cars = 0
+    for segment in problem.exposure_segments:
+        inner_lines = tuple(sorted(inner_remaining or {}))
+        line_index = {line: index for index, line in enumerate(inner_lines)}
+        run_states: dict[tuple[tuple[int, ...], str], int] = {
+            ((0,) * len(inner_lines), ""): 0,
+        }
+        positions_by_line: dict[str, list[int]] = {}
+        for no in segment:
+            assigned = assigned_by_no.get(no)
+            lines = (
+                frozenset({assigned.line})
+                if assigned is not None
+                else available_lines_by_no[no]
+            )
+            next_states: dict[tuple[tuple[int, ...], str], int] = {}
+            for (counts, prior_line), runs in run_states.items():
+                for line in lines:
+                    next_counts = counts
+                    index = line_index.get(line)
+                    if assigned is None and index is not None:
+                        if counts[index] >= (inner_remaining or {})[line]:
+                            continue
+                        mutable_counts = list(counts)
+                        mutable_counts[index] += 1
+                        next_counts = tuple(mutable_counts)
+                    key = (next_counts, line)
+                    candidate = runs + (line != prior_line)
+                    if candidate < next_states.get(key, 10**9):
+                        next_states[key] = candidate
+            run_states = next_states
+            if (
+                assigned is not None
+                and assigned.kind == "inner"
+                and assigned.position is not None
+            ):
+                positions_by_line.setdefault(assigned.line, []).append(
+                    assigned.position
+                )
+        terminal_runs += min(run_states.values(), default=0)
+        staged_cars += sum(
+            len(positions) - _longest_strictly_decreasing_length(positions)
+            for positions in positions_by_line.values()
+        )
+    # A staging batch costs one shared Put/Get pair regardless of how many
+    # cars it carries.  Keep staged-car count as a secondary quality signal,
+    # but make the primary score match the business-hook relaxation.
+    hook_bound = terminal_runs + (2 if staged_cars else 0)
+    if staged_cars == 0 and available_atoms_by_no is not None:
+        key = _zero_staging_key(
+            problem,
+            assigned_by_no,
+            available_atoms_by_no,
+        )
+        if zero_staging_cache is None or key not in zero_staging_cache:
+            zero_staging_runs = _minimum_zero_staging_runs(
+                problem,
+                assigned_by_no,
+                available_atoms_by_no,
+            )
+            if zero_staging_cache is not None:
+                zero_staging_cache[key] = zero_staging_runs
+        else:
+            zero_staging_runs = zero_staging_cache[key]
+        if zero_staging_runs is None:
+            staged_cars = 1
+            hook_bound = terminal_runs + 2
+        else:
+            hook_bound = min(zero_staging_runs, terminal_runs + 2)
+    return hook_bound, staged_cars
+
+
+def _zero_staging_key(
+    problem: Problem,
+    assigned_by_no: dict[str, Atom],
+    available_atoms_by_no: dict[str, tuple[Atom, ...]],
+) -> ZeroStagingKey:
+    """Canonicalize exactly the structural domains observed by the DP."""
+
+    return tuple(
+        tuple(
+            tuple(sorted({
+                (
+                    atom.kind,
+                    atom.line,
+                    atom.position if atom.kind == "inner" else None,
+                )
+                for atom in (
+                    (assigned_by_no[no],)
+                    if no in assigned_by_no
+                    else available_atoms_by_no[no]
+                )
+            }))
+            for no in segment
+        )
+        for segment in problem.exposure_segments
+    )
+
+
+def _minimum_zero_staging_runs(
+    problem: Problem,
+    assigned_by_no: dict[str, Atom],
+    available_atoms_by_no: dict[str, tuple[Atom, ...]],
+) -> int | None:
+    """Minimize runs subject to every inner subsequence being decreasing.
+
+    For one predecessor state and one inner line, every feasible position has
+    the same run increment.  The largest feasible position dominates every
+    smaller one because it leaves a superset of positions available to the
+    remaining decreasing suffix.  Keeping that single transition is exact.
+    """
+
+    capacities = dict(problem.inner_capacities)
+    inner_lines = tuple(sorted(capacities))
+    line_index = {line: index for index, line in enumerate(inner_lines)}
+    total_runs = 0
+    for segment in problem.exposure_segments:
+        structural_options: list[
+            tuple[tuple[tuple[str, tuple[int, ...]], ...], tuple[str, ...]]
+        ] = []
+        for no in segment:
+            assigned = assigned_by_no.get(no)
+            atoms = (
+                (assigned,)
+                if assigned is not None
+                else available_atoms_by_no[no]
+            )
+            inner_positions: dict[str, set[int]] = {}
+            outer_lines: set[str] = set()
+            for atom in atoms:
+                if atom.kind == "inner":
+                    if atom.position is not None:
+                        inner_positions.setdefault(atom.line, set()).add(
+                            atom.position
+                        )
+                else:
+                    outer_lines.add(atom.line)
+            structural_options.append((
+                tuple(
+                    (line, tuple(sorted(positions)))
+                    for line, positions in sorted(inner_positions.items())
+                ),
+                tuple(sorted(outer_lines)),
+            ))
+
+        states: dict[tuple[tuple[int, ...], str], int] = {
+            (tuple(capacities[line] + 1 for line in inner_lines), ""): 0,
+        }
+        for inner_options, outer_lines in structural_options:
+            next_states: dict[tuple[tuple[int, ...], str], int] = {}
+            for (last_positions, prior_line), runs in states.items():
+                for line in outer_lines:
+                    key = (last_positions, line)
+                    candidate = runs + (line != prior_line)
+                    if candidate < next_states.get(key, 10**9):
+                        next_states[key] = candidate
+                for line, positions in inner_options:
+                    index = line_index[line]
+                    cut = bisect.bisect_left(
+                        positions,
+                        last_positions[index],
+                    )
+                    if cut == 0:
+                        continue
+                    mutable_positions = list(last_positions)
+                    mutable_positions[index] = positions[cut - 1]
+                    next_positions = tuple(mutable_positions)
+                    key = (next_positions, line)
+                    candidate = runs + (line != prior_line)
+                    if candidate < next_states.get(key, 10**9):
+                        next_states[key] = candidate
+            if not next_states:
+                return None
+            states = next_states
+        total_runs += min(states.values(), default=0)
+    return total_runs
+
+
+def _remaining_inner_slot_counts(
+    problem: Problem,
+    state: _State,
+) -> dict[str, int]:
+    capacities = dict(problem.inner_capacities)
+    fixed = _positions_by_line(problem.inner_fixed_positions)
+    return {
+        line: sum(
+            position not in state.inner_used[line]
+            for position in range(
+                1,
+                min(fixed.get(line, ()), default=capacity + 1),
+            )
+        )
+        for line, capacity in capacities.items()
+    }
+
+
 def _plan_from_state(problem: Problem, state: _State) -> Plan:
     assignments = tuple(
         sorted(
@@ -557,7 +1109,7 @@ def _plan_from_state(problem: Problem, state: _State) -> Plan:
             len(positions) - _longest_strictly_decreasing_length(positions)
             for positions in positions_by_line.values()
         )
-    placement_hook_bound = terminal_runs + 2 * staged_cars
+    placement_hook_bound = terminal_runs + (2 if staged_cars else 0)
     return Plan(
         assignments=assignments,
         score=(placement_hook_bound, staged_cars, *state.score),
@@ -570,8 +1122,21 @@ def _insert_frontier(
     *,
     max_plans: int,
 ) -> tuple[list[Plan], bool]:
-    if any(plan.signature == candidate.signature for plan in frontier):
-        return frontier, False
+    same_assignment = next(
+        (
+            plan
+            for plan in frontier
+            if plan.signature == candidate.signature
+        ),
+        None,
+    )
+    if same_assignment is not None:
+        if (same_assignment.score, same_assignment.signature) <= (
+            candidate.score,
+            candidate.signature,
+        ):
+            return frontier, False
+        frontier = [plan for plan in frontier if plan is not same_assignment]
     ranked = sorted((*frontier, candidate), key=lambda plan: (plan.score, plan.signature))
     return ranked[:max_plans], len(ranked) > max_plans
 

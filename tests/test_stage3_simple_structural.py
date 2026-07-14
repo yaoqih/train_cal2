@@ -106,6 +106,41 @@ class Stage3StructuralTests(unittest.TestCase):
         for name in legacy_methods:
             with self.subTest(name=name):
                 self.assertFalse(hasattr(Stage3Solver, name), name)
+        self.assertFalse(hasattr(transactions, "enumerate_minimal_transactions"))
+
+    def test_global_placement_lower_bound_violation_is_reported(self) -> None:
+        req = request([car("A", "机走北", 1, ["修1库内"])])
+        original_solve = placement.solve
+
+        def invalid_placement_bound(*args: object, **kwargs: object) -> placement.SolveResult:
+            solved = original_solve(*args, **kwargs)  # type: ignore[arg-type]
+            self.assertIsNotNone(solved.lower_bound)
+            return replace(
+                solved,
+                lower_bound=(99, *solved.lower_bound[1:]),  # type: ignore[index]
+            )
+
+        with patch.object(placement, "solve", side_effect=invalid_placement_bound):
+            result = Stage3Solver(
+                "TEST",
+                req,
+                EMPTY_STAGE2,
+                time_budget_seconds=5,
+            ).solve()
+
+        self.assertEqual(result["summary"]["status"], "complete")
+        self.assertEqual(
+            result["summary"]["optimality_status"],
+            "invalid_lower_bound_certificate",
+        )
+        self.assertIn(
+            {
+                "operation_lower_bound_scope": "all_placement_relaxation",
+                "operations": result["summary"]["business_hooks"],
+                "operation_lower_bound": 100,
+            },
+            result["summary"]["lower_bound_validation_violations"],
+        )
 
     def test_invalid_stage2_combined_response_is_explicitly_rejected(self) -> None:
         req = request([car("A", "机走北", 1, ["修1库内"])])
@@ -136,6 +171,26 @@ class Stage3StructuralTests(unittest.TestCase):
             "terminal_inspection_mode_missing_or_invalid",
         ):
             Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+
+    def test_deferred_staging_lines_share_one_terminal_equivalence_class(self) -> None:
+        req = request([car("D", "机走北", 1, ["油漆线"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"D"}
+        solver.assigned_line_by_no = {"D": "修1库外"}
+        solver.assigned_slot_by_no = {}
+        state = State(
+            lines=(("卸轮线", ("D",)),),
+            held=(),
+            loco=("修1库外",),
+            phase=1,
+        )
+
+        self.assertTrue(solver.assignment_line_satisfied("D", "卸轮线"))
+        self.assertTrue(solver.assignment_line_satisfied("D", "修4库外"))
+        self.assertFalse(solver.assignment_line_satisfied("D", "机走北"))
+        self.assertEqual(solver.stable_closure(state, frozenset()), frozenset({"D"}))
+        self.assertEqual(solver.transaction_progress_key(state, frozenset({"D"}))[0], 0)
+        self.assertTrue(solver.complete(state))
 
     def test_transaction_expansion_limit_must_be_positive(self) -> None:
         req = request([car("A", "机走北", 1, ["修1库内"])])
@@ -336,6 +391,115 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertGreater(deeper_key[1], shallow_key[1])
         self.assertLess(deeper_key, shallow_key)
 
+    def test_staging_affinity_prefers_near_term_matching_batch(self) -> None:
+        cars = [
+            car("S", "机走北", 1, ["修1库内"], forced=[1]),
+            car("L", "机走北", 2, ["修3库内"], forced=[1]),
+            car("N", "机走北", 3, ["修4库内"], forced=[1]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"S", "L", "N"}
+        solver.assigned_line_by_no = {
+            "S": "修1库内",
+            "L": "修3库内",
+            "N": "修4库内",
+        }
+        held = ("L", "N")
+        stage_with_later_batch = State(
+            lines=(("修3库外", ("S",)),),
+            held=held,
+            loco=("联7",),
+            phase=1,
+        )
+        stage_with_next_batch = replace(
+            stage_with_later_batch,
+            lines=(("修4库外", ("S",)),),
+        )
+
+        later_debt = solver.staging_affinity_debt(
+            stage_with_later_batch,
+            frozenset(),
+        )
+        next_debt = solver.staging_affinity_debt(
+            stage_with_next_batch,
+            frozenset(),
+        )
+
+        self.assertLess(next_debt, later_debt)
+
+    def test_alignment_debt_tracks_a_relevant_legal_tail_put(self) -> None:
+        cars = [
+            car("D", "机走北", 1, ["修1库内"], forced=[5]),
+            car("X", "机走北", 2, ["修2库外"]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"D", "X"}
+        solver.assigned_line_by_no = {
+            "D": "修1库内",
+            "X": "修2库外",
+        }
+        solver.assigned_slot_by_no = {"D": ("修1库内", 5)}
+        state = State(
+            lines=(),
+            held=("D", "X"),
+            loco=("联7",),
+            phase=1,
+        )
+        before = solver.alignment_debt(state, frozenset())
+
+        _op, after, reject = solver.apply_put(state, "卸轮线", ("X",))
+
+        self.assertEqual(reject, "")
+        self.assertEqual(before, 1)
+        self.assertEqual(solver.alignment_debt(after, frozenset()), 0)
+        committed = frozenset({"D"})
+        self.assertEqual(
+            solver.alignment_debt(after, committed),
+            solver.alignment_debt(state, committed),
+        )
+
+    def test_pickup_merge_batches_a_flexible_exposed_car(self) -> None:
+        cars = [
+            car("H", "机走北", 1, ["修1库外"]),
+            car("C", "修4库内", 1, ["油漆线"]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"H", "C"}
+        solver.assigned_line_by_no = {
+            "H": "修1库外",
+            "C": "卸轮线",
+        }
+        solver.assigned_slot_by_no = {}
+        state = State(
+            lines=(("修4库内", ("C",)),),
+            held=("H",),
+            loco=("修4库外",),
+            phase=1,
+            positioned_positions=(("C", 1),),
+        )
+        get_op, after_get, reject = solver.apply_get(
+            state,
+            "修4库内",
+            ("C",),
+        )
+
+        candidates = solver.pickup_merge_transactions(
+            state,
+            frozenset(),
+            (transactions.LegalTransition(get_op, after_get),),
+        )
+
+        self.assertEqual(reject, "")
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(
+            [(op.action, op.line, op.move) for op in candidates[0].actions],
+            [
+                ("Get", "修4库内", ("C",)),
+                ("Put", "修1库外", ("H", "C")),
+            ],
+        )
+        self.assertEqual(candidates[0].newly_committed, frozenset({"H", "C"}))
+
     def test_compact_outer_projection_preserves_relative_not_absolute_position(self) -> None:
         solver = object.__new__(Stage3Solver)
         solver.line_map_cache = {}
@@ -364,122 +528,6 @@ class Stage3StructuralTests(unittest.TestCase):
             solver.committed_projection(before, committed),
             solver.committed_projection(after_prefix_insert, committed),
         )
-
-    def test_alignment_tries_second_staging_line_when_first_cannot_close(self) -> None:
-        solver = object.__new__(Stage3Solver)
-        solver.assigned_slot_by_no = {"D": ("修1库内", 5)}
-        solver.assigned_line_by_no = {
-            "D": "修1库内",
-            "X": "修2库内",
-        }
-        solver.active_nos = {"D", "X"}
-        solver.search_space_evaluation_incomplete = False
-
-        initial = State(lines=(), held=("D", "X"), loco=("联7",), phase=1)
-        after_unwheel = State(
-            lines=(("卸轮线", ("X",)),),
-            held=("D",),
-            loco=("卸轮线",),
-            phase=1,
-        )
-        after_outer = State(
-            lines=(("修1库外", ("X",)),),
-            held=("D",),
-            loco=("修1库外",),
-            phase=1,
-        )
-        final = State(
-            lines=(("修1库外", ("X",)), ("修1库内", ("D",))),
-            held=(),
-            loco=("修1库外",),
-            phase=1,
-            positioned_positions=(("D", 5),),
-        )
-        put_unwheel = Op("Put", "卸轮线", ("X",), (), ("D",))
-        put_outer = Op("Put", "修1库外", ("X",), (), ("D",))
-        commit = Op(
-            "Put",
-            "修1库内",
-            ("D",),
-            (),
-            (),
-            positions=(("D", 5),),
-        )
-        successful_chain = transactions.Transaction(
-            start_state=after_outer,
-            end_state=final,
-            actions=(commit,),
-            committed_before=frozenset(),
-            committed_after=frozenset({"D"}),
-            cost=(1, 0, 0, 0),
-        )
-
-        def apply_put(
-            state: State,
-            line: str,
-            move: tuple[str, ...],
-        ) -> tuple[Op, State, str]:
-            self.assertEqual(state, initial)
-            self.assertEqual(move, ("X",))
-            if line == "卸轮线":
-                return put_unwheel, after_unwheel, ""
-            if line == "修1库外":
-                return put_outer, after_outer, ""
-            raise AssertionError(line)
-
-        def gate_chains(
-            state: State,
-            _committed: frozenset[str],
-        ) -> tuple[transactions.Transaction[State, Op, str], ...]:
-            if state == after_unwheel:
-                return ()
-            if state == after_outer:
-                return (successful_chain,)
-            raise AssertionError(state)
-
-        def stable_closure(
-            state: State,
-            seed: frozenset[str],
-        ) -> frozenset[str]:
-            return frozenset({"D"}) if state == final else seed
-
-        with (
-            patch.object(solver, "stable_closure", side_effect=stable_closure),
-            patch.object(solver, "committed_projection", return_value=()),
-            patch.object(solver, "deadline_reached", return_value=False),
-            patch.object(solver, "pending_inner_targets", return_value=set()),
-            patch.object(
-                solver,
-                "put_candidate_allowed",
-                side_effect=lambda _state, line, _move: line in {"卸轮线", "修1库外"},
-            ),
-            patch.object(solver, "apply_put", side_effect=apply_put),
-            patch.object(
-                solver,
-                "gate_chain_transactions",
-                side_effect=gate_chains,
-            ) as gate_chain_transactions,
-            patch.object(
-                solver,
-                "ops_cost",
-                side_effect=lambda ops: (len(ops), 0, 0, 0),
-            ),
-        ):
-            result = solver.alignment_transactions(initial, frozenset())
-
-        self.assertEqual(
-            [call.args[0] for call in gate_chain_transactions.call_args_list],
-            [after_unwheel, after_outer],
-        )
-        self.assertEqual(len(result), 1)
-        transaction = result[0]
-        self.assertEqual(transaction.start_state, initial)
-        self.assertEqual(transaction.end_state, final)
-        self.assertEqual(
-            [op.line for op in transaction.actions],
-            ["修1库外", "修1库内"],
-        )
-        self.assertEqual(transaction.newly_committed, frozenset({"D"}))
 
     def test_apply_get_requires_the_exposed_prefix_and_updates_state(self) -> None:
         req = request([
@@ -520,152 +568,859 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertEqual(reject, "put_tail_order_violation")
         self.assertEqual(unchanged, state)
 
-    def test_direct_put_transaction_closes_without_generic_expansion(self) -> None:
-        req = request([car("A", "机走北", 1, ["修1库内"], forced=[1])])
+    def test_mixed_gate_cycle_collects_remote_ready_block(self) -> None:
+        cars = [
+            car("H1", "机走北", 1, ["修1库内"], forced=[1]),
+            car("H2", "机走北", 2, ["修1库内"], forced=[2]),
+            car("G3", "修1库外", 1, ["修3库内"], forced=[3]),
+            car("G4", "修1库外", 2, ["修3库内"], forced=[4]),
+            car("S1", "修3库外", 1, ["修3库内"], forced=[1]),
+            car("T4", "修3库外", 2, ["修1库内"], forced=[4]),
+            car("T5", "修3库外", 3, ["修1库内"], forced=[5]),
+            car("D", "修1库内", 5, ["油漆线"]),
+            car("K", "机走北", 3, ["修2库内"], forced=[1]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {item["No"] for item in cars}
+        solver.fixed_cars = []
+        solver.fixed_outer_lines = set()
+        solver.fixed_positioned_positions = {}
+        solver.assigned_line_by_no = {
+            "H1": "修1库内", "H2": "修1库内", "T4": "修1库内", "T5": "修1库内",
+            "S1": "修3库内", "G3": "修3库内", "G4": "修3库内",
+            "D": "修1库外", "K": "修2库内",
+        }
+        solver.assigned_slot_by_no = {
+            "H1": ("修1库内", 1), "H2": ("修1库内", 2),
+            "T4": ("修1库内", 4), "T5": ("修1库内", 5),
+            "S1": ("修3库内", 1), "G3": ("修3库内", 3),
+            "G4": ("修3库内", 4), "K": ("修2库内", 1),
+        }
+        state = State(
+            lines=solver.pack_lines({
+                "修1库内": ("D",),
+                "修1库外": ("G3", "G4"),
+                "修2库内": ("K",),
+                "修3库外": ("S1", "T4", "T5"),
+            }),
+            held=("H1", "H2"),
+            loco=("修2库外",),
+            phase=1,
+            positioned_positions=(
+                ("D", 5), ("G3", 1), ("G4", 2), ("K", 1),
+                ("S1", 1), ("T4", 2), ("T5", 3),
+            ),
+        )
+        before = solver.stable_closure(state, frozenset())
+
+        transaction = min(
+            (
+                item
+                for item in solver.mixed_gate_cycle_transactions(state, before)
+                if item.newly_committed == frozenset({"T4", "T5"})
+            ),
+            key=lambda item: item.cost,
+        )
+
+        self.assertEqual(transaction.newly_committed, frozenset({"T4", "T5"}))
+        self.assertEqual(
+            [(op.action, op.line, op.move) for op in transaction.actions],
+            [
+                ("Get", "修1库外", ("G3", "G4")),
+                ("Get", "修1库内", ("D",)),
+                ("Get", "修3库外", ("S1", "T4", "T5")),
+                ("Put", "修1库内", ("T4", "T5")),
+            ],
+        )
+        projection = solver.committed_projection(state, before)
+        working = state
+        for op in transaction.actions:
+            if op.action == "Get":
+                _applied, working, reject = solver.apply_get(working, op.line, op.move)
+            else:
+                _applied, working, reject = solver.apply_put(working, op.line, op.move)
+            self.assertEqual(reject, "")
+            self.assertEqual(solver.committed_projection(working, before), projection)
+
+    def test_mixed_gate_cycle_restages_gate_and_inner_blocker(self) -> None:
+        held = [car(f"H{index}", "机走北", index, ["修4库内"], forced=[index]) for index in range(1, 5)]
+        for item in held:
+            item["IsHeavy"] = True
+        blocker = car("D", "修1库内", 5, ["油漆线"])
+        blocker["IsHeavy"] = True
+        cars = [
+            *held,
+            car("G1", "修1库外", 1, ["修3库内"], forced=[1]),
+            car("G2", "修1库外", 2, ["修3库内"], forced=[2]),
+            car("T5", "修1库外", 3, ["修1库内"], forced=[5]),
+            blocker,
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {item["No"] for item in cars}
+        solver.fixed_cars = []
+        solver.fixed_outer_lines = set()
+        solver.fixed_positioned_positions = {}
+        solver.assigned_line_by_no = {
+            **{f"H{index}": "修4库内" for index in range(1, 5)},
+            "G1": "修3库内", "G2": "修3库内",
+            "T5": "修1库内", "D": "修1库外",
+        }
+        solver.assigned_slot_by_no = {
+            **{f"H{index}": ("修4库内", index) for index in range(1, 5)},
+            "G1": ("修3库内", 1), "G2": ("修3库内", 2),
+            "T5": ("修1库内", 5),
+        }
+        state = State(
+            lines=solver.pack_lines({
+                "修1库内": ("D",),
+                "修1库外": ("G1", "G2", "T5"),
+            }),
+            held=("H1", "H2", "H3", "H4"),
+            loco=("修2库外",),
+            phase=1,
+            positioned_positions=(("D", 5), ("G1", 1), ("G2", 2), ("T5", 3)),
+        )
+
+        with (
+            patch.object(
+                solver,
+                "route",
+                side_effect=lambda current, _action, line, _move: (
+                    (current.loco[0], line),
+                    "",
+                ),
+            ),
+            patch.object(rv, "put_loco_positions", return_value={"联7"}),
+        ):
+            candidates = solver.mixed_gate_cycle_transactions(state, frozenset())
+        restaged = next(
+            item
+            for item in candidates
+            if [op.action for op in item.actions] == ["Get", "Put", "Get", "Put", "Get", "Put"]
+        )
+
+        self.assertEqual(restaged.newly_committed, frozenset({"D", "T5"}))
+        self.assertEqual(restaged.actions[0].move, ("G1", "G2", "T5"))
+        self.assertEqual(restaged.actions[2].move, ("D",))
+        self.assertEqual(restaged.actions[-1].move, ("T5",))
+
+    def test_mixed_gate_cycle_rejects_intermediate_committed_projection_change(self) -> None:
+        cars = [
+            car("C", "修1库外", 1, ["修2库内"], forced=[1]),
+            car("T5", "修3库外", 1, ["修1库内"], forced=[5]),
+            car("D", "修1库内", 5, ["油漆线"]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {item["No"] for item in cars}
+        solver.fixed_cars = []
+        solver.fixed_outer_lines = set()
+        solver.fixed_positioned_positions = {}
+        solver.assigned_line_by_no = {
+            "C": "修2库内",
+            "T5": "修1库内",
+            "D": "修1库外",
+        }
+        solver.assigned_slot_by_no = {
+            "C": ("修2库内", 1),
+            "T5": ("修1库内", 5),
+        }
+        state = State(
+            lines=solver.pack_lines({
+                "修1库内": ("D",),
+                "修1库外": ("C",),
+                "修3库外": ("T5",),
+            }),
+            held=(),
+            loco=("修2库外",),
+            phase=1,
+            positioned_positions=(("C", 1), ("D", 5), ("T5", 1)),
+        )
+
+        self.assertEqual(
+            solver.mixed_gate_cycle_transactions(state, frozenset({"C"})),
+            (),
+        )
+
+    def test_mixed_gate_cycle_with_empty_gate_stages_inner_blocker(self) -> None:
+        cars = [
+            car("T5", "机走北", 1, ["修1库内"], forced=[5]),
+            car("D", "修1库内", 5, ["油漆线"]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.assigned_line_by_no = {
+            "T5": "修1库内",
+            "D": "修2库外",
+        }
+        solver.assigned_slot_by_no = {"T5": ("修1库内", 5)}
+        state = State(
+            lines=(("修1库内", ("D",)),),
+            held=("T5",),
+            loco=("修2库外",),
+            phase=1,
+            positioned_positions=(("D", 5),),
+        )
+
+        transaction = min(
+            solver.mixed_gate_cycle_transactions(state, frozenset()),
+            key=lambda item: item.cost,
+        )
+
+        self.assertEqual(transaction.newly_committed, frozenset({"D", "T5"}))
+        self.assertEqual(
+            [(op.action, op.move) for op in transaction.actions],
+            [
+                ("Get", ("D",)),
+                ("Put", ("D",)),
+                ("Put", ("T5",)),
+            ],
+        )
+        self.assertNotEqual(transaction.actions[1].line, "修1库外")
+
+    def test_mixed_gate_cycle_moves_terminal_but_unstable_inner_prefix(self) -> None:
+        cars = [
+            car("S1", "机走北", 1, ["修1库内"], forced=[1]),
+            car("T5", "机走北", 2, ["修1库内"], forced=[5]),
+        ]
+        solver = Stage3Solver("TEST", request(cars), EMPTY_STAGE2, time_budget_seconds=5)
+        solver.assigned_line_by_no = {
+            "S1": "修1库内",
+            "T5": "修1库内",
+        }
+        solver.assigned_slot_by_no = {
+            "S1": ("修1库内", 1),
+            "T5": ("修1库内", 5),
+        }
+        state = State(
+            lines=(("修1库内", ("S1",)),),
+            held=("T5",),
+            loco=("修2库外",),
+            phase=1,
+            positioned_positions=(("S1", 1),),
+        )
+        before = solver.stable_closure(state, frozenset())
+
+        transaction = min(
+            solver.mixed_gate_cycle_transactions(state, before),
+            key=lambda item: item.cost,
+        )
+
+        self.assertTrue(solver.terminal_line_satisfied("S1", "修1库内"))
+        self.assertNotIn("S1", before)
+        self.assertEqual(transaction.newly_committed, frozenset({"T5"}))
+        self.assertEqual(
+            [(op.action, op.move) for op in transaction.actions],
+            [
+                ("Get", ("S1",)),
+                ("Put", ("S1",)),
+                ("Put", ("T5",)),
+            ],
+        )
+
+    def test_feasibility_potential_bounds_hook_cost_per_commit(self) -> None:
+        req = request([
+            car("A", "机走北", 1, ["修1库内"]),
+            car("B", "机走北", 2, ["修1库内"]),
+            car("C", "机走北", 3, ["修1库内"]),
+        ])
         solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
-        self.prepare_unified_assignment(solver)
-        state = State(lines=(), held=("A",), loco=("联7",), phase=1)
+        one = Op("Put", "修1库内", ("A",), (), ())
+        expensive = transactions.Transaction(
+            start_state="root",
+            end_state="high_progress",
+            actions=(one, one, one, one),
+            committed_before=frozenset(),
+            committed_after=frozenset({"A", "B"}),
+            cost=(4, 0, 0, 0),
+        )
+        cheap = transactions.Transaction(
+            start_state="root",
+            end_state="low_cost",
+            actions=(one,),
+            committed_before=frozenset(),
+            committed_after=frozenset({"A"}),
+            cost=(1, 0, 0, 0),
+        )
+        expensive_finish = transactions.Transaction(
+            start_state="high_progress",
+            end_state="expensive_done",
+            actions=(one,),
+            committed_before=frozenset({"A", "B"}),
+            committed_after=frozenset({"A", "B", "C"}),
+            cost=(1, 0, 0, 0),
+        )
+        cheap_finish = replace(
+            expensive_finish,
+            start_state="low_cost",
+            end_state="cheap_done",
+            committed_before=frozenset({"A"}),
+        )
+        closure = {
+            "root": frozenset(),
+            "high_progress": frozenset({"A", "B"}),
+            "low_cost": frozenset({"A"}),
+            "expensive_done": frozenset({"A", "B", "C"}),
+            "cheap_done": frozenset({"A", "B", "C"}),
+        }
+        lower_bound = {
+            "root": 2,
+            "high_progress": 1,
+            "low_cost": 1,
+            "expensive_done": 0,
+            "cheap_done": 0,
+        }
+        solver.active_nos = {"A", "B", "C"}
 
-        candidates = solver.direct_put_transactions(state, frozenset())
+        with (
+            patch.object(
+                solver,
+                "stable_closure",
+                side_effect=lambda state, seed: seed | closure[state],
+            ),
+            patch.object(
+                solver,
+                "transaction_hook_lower_bound",
+                side_effect=lambda state, _committed: lower_bound[state],
+            ),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    len(solver.active_nos - closure[state]),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(
+                solver,
+                "complete",
+                side_effect=lambda state: state.endswith("_done"),
+            ),
+            patch.object(solver, "deadline_reached", return_value=False),
+            patch.object(
+                solver,
+                "unsatisfied_active_count",
+                side_effect=lambda state: len(solver.active_nos - closure[state]),
+            ),
+            patch.object(
+                solver,
+                "direct_transfer_transactions",
+                side_effect=lambda state, _committed: {
+                    "root": (cheap, expensive),
+                    "high_progress": (expensive_finish,),
+                    "low_cost": (cheap_finish,),
+                }.get(state, ()),
+            ),
+            patch.object(solver, "direct_put_transactions", return_value=()),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(solver, "transaction_neighbors", return_value=()),
+        ):
+            result = solver.plan_transactions(
+                "B",
+                "root",  # type: ignore[arg-type]
+                (),
+                solver.started_at,
+                expansion_limit=3,
+            )
 
-        self.assertEqual(len(candidates), 1)
-        transaction = candidates[0]
-        self.assertEqual(transaction.newly_committed, frozenset({"A"}))
-        self.assertEqual(transaction.actions[0].action, "Put")
-        self.assertTrue(solver.complete(transaction.end_state))
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.state, "cheap_done")
+        self.assertEqual(result.cost, (2, 0, 0, 0))
+        self.assertEqual(len(result.ops), 2)
+        self.assertEqual(result.expansions, 2)
 
-    def test_budget_exhaustion_drains_other_structural_frontier_states(self) -> None:
+    def test_primitive_lowering_hook_bound_is_preferred_by_guide(self) -> None:
+        req = request([car("A", "机走北", 1, ["修1库内"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        phase = Op("Phase", "", (), (), ())
+        hook = Op("Put", "修1库内", ("A",), (), ())
+        neighbors = {
+            "root": (
+                transactions.LegalTransition(phase, "ordinary"),
+                transactions.LegalTransition(hook, "lower_bound_drop"),
+            ),
+            "lower_bound_drop": (
+                transactions.LegalTransition(hook, "done"),
+            ),
+        }
+        lower_bound = {
+            "root": 2,
+            "ordinary": 2,
+            "lower_bound_drop": 1,
+            "done": 0,
+        }
+
+        with (
+            patch.object(solver, "stable_closure", return_value=frozenset()),
+            patch.object(
+                solver,
+                "transaction_hook_lower_bound",
+                side_effect=lambda state, _committed: lower_bound[state],
+            ),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    int(state != "done"),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(solver, "complete", side_effect=lambda state: state == "done"),
+            patch.object(solver, "deadline_reached", return_value=False),
+            patch.object(solver, "unsatisfied_active_count", return_value=1),
+            patch.object(solver, "direct_put_transactions", return_value=()),
+            patch.object(solver, "direct_transfer_transactions", return_value=()),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(
+                solver,
+                "transaction_neighbors",
+                side_effect=lambda state, _template: neighbors.get(state, ()),
+            ),
+        ):
+            result = solver.plan_transactions(
+                "B",
+                "root",  # type: ignore[arg-type]
+                (),
+                solver.started_at,
+                expansion_limit=2,
+            )
+
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.state, "done")
+        self.assertEqual(result.cost, (2, 0, 0, 0))
+        self.assertEqual(result.expansions, 2)
+
+    def test_put_get_put_is_kept_when_it_reaches_a_distinct_state(self) -> None:
+        req = request([car("X", "机走北", 1, ["修1库内"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"X"}
+        put = Op("Put", "修1库内", ("X",), (), ())
+        get = Op("Get", "修1库内", ("X",), (), ())
+        root = State((), ("X",), ("root",), 0)
+        put_once = State((), (), ("put_once",), 0)
+        get_again = State((), ("X",), ("get_again",), 0)
+        done = State((), (), ("done",), 1)
+        closure = {
+            root: frozenset(),
+            put_once: frozenset(),
+            get_again: frozenset(),
+            done: frozenset({"X"}),
+        }
+        neighbors = {
+            root: (transactions.LegalTransition(put, put_once),),
+            put_once: (transactions.LegalTransition(get, get_again),),
+            get_again: (transactions.LegalTransition(put, done),),
+        }
+
+        with (
+            patch.object(
+                solver,
+                "stable_closure",
+                side_effect=lambda state, seed: seed | closure[state],
+            ),
+            patch.object(solver, "transaction_hook_lower_bound", return_value=0),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    len(solver.active_nos - closure[state]),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(solver, "complete", side_effect=lambda state: state == done),
+            patch.object(solver, "deadline_reached", return_value=False),
+            patch.object(solver, "unsatisfied_active_count", return_value=1),
+            patch.object(solver, "direct_put_transactions", return_value=()),
+            patch.object(solver, "direct_transfer_transactions", return_value=()),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(
+                solver,
+                "transaction_neighbors",
+                side_effect=lambda state, _template: neighbors.get(state, ()),
+            ),
+        ):
+            result = solver.plan_transactions(
+                "B",
+                root,
+                (),
+                solver.started_at,
+                expansion_limit=3,
+            )
+
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.state, done)
+        self.assertEqual([op.action for op in result.ops], ["Put", "Get", "Put"])
+
+    def test_anchor_recovers_after_guide_drains(self) -> None:
+        req = request([car("X", "机走北", 1, ["修1库内"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"X"}
+        put = Op("Put", "修1库内", ("X",), (), ())
+        root = State((), ("X",), ("root",), 0)
+        detour = State((), ("X",), ("detour",), 0)
+        necessary = State((), ("X",), ("necessary",), 0)
+        done = State((), (), ("done",), 1)
+        closure = {
+            root: frozenset(),
+            detour: frozenset(),
+            necessary: frozenset(),
+            done: frozenset({"X"}),
+        }
+        structural = transactions.Transaction(
+            start_state=root,
+            end_state=detour,
+            actions=(put, put, put),
+            committed_before=frozenset(),
+            committed_after=frozenset(),
+            cost=(3, 0, 0, 0),
+        )
+        neighbors = {
+            root: (transactions.LegalTransition(put, necessary),),
+            necessary: (transactions.LegalTransition(put, done),),
+        }
+
+        with (
+            patch.object(
+                solver,
+                "stable_closure",
+                side_effect=lambda state, seed: seed | closure[state],
+            ),
+            patch.object(solver, "transaction_hook_lower_bound", return_value=0),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    len(solver.active_nos - closure[state]),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(solver, "complete", side_effect=lambda state: state == done),
+            patch.object(solver, "deadline_reached", return_value=False),
+            patch.object(solver, "unsatisfied_active_count", return_value=1),
+            patch.object(solver, "direct_put_transactions", return_value=()),
+            patch.object(
+                solver,
+                "direct_transfer_transactions",
+                side_effect=lambda state, _committed: (
+                    (structural,) if state == root else ()
+                ),
+            ),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(
+                solver,
+                "transaction_neighbors",
+                side_effect=lambda state, _template: neighbors.get(state, ()),
+            ),
+        ):
+            result = solver.plan_transactions(
+                "B",
+                root,
+                (),
+                solver.started_at,
+                expansion_limit=3,
+            )
+
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.state, done)
+        self.assertEqual(result.cost, (2, 0, 0, 0))
+        self.assertEqual(result.expansions, 3)
+
+    def test_generated_complete_is_retained_before_next_frontier_pop(self) -> None:
+        req = request([car("A", "机走北", 1, ["修1库内"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        solver.active_nos = {"A"}
+        op = Op("Put", "修1库内", ("A",), (), ())
+        goal = transactions.Transaction(
+            start_state="root",
+            end_state="done",
+            actions=(op,),
+            committed_before=frozenset(),
+            committed_after=frozenset({"A"}),
+            cost=(1, 0, 0, 0),
+        )
+        closure = {"root": frozenset(), "done": frozenset({"A"})}
+
+        with (
+            patch.object(
+                solver,
+                "stable_closure",
+                side_effect=lambda state, seed: seed | closure[state],
+            ),
+            patch.object(
+                solver,
+                "transaction_hook_lower_bound",
+                side_effect=lambda state, _committed: int(state == "root"),
+            ),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    len(solver.active_nos - closure[state]),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(
+                solver,
+                "complete",
+                side_effect=lambda state: state == "done",
+            ),
+            patch.object(solver, "deadline_reached", side_effect=[False, True]),
+            patch.object(
+                solver,
+                "unsatisfied_active_count",
+                side_effect=lambda state: len(solver.active_nos - closure[state]),
+            ),
+            patch.object(
+                solver,
+                "direct_put_transactions",
+                side_effect=lambda state, _committed: (goal,) if state == "root" else (),
+            ),
+            patch.object(solver, "direct_transfer_transactions", return_value=()),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(solver, "transaction_neighbors", return_value=()),
+        ):
+            result = solver.plan_transactions(
+                "B",
+                "root",  # type: ignore[arg-type]
+                (),
+                solver.started_at,
+                expansion_limit=1,
+            )
+
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.state, "done")
+        self.assertEqual(result.cost, (1, 0, 0, 0))
+
+    def test_transaction_search_resumes_at_cumulative_expansion_limit(self) -> None:
+        solver = Stage3Solver(
+            "TEST",
+            request([
+                car("A", "机走北", 1, ["修1库内"]),
+                car("B", "机走北", 2, ["修1库内"]),
+            ]),
+            EMPTY_STAGE2,
+            time_budget_seconds=5,
+        )
+        solver.active_nos = {"A", "B"}
+        put_a = Op("Put", "修1库内", ("A",), (), ())
+        put_b = Op("Put", "修1库内", ("B",), (), ())
+        closure = {
+            "root": frozenset(),
+            "mid": frozenset({"A"}),
+            "done": frozenset({"A", "B"}),
+        }
+        neighbors = {
+            "root": (transactions.LegalTransition(put_a, "mid"),),
+            "mid": (transactions.LegalTransition(put_b, "done"),),
+        }
+        expanded_states: list[str] = []
+
+        def transitions(state: str, _template: str) -> tuple[object, ...]:
+            expanded_states.append(state)
+            return neighbors.get(state, ())
+
+        with (
+            patch.object(
+                solver,
+                "stable_closure",
+                side_effect=lambda state, seed: seed | closure[state],
+            ),
+            patch.object(
+                solver,
+                "transaction_hook_lower_bound",
+                side_effect=lambda state, _committed: len(
+                    solver.active_nos - closure[state]
+                ),
+            ),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    len(solver.active_nos - closure[state]),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(solver, "complete", side_effect=lambda state: state == "done"),
+            patch.object(solver, "deadline_reached", return_value=False),
+            patch.object(
+                solver,
+                "unsatisfied_active_count",
+                side_effect=lambda state: len(solver.active_nos - closure[state]),
+            ),
+            patch.object(solver, "direct_put_transactions", return_value=()),
+            patch.object(solver, "direct_transfer_transactions", return_value=()),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(solver, "transaction_neighbors", side_effect=transitions),
+        ):
+            first = solver.plan_transactions(
+                "B",
+                "root",  # type: ignore[arg-type]
+                (),
+                solver.started_at,
+                expansion_limit=1,
+                search_key=("B", "resume-test"),
+            )
+            resumed = solver.plan_transactions(
+                "B",
+                "root",  # type: ignore[arg-type]
+                (),
+                solver.started_at,
+                expansion_limit=2,
+                search_key=("B", "resume-test"),
+            )
+
+        self.assertEqual(first.status, "partial")
+        self.assertEqual(first.expansions, 1)
+        self.assertEqual(resumed.status, "complete")
+        self.assertEqual(resumed.expansions, 2)
+        self.assertEqual(expanded_states, ["root", "mid"])
+
+    def test_restoration_position_shift_does_not_add_a_false_get_bound(self) -> None:
+        solver = Stage3Solver(
+            "TEST",
+            request([
+                car("B", "机走北", 1, ["机走北"]),
+                car("R", "机走北", 2, ["机走北"]),
+            ]),
+            EMPTY_STAGE2,
+            time_budget_seconds=5,
+        )
+        solver.active_nos = {"B", "R"}
+        solver.restoration_nos = {"B", "R"}
+        solver.restoration_position_nos = {"B", "R"}
+        solver.assigned_line_by_no = {"B": "机走北", "R": "机走北"}
+        state = State(
+            lines=solver.pack_lines({"机走北": ("R",)}),
+            held=("B",),
+            loco=("机走北",),
+            phase=1,
+        )
+
+        self.assertEqual(
+            solver.transaction_hook_lower_bound(state, frozenset()),
+            1,
+        )
+
+    def test_budget_exhaustion_returns_existing_incumbent(self) -> None:
         req = request([
             car("A", "机走北", 1, ["修1库内"]),
             car("B", "机走北", 2, ["修1库内"]),
         ])
         solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
-        first = Op("Put", "修1库外", ("A",), (), ("A",))
-        second = Op("Put", "修2库外", ("B",), (), ("B",))
-        root_search = transactions.TransactionSearchResult(
-            transactions=(
-                transactions.Transaction(
-                    start_state="root",
-                    end_state="dead",
-                    actions=(first,),
-                    committed_before=frozenset(),
-                    committed_after=frozenset({"A"}),
-                    cost=(1, 0, 0, 1),
-                ),
-                transactions.Transaction(
-                    start_state="root",
-                    end_state="good",
-                    actions=(first,),
-                    committed_before=frozenset(),
-                    committed_after=frozenset({"A"}),
-                    cost=(1, 0, 0, 1),
-                ),
-            ),
-            termination=transactions.TransactionTermination.FOUND,
-            minimal_cost=(1, 0, 0, 1),
-            minimal_cost_proven=True,
-            enumeration_complete=True,
-            search_spec_evaluated=True,
-            expansions=1,
-            generated=2,
-            dominated_pruned=0,
-            committed_projection_pruned=0,
-            frontier_size=0,
-            elapsed_seconds=0.0,
-        )
-        finish = transactions.Transaction(
-            start_state="good",
+        solver.active_nos = {"A", "B"}
+        op = Op("Put", "修1库内", ("A",), (), ())
+        goal = transactions.Transaction(
+            start_state="root",
             end_state="done",
-            actions=(second,),
-            committed_before=frozenset({"A"}),
+            actions=(op, op, op),
+            committed_before=frozenset(),
             committed_after=frozenset({"A", "B"}),
-            cost=(1, 0, 0, 1),
+            cost=(3, 0, 0, 0),
         )
+        dead = tuple(
+            transactions.Transaction(
+                start_state="root",
+                end_state=f"dead_{index}",
+                actions=(op,),
+                committed_before=frozenset(),
+                committed_after=frozenset({"A"}),
+                cost=(1, 0, 0, 0),
+            )
+            for index in range(3)
+        )
+        root_candidates = (goal, *dead)
         closure = {
             "root": frozenset(),
-            "dead": frozenset({"A"}),
-            "good": frozenset({"A"}),
             "done": frozenset({"A", "B"}),
+            **{f"dead_{index}": frozenset({"A"}) for index in range(3)},
         }
-        def run(
-            active_nos: set[str],
-            terminal_state: str | None,
-        ) -> tuple[SearchResult, object, object]:
-            solver.active_nos = active_nos
-            with (
-                patch.object(
-                    solver,
-                    "stable_closure",
-                    side_effect=lambda state, seed: seed | closure[state],
-                ),
-                patch.object(
-                    solver,
-                    "transaction_progress_key",
-                    side_effect=lambda state, _committed: (
-                        len(active_nos - closure[state]),
-                        int(state == "good"),
-                        0,
-                        0,
-                        0,
-                    ),
-                ),
-                patch.object(
-                    solver,
-                    "complete",
-                    side_effect=lambda state: state == terminal_state,
-                ),
-                patch.object(solver, "deadline_reached", return_value=False),
-                patch.object(
-                    solver,
-                    "unsatisfied_active_count",
-                    side_effect=lambda state: len(active_nos - closure[state]),
-                ),
-                patch.object(
-                    solver,
-                    "direct_put_transactions",
-                    side_effect=lambda state, _committed: (
-                        (finish,) if state == "good" else ()
-                    ),
-                ) as direct_put_transactions,
-                patch.object(solver, "capacity_exchange_transactions", return_value=()),
-                patch.object(solver, "gate_chain_transactions", return_value=()),
-                patch.object(
-                    solver,
-                    "alignment_transactions",
-                    return_value=(),
-                ) as alignment_transactions,
-                patch.object(
-                    transactions,
-                    "enumerate_minimal_transactions",
-                    return_value=root_search,
-                ),
-            ):
-                result = solver.plan_transactions(
-                    "B",
-                    "root",  # type: ignore[arg-type]
-                    (),
-                    solver.started_at,
-                    expansion_limit=1,
-                )
-            return result, alignment_transactions, direct_put_transactions
 
-        complete, complete_alignment, complete_direct = run({"A", "B"}, "done")
-        self.assertEqual(complete.status, "complete")
-        self.assertEqual(complete.state, "done")
-        self.assertEqual(complete.committed_count, 2)
-        self.assertEqual(complete.expansions, 1)
-        complete_alignment.assert_called_once_with("root", frozenset())
-        self.assertEqual(complete_direct.call_count, 3)
+        with (
+            patch.object(
+                solver,
+                "stable_closure",
+                side_effect=lambda state, seed: seed | closure[state],
+            ),
+            patch.object(
+                solver,
+                "transaction_hook_lower_bound",
+                return_value=0,
+            ),
+            patch.object(
+                solver,
+                "transaction_progress_key",
+                side_effect=lambda state, _committed: (
+                    len(solver.active_nos - closure[state]),
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+            ),
+            patch.object(
+                solver,
+                "complete",
+                side_effect=lambda state: state == "done",
+            ),
+            patch.object(solver, "deadline_reached", return_value=False),
+            patch.object(
+                solver,
+                "unsatisfied_active_count",
+                side_effect=lambda state: len(solver.active_nos - closure[state]),
+            ),
+            patch.object(
+                solver,
+                "direct_transfer_transactions",
+                side_effect=lambda state, _committed: (
+                    root_candidates if state == "root" else ()
+                ),
+            ),
+            patch.object(solver, "direct_put_transactions", return_value=()),
+            patch.object(solver, "capacity_exchange_transactions", return_value=()),
+            patch.object(solver, "gate_chain_transactions", return_value=()),
+            patch.object(solver, "mixed_gate_cycle_transactions", return_value=()),
+            patch.object(solver, "transaction_neighbors", return_value=()),
+        ):
+            result = solver.plan_transactions(
+                "B",
+                "root",  # type: ignore[arg-type]
+                (),
+                solver.started_at,
+                expansion_limit=1,
+            )
 
-        partial, partial_alignment, partial_direct = run({"A", "B", "C"}, None)
-        self.assertEqual(partial.status, "partial")
-        self.assertEqual(partial.committed_count, 1)
-        self.assertEqual(
-            partial.reasons,
-            ("transaction_post_budget_frontier_exhausted",),
-        )
-        partial_alignment.assert_called_once_with("root", frozenset())
-        self.assertEqual(partial_direct.call_count, 3)
+        self.assertEqual(result.status, "complete")
+        self.assertEqual(result.state, "done")
+        self.assertEqual(result.cost, (3, 0, 0, 0))
+        self.assertFalse(result.search_spec_evaluated)
 
     def test_partial_response_drops_open_train_operation_prefix(self) -> None:
         req = request([car("A", "机走北", 1, ["修1库内"])])
@@ -862,7 +1617,132 @@ class Stage3StructuralTests(unittest.TestCase):
         )
         self.assertEqual(solver.select_finalist_specs([], results), [])
 
-    def test_deepening_evaluates_static_pair_before_skipping_dynamic_finalist(self) -> None:
+    def test_select_finalist_specs_covers_pickup_templates_before_filling(self) -> None:
+        solver = object.__new__(Stage3Solver)
+
+        def spec(template: str, index: int) -> PlacementSpec:
+            return PlacementSpec(
+                operation_lower_bound=index,
+                placement_score=(index,),
+                signature=((f"{template}{index}", "outer", "修1库外", -1),),
+                template=template,
+                layout=f"unified:{template}:{index:02d}",
+            )
+
+        first_b = spec("B", 0)
+        second_b = spec("B", 1)
+        third_b = spec("B", 2)
+        first_a = spec("A", 3)
+
+        selected = solver.select_finalist_specs(
+            [first_b, second_b, third_b, first_a],
+            {},
+        )
+
+        self.assertEqual(selected, [first_b, first_a, second_b])
+        self.assertEqual({item.template for item in selected}, {"A", "B"})
+
+    def test_select_finalist_specs_prioritizes_less_deeply_searched_layouts(self) -> None:
+        solver = object.__new__(Stage3Solver)
+
+        def spec(index: int) -> PlacementSpec:
+            return PlacementSpec(
+                operation_lower_bound=1,
+                placement_score=(index,),
+                signature=((f"C{index}", "outer", "修1库外", -1),),
+                template="B",
+                layout=f"unified:B:{index:02d}",
+            )
+
+        specs = [spec(index) for index in range(4)]
+        searched = SearchResult(
+            status="complete",
+            template="B",
+            state=None,
+            ops=(),
+            cost=(1, 0, 0, 0),
+            reasons=(),
+            expansions=5_000,
+            elapsed_seconds=0.0,
+            search_spec_evaluated=False,
+        )
+        results = {
+            (item.template, item.layout): replace(searched, layout=item.layout)
+            for item in specs[:3]
+        }
+
+        selected = solver.select_finalist_specs(specs, results)
+
+        self.assertEqual(selected[0], specs[3])
+        self.assertEqual(selected, [specs[3]])
+
+    def test_select_finalist_specs_exploits_low_hook_incumbent_after_screening(self) -> None:
+        solver = object.__new__(Stage3Solver)
+        hook = Op("Put", "修1库外", ("A",), (), ())
+
+        def spec(index: int) -> PlacementSpec:
+            return PlacementSpec(
+                operation_lower_bound=5,
+                placement_score=(index,),
+                signature=((f"C{index}", "outer", "修1库外", -1),),
+                template="B",
+                layout=f"unified:B:{index:02d}",
+            )
+
+        specs = [spec(index) for index in range(4)]
+        results = {
+            (item.template, item.layout): SearchResult(
+                status="complete",
+                template=item.template,
+                state=None,
+                ops=(hook,) * (8 if index == 0 else 14),
+                cost=(8 if index == 0 else 14, 0, 0, 0),
+                reasons=(),
+                expansions=5_000 if index == 0 else 100,
+                elapsed_seconds=0.0,
+                layout=item.layout,
+                search_spec_evaluated=False,
+            )
+            for index, item in enumerate(specs)
+        }
+
+        selected = solver.select_finalist_specs(specs, results)
+
+        self.assertEqual(selected[0], specs[0])
+        self.assertEqual(len(selected), 3)
+
+    def test_finalist_first_deepening_stops_at_screening_floor(self) -> None:
+        prior = SearchResult(
+            status="partial",
+            template="B",
+            state=None,
+            ops=(),
+            cost=(10**9, 0, 0, 0),
+            reasons=("budget",),
+            expansions=25,
+            elapsed_seconds=0.0,
+        )
+
+        self.assertEqual(
+            Stage3Solver.finalist_expansion_target(None, 250),
+            25,
+        )
+        self.assertEqual(
+            Stage3Solver.finalist_expansion_target(
+                replace(prior, expansions=0),
+                500,
+            ),
+            25,
+        )
+        self.assertEqual(
+            Stage3Solver.finalist_expansion_target(
+                prior,
+                500,
+            ),
+            500,
+        )
+
+    def test_deepening_evaluates_lower_bound_viable_dynamic_finalist(self) -> None:
         req = request([car("A", "机走北", 1, ["修1库内"])])
         solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
         plans = tuple(
@@ -898,8 +1778,20 @@ class Stage3StructuralTests(unittest.TestCase):
             reasons=("screening",),
             expansions=0,
             elapsed_seconds=0.0,
+            search_spec_evaluated=False,
         )
         calls: list[tuple[str, int]] = []
+
+        def unified_placements(template: str) -> placement.SolveResult:
+            solved = available if template == "B" else unavailable
+            solver.placement_candidates[template] = tuple(
+                (
+                    f"unified:{template}:{index:02d}",
+                    plan,
+                )
+                for index, plan in enumerate(solved.plans)
+            )
+            return solved
 
         def solve_template(
             template: str,
@@ -914,10 +1806,14 @@ class Stage3StructuralTests(unittest.TestCase):
                 layout=layout,
                 expansions=transaction_expansion_limit,
             )
-            complete_cost = {
-                "unified:B:00": 30,
-                "unified:B:01": 20,
-            }.get(layout) if transaction_expansion_limit >= 5_000 else None
+            complete_cost = None
+            if transaction_expansion_limit >= 5_000:
+                complete_cost = {
+                    "unified:B:00": 30,
+                    "unified:B:01": 20,
+                }.get(layout)
+            if layout == "unified:B:02" and transaction_expansion_limit >= 10_000:
+                complete_cost = 15
             if complete_cost is None:
                 return candidate
             return replace(
@@ -933,7 +1829,7 @@ class Stage3StructuralTests(unittest.TestCase):
             patch.object(
                 solver,
                 "unified_placements",
-                side_effect=lambda template: available if template == "B" else unavailable,
+                side_effect=unified_placements,
             ),
             patch.object(
                 solver,
@@ -957,21 +1853,136 @@ class Stage3StructuralTests(unittest.TestCase):
 
         self.assertEqual(
             [layout for layout, limit in calls if limit == 5_000],
-            ["unified:B:00", "unified:B:01"],
+            ["unified:B:00", "unified:B:01", "unified:B:02"],
         )
-        self.assertFalse(any(limit == 10_000 for _layout, limit in calls))
-        self.assertEqual(result["chosen"].layout, "unified:B:01")
-        self.assertEqual(result["chosen"].cost, (20, 0, 0, 0))
+        self.assertEqual(
+            [layout for layout, limit in calls if limit == 10_000],
+            ["unified:B:01", "unified:B:00", "unified:B:02"],
+        )
+        self.assertEqual(result["chosen"].layout, "unified:B:02")
+        self.assertEqual(result["chosen"].cost, (15, 0, 0, 0))
         self.assertEqual(
             {
                 item.layout
                 for item in result["results"]
                 if item.status == "complete"
             },
-            {"unified:B:00", "unified:B:01"},
+            {"unified:B:00", "unified:B:01", "unified:B:02"},
         )
 
-    def test_iterative_deepening_screens_fairly_before_selecting_finalists(self) -> None:
+    def test_stop_certificate_covers_every_retained_placement(self) -> None:
+        req = request([car("A", "机走北", 1, ["修1库内"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        plans = tuple(
+            placement.Plan(
+                assignments=(("A", placement.Atom("inner", "修1库内", position)),),
+                score=(0, position),
+            )
+            for position in range(1, 5)
+        )
+        available = placement.SolveResult(
+            plans=plans,
+            explored_nodes=4,
+            complete=True,
+            budget_exhausted=False,
+            frontier_truncated=False,
+        )
+        initial = solver.initial_state_without_pickup()
+        attempted = Op("Get", "机走北", ("A",), (), ("A",))
+        hooks_by_layout = {
+            "unified:B:00": 30,
+            "unified:B:01": 20,
+            "unified:B:02": 18,
+            "unified:B:03": 10,
+        }
+        calls: list[str] = []
+
+        def unified_placements(template: str) -> placement.SolveResult:
+            solver.placement_candidates[template] = tuple(
+                (f"unified:{template}:{index:02d}", plan)
+                for index, plan in enumerate(plans)
+            )
+            return available
+
+        def solve_template(
+            template: str,
+            *,
+            layout: str,
+            transaction_expansion_limit: int,
+        ) -> SearchResult:
+            del transaction_expansion_limit
+            calls.append(layout)
+            hooks = hooks_by_layout[layout]
+            return SearchResult(
+                status="complete",
+                template=template,
+                state=initial,
+                ops=(attempted,) * hooks,
+                cost=(hooks, 0, 0, 0),
+                reasons=(),
+                expansions=1,
+                elapsed_seconds=0.0,
+                layout=layout,
+                search_spec_evaluated=True,
+                committed_count=1,
+            )
+
+        with (
+            patch.object(solver, "unified_placements", side_effect=unified_placements),
+            patch.object(
+                solver,
+                "build_assigned_line_by_no",
+                return_value={"A": "修1库内"},
+            ),
+            patch.object(
+                solver,
+                "template_operation_lower_bound_components",
+                return_value={"test": 0},
+            ),
+            patch.object(solver, "solve_template", side_effect=solve_template),
+            patch.object(solver, "validate_candidate", side_effect=lambda item: item),
+            patch.object(
+                solver,
+                "result",
+                side_effect=lambda chosen, results: {
+                    "chosen": chosen,
+                    "results": results,
+                },
+            ),
+        ):
+            result = solver.solve()
+
+        self.assertIn("unified:B:03", calls)
+        self.assertEqual(result["chosen"].layout, "unified:B:03")
+        self.assertEqual(result["chosen"].cost, (10, 0, 0, 0))
+
+    def test_finalist_lower_bound_only_prunes_strictly_worse_hook_counts(self) -> None:
+        solver = object.__new__(Stage3Solver)
+        spec = PlacementSpec(
+            operation_lower_bound=20,
+            placement_score=(),
+            signature=(),
+            template="B",
+            layout="unified:B:00",
+        )
+
+        self.assertTrue(
+            solver.finalist_lower_bound_can_improve(spec, 20)
+        )
+        self.assertTrue(
+            solver.finalist_lower_bound_can_improve(
+                replace(spec, operation_lower_bound=19),
+                20,
+            )
+        )
+        self.assertFalse(
+            solver.finalist_lower_bound_can_improve(
+                replace(spec, operation_lower_bound=21),
+                20,
+            )
+        )
+
+    def test_iterative_deepening_uses_certified_bounds_before_finalists(self) -> None:
         req = request([car("A", "机走北", 1, ["修1库内"])])
         solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
         b_plans = tuple(
@@ -1019,6 +2030,17 @@ class Stage3StructuralTests(unittest.TestCase):
         }
         calls: list[tuple[str, int]] = []
 
+        def unified_placements(template: str) -> placement.SolveResult:
+            solved = b_available if template == "B" else a_available
+            solver.placement_candidates[template] = tuple(
+                (
+                    f"unified:{template}:{index:02d}",
+                    plan,
+                )
+                for index, plan in enumerate(solved.plans)
+            )
+            return solved
+
         def solve_template(
             template: str,
             *,
@@ -1046,9 +2068,7 @@ class Stage3StructuralTests(unittest.TestCase):
             patch.object(
                 solver,
                 "unified_placements",
-                side_effect=lambda template: (
-                    b_available if template == "B" else a_available
-                ),
+                side_effect=unified_placements,
             ),
             patch.object(
                 solver,
@@ -1071,23 +2091,31 @@ class Stage3StructuralTests(unittest.TestCase):
             result = solver.solve()
 
         self.assertEqual(
+            {
+                layout
+                for layout, limit in calls
+                if limit == 25
+            },
+            {
+                f"unified:B:{index:02d}"
+                for index in range(8)
+            },
+        )
+        self.assertEqual(
             [layout for layout, limit in calls if limit == 100],
-            [
-                "unified:B:01",
-                "unified:B:02",
-                "unified:B:00",
-                "unified:B:03",
-                "unified:A:00",
-                "unified:B:04",
-            ],
-        )
-        self.assertEqual(
-            [layout for layout, limit in calls if limit == 5_000],
             ["unified:B:00", "unified:B:01", "unified:B:02"],
         )
+        calls_at_5_000 = [
+            layout for layout, limit in calls if limit == 5_000
+        ]
+        calls_at_10_000 = [
+            layout for layout, limit in calls if limit == 10_000
+        ]
+        self.assertEqual(len(calls_at_5_000), 3)
+        self.assertEqual(len(calls_at_10_000), 3)
         self.assertEqual(
-            [layout for layout, limit in calls if limit == 10_000],
-            ["unified:B:00", "unified:B:01", "unified:B:02"],
+            set(calls_at_5_000),
+            {"unified:B:00", "unified:B:01", "unified:B:02"},
         )
         self.assertEqual(result["chosen"].layout, "unified:B:01")
         self.assertEqual(result["chosen"].committed_count, 1)
@@ -1337,6 +2365,24 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertEqual(put["Positions"], {"A": 3})
         self.assert_replay_clean(req, result)
 
+    def test_unforced_outer_restoration_allows_compact_position_shift(self) -> None:
+        req = request([
+            car("A", "机走北", 1, ["修2库外"]),
+            car("R", "修2库外", 1, ["修2库外"]),
+        ])
+
+        result = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5).solve()
+        generated = {
+            row["No"]: (row["Line"], row["Position"])
+            for row in result["response"]["Data"]["GeneratedEndStatus"]
+        }
+
+        self.assertEqual(result["summary"]["status"], "complete")
+        self.assertEqual(result["summary"]["business_hooks"], 2)
+        self.assertEqual(generated["A"], ("修2库外", 1))
+        self.assertEqual(generated["R"], ("修2库外", 2))
+        self.assert_replay_clean(req, result)
+
     def test_source_prefix_support_is_restored_in_original_order(self) -> None:
         req = request([
             car("F1", "机走北", 1, ["机走北"], forced=[1]),
@@ -1420,7 +2466,7 @@ class Stage3StructuralTests(unittest.TestCase):
                 "source_gets": 1,
                 "inner_puts": 1,
                 "non_inner_puts": 0,
-                "frontier_rehandle": 0,
+                "shared_rehandle": 0,
             },
         )
         self.assertEqual(sum(components.values()), 2)
@@ -1466,6 +2512,30 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertEqual(summary["optimality_status"], "search_space_evaluation_incomplete")
         self.assertEqual(summary["template_summaries"][0]["operation_lower_bound_gap"], 0)
 
+    def test_global_lower_bound_reached_proves_optimality_without_enumeration(self) -> None:
+        req = request([car("A", "机走北", 1, ["修1库内"])])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        solver.search_space_evaluation_incomplete = True
+
+        result = solver.solve()
+        summary = result["summary"]
+
+        self.assertEqual(summary["status"], "complete")
+        self.assertEqual(summary["evaluated_search_space_gap"], 0)
+        self.assertFalse(summary["search_space_evaluation_complete"])
+        self.assertEqual(
+            summary["optimality_status"],
+            "search_space_lower_bound_reached",
+        )
+        self.assertEqual(
+            summary["elapsed_seconds"],
+            summary["wall_elapsed_seconds"],
+        )
+        self.assertLessEqual(
+            summary["chosen_search_seconds"],
+            summary["wall_elapsed_seconds"],
+        )
+
     def test_upstream_unavailable_summary_keeps_optimality_contract(self) -> None:
         summary = diagnostic_summary("TEST", "stage2_not_complete:partial")
 
@@ -1487,6 +2557,53 @@ class Stage3StructuralTests(unittest.TestCase):
         self.assertEqual(components["inner_puts"], 2)
         self.assertEqual(components["source_gets"], 2)
         self.assertEqual(sum(components.values()), 4)
+
+    def test_alignment_rehandle_is_shared_across_inner_lines(self) -> None:
+        req = request([
+            *[
+                car(
+                    f"S{index}",
+                    "机走北",
+                    index,
+                    [f"修{index}库内"],
+                    process="段修",
+                    forced=[1],
+                )
+                for index in range(1, 4)
+            ],
+            *[
+                car(
+                    f"F{index}",
+                    "洗油北",
+                    index,
+                    [f"修{index}库内"],
+                    process="厂修",
+                    forced=[4],
+                )
+                for index in range(1, 4)
+            ],
+        ])
+        solver = Stage3Solver("TEST", req, EMPTY_STAGE2, time_budget_seconds=5)
+        layout = self.prepare_unified_assignment(solver, "A")
+
+        components = solver.template_operation_lower_bound_components("A")
+        candidate = solver.solve_template(
+            "A",
+            layout=layout,
+            transaction_expansion_limit=10_000,
+        )
+
+        self.assertEqual(components["source_gets"], 2)
+        self.assertEqual(components["inner_puts"], 6)
+        self.assertEqual(components["shared_rehandle"], 1)
+        self.assertEqual(sum(components.values()), 9)
+        self.assertEqual(candidate.status, "complete")
+        self.assertEqual(solver.business_hook_count(candidate.ops), 10)
+        self.assertEqual(candidate.lower_bound, 9)
+        self.assertLessEqual(
+            candidate.lower_bound,
+            solver.business_hook_count(candidate.ops),
+        )
 
     def test_long_non_inner_load_requires_multiple_staging_puts(self) -> None:
         req = request([

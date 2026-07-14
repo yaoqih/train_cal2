@@ -1221,7 +1221,11 @@ class ContractPlanner:
             contract.mode in {DepotRehookMode.DIRECT, DepotRehookMode.BATCHED}
             and not paint_existing
         ):
-            self._close_paint_direct(contract.paint_tail)
+            additional_paint = self._collect_direct_target_inbound(
+                "油漆线",
+                excluded_lines=frozenset({"存4线", "卸轮线", "油漆线"}),
+            )
+            self._close_paint_direct((*contract.paint_tail, *additional_paint))
             if c4:
                 self.builder.put_target("存4线", c4, event="restore_c4_backbone")
             self._close_rehook()
@@ -1260,6 +1264,58 @@ class ContractPlanner:
     def _close_paint_direct(self, paint: tuple[str, ...]) -> None:
         self.builder.put_target("油漆线", paint, event="close_paint_tail")
         self.builder.close_contract_for_target("油漆线")
+
+    def _collect_direct_target_inbound(
+        self,
+        target: str,
+        *,
+        excluded_lines: frozenset[str],
+    ) -> tuple[str, ...]:
+        """Collect homogeneous accessible prefixes while retaining the consist."""
+
+        collected: list[str] = []
+        while True:
+            candidates: list[tuple[int, str, tuple[str, ...], SearchNode]] = []
+            for line in sorted(physical.TRACK_SPECS):
+                if line in excluded_lines:
+                    continue
+                order = tuple(physical.line_access_order(self.builder.cars, line))
+                desired_indexes = [
+                    index
+                    for index, no in enumerate(order)
+                    if no in self.problem.active_nos
+                    and self.problem.target_by_no.get(no) == target
+                ]
+                if not desired_indexes:
+                    continue
+                move = order[: max(desired_indexes) + 1]
+                if any(
+                    no not in self.problem.active_nos
+                    or self.problem.target_by_no.get(no) != target
+                    for no in move
+                ):
+                    continue
+                successor = self.builder.probe("Get", line, move)
+                if successor is None:
+                    continue
+                candidates.append((
+                    len(successor.state.operation_paths[-1]),
+                    line,
+                    move,
+                    successor,
+                ))
+            if not candidates:
+                return tuple(collected)
+            _distance, line, move, successor = min(candidates)
+            self.builder.apply(
+                "Get",
+                line,
+                move,
+                event="collect_direct_target_inbound",
+                successor=successor,
+                owner=target,
+            )
+            collected.extend(move)
 
     def _resolve_outbound_paint_window(
         self,

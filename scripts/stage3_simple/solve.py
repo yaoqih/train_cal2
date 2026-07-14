@@ -46,16 +46,15 @@ TEMPLATE_A_FIRST_ORDER = ("机走北", "机走棚", "机南")
 TEMPLATE_A_SECOND_LINE = "洗油北"
 DEFAULT_TIME_BUDGET_SECONDS = 180.0
 PLACEMENT_MAX_PLANS = 8
-PLACEMENT_NODE_BUDGET = 10_000
-TRANSACTION_EXPANSION_LEVELS = (25, 100, 5_000, 10_000)
-SHALLOW_COMPLETE_QUORUM = 2
-SCREEN_COMPLETE_QUORUM = 3
-SCREEN_PLAN_BUDGET = 6
-SCREEN_BASE_PLAN_BUDGET = 4
-STATIC_FINALIST_PLAN_BUDGET = 2
+PLACEMENT_NODE_BUDGET = 1_200
+TRANSACTION_EXPANSION_LEVELS = (25, 100, 250, 500, 1_000, 2_500, 5_000, 10_000)
+SCREEN_PLAN_BUDGET = 3
+SCREEN_BASE_PLAN_BUDGET = 3
 FINALIST_PLAN_BUDGET = 3
-ALIGNMENT_STATE_BUDGET = 256
-POST_BUDGET_FRONTIER_WIDTH = 2
+FINALIST_SCREEN_EXPANSIONS = 25
+FEASIBILITY_COMMIT_VALUE = 2
+RETAINED_TARGET_HOOK_GAP = 1
+GLOBAL_TARGET_HOOK_GAP = 3
 STAGE3_REHOOK_LOCO = PREPICKUP_OUTER_SOURCE
 BLOCKING_REPLAY_KINDS = {"schema", "physical", "business", "state"}
 
@@ -110,9 +109,31 @@ class PlacementSpec:
     template: str
     layout: str
 
-    @property
-    def shallow_group(self) -> tuple[int, tuple[int, ...]]:
-        return self.operation_lower_bound, self.placement_score
+
+Cost4 = tuple[int, int, int, int]
+Progress5 = tuple[int, int, int, int, int]
+TransactionRecord = tuple[State, Cost4, int | None, tuple[Op, ...]]
+
+
+@dataclass
+class TransactionSearch:
+    """Persistent search state for one fixed template and placement."""
+
+    start: State
+    prefix_ops: tuple[Op, ...]
+    records: list[TransactionRecord]
+    anchor: list[tuple[Any, ...]]
+    feasibility_guide: list[tuple[Any, ...]]
+    best_record: dict[State, int]
+    expanded_cost: dict[State, Cost4]
+    serial: Any
+    best_partial_record: int
+    best_budgeted_progress: Progress5
+    best_partial_key: tuple[Progress5, Cost4]
+    expansions: int = 0
+    incumbent: tuple[Cost4, int] | None = None
+    finished: bool = False
+    active_elapsed_seconds: float = 0.0
 
 
 def case_id_from_path(path: Path) -> str:
@@ -237,15 +258,28 @@ class Stage3Solver:
             tuple[State, tuple[Op, ...]] | SearchResult,
         ] = {}
         self.candidate_evaluation_cache: dict[
-            tuple[State, tuple[Op, ...]],
+            tuple[str, str, State, tuple[Op, ...]],
             dict[str, Any],
+        ] = {}
+        self.transaction_searches: dict[
+            tuple[str, str],
+            TransactionSearch,
         ] = {}
         self.assigned_line_by_no: dict[str, str] = {}
         self.placement_results: dict[str, placement.SolveResult] = {}
+        self.placement_candidates: dict[
+            str,
+            tuple[tuple[str, placement.Plan], ...],
+        ] = {}
+        self.placement_solution_cache: dict[
+            placement.Problem,
+            placement.SolveResult,
+        ] = {}
         self.optimization_attempted = 0
         self.optimization_expansions = 0
         self.optimization_budget_exhausted = False
         self.search_space_evaluation_incomplete = False
+        self.placement_operation_lower_bound: int | None = None
 
     def validate_input_contract(self, request: dict[str, Any]) -> None:
         errors: list[str] = []
@@ -428,8 +462,68 @@ class Stage3Solver:
     ) -> tuple[placement.Problem, dict[str, str]]:
         """Build the single finite terminal domain used by every Stage3 plan."""
 
+        positioned_sources = set(POSITIONED_LINES) | {UNWHEEL}
+        domain_nos = {
+            no
+            for no in self.active_nos
+            if not (
+                no in self.restoration_nos
+                and self.meta[no]["Line"] not in positioned_sources
+            )
+        }
+        fixed_assignments = {
+            no: self.meta[no]["Line"]
+            for no in self.active_nos - domain_nos
+        }
+        exposure = tuple(
+            no for no in self.template_exposure_order(template) if no in domain_nos
+        )
+        if template == "A":
+            exposure_segments = tuple(
+                segment
+                for segment in (
+                    tuple(
+                        no
+                        for no in exposure
+                        if self.meta[no]["Line"] != TEMPLATE_A_SECOND_LINE
+                    ),
+                    tuple(
+                        no
+                        for no in exposure
+                        if self.meta[no]["Line"] == TEMPLATE_A_SECOND_LINE
+                    ),
+                )
+                if segment
+            )
+        else:
+            exposure_segments = (exposure,) if exposure else ()
+
+        exposure_weight = {
+            no: len(segment) - rank - 1
+            for segment in exposure_segments
+            for rank, no in enumerate(segment)
+        }
+        max_inner_capacity = max(self.caps[line] for line in DEPOT_IN)
+        blocked_inner_lines = {
+            self.meta[no]["Line"]
+            for no in self.active_nos
+            if self.meta[no]["Line"] in set(DEPOT_IN)
+        }
+        readiness_by_line: dict[str, int] = {}
+        for line in DEPOT_IN:
+            capacity = self.caps[line]
+            fixed_positions = self.fixed_positioned_positions.get(line, {})
+            settled_depth = capacity + 1 - min(
+                fixed_positions,
+                default=capacity + 1,
+            )
+            readiness_by_line[line] = (
+                max_inner_capacity
+                - settled_depth
+                + (max_inner_capacity + 1) * int(line in blocked_inner_lines)
+            )
+
         domains: list[placement.CarDomain] = []
-        fixed_assignments: dict[str, str] = {}
         positioned_fixed = tuple(
             (line, position)
             for line, by_position in self.fixed_positioned_positions.items()
@@ -471,24 +565,33 @@ class Stage3Solver:
                 and paired_inner in active_inner_gate_demand
             )
 
-        for no in sorted(self.active_nos):
+        for no in sorted(domain_nos):
             car = self.meta[no]
             atoms: list[placement.Atom] = []
             restoration_line: str | None = None
             restoration_position: int | None = None
             if no in self.restoration_nos:
                 line = car["Line"]
-                if line not in set(POSITIONED_LINES) | {UNWHEEL}:
-                    fixed_assignments[no] = line
-                    continue
                 restoration_line = line
                 position = int(car.get("Position") or 0)
-                restoration_position = position if line in set(POSITIONED_LINES) and position > 0 else None
+                # Inner bays and explicit ForceTargetPosition are physical
+                # slots.  An unforced outer Position is only a compact ordinal:
+                # inserting cars ahead of it may shift that ordinal without
+                # moving the restoration car off its original line.
+                position_is_fixed = (
+                    line in set(DEPOT_IN)
+                    or bool(car.get("_ForcePositions"))
+                )
+                restoration_position = (
+                    position
+                    if position_is_fixed and position > 0
+                    else None
+                )
                 atoms.append(placement.Atom(
                     "inner" if line in set(DEPOT_IN) else "outer",
                     line,
                     restoration_position,
-                    (0, 0),
+                    (0, 0, 0),
                 ))
             elif self.is_stage4_deferred(no):
                 initial_line = car["Line"]
@@ -508,7 +611,7 @@ class Stage3Solver:
                         "outer",
                         line,
                         None,
-                        (staging_gate_conflict(line), staging_cost(line)),
+                        (staging_gate_conflict(line), 0, staging_cost(line)),
                     )
                     for line in STAGE4_STAGING_LINES
                 )
@@ -527,6 +630,8 @@ class Stage3Solver:
                                 position,
                                 (
                                     0,
+                                    readiness_by_line[line]
+                                    * exposure_weight.get(no, 0),
                                     self.slot_preference_cost(
                                         no,
                                         (line, position),
@@ -541,7 +646,7 @@ class Stage3Solver:
                             "outer",
                             line,
                             position,
-                            (0, self.line_number(line)),
+                            (0, 0, self.line_number(line)),
                         )
                         for position in positions
                     )
@@ -556,16 +661,6 @@ class Stage3Solver:
                 restoration_position=restoration_position,
             ))
 
-        domain_nos = {domain.no for domain in domains}
-        exposure = tuple(
-            no for no in self.template_exposure_order(template) if no in domain_nos
-        )
-        if template == "A":
-            first = tuple(no for no in exposure if self.meta[no]["Line"] != TEMPLATE_A_SECOND_LINE)
-            second = tuple(no for no in exposure if self.meta[no]["Line"] == TEMPLATE_A_SECOND_LINE)
-            exposure_segments = tuple(segment for segment in (first, second) if segment)
-        else:
-            exposure_segments = (exposure,) if exposure else ()
         problem = placement.Problem(
             cars=tuple(domains),
             inner_capacities=tuple((line, self.caps[line]) for line in DEPOT_IN),
@@ -587,14 +682,19 @@ class Stage3Solver:
 
     def unified_placements(self, template: str) -> placement.SolveResult:
         problem, fixed_assignments = self.build_placement_problem(template)
-        solved = placement.solve(
-            problem,
-            max_plans=PLACEMENT_MAX_PLANS,
-            node_budget=PLACEMENT_NODE_BUDGET,
-        )
+        solved = self.placement_solution_cache.get(problem)
+        if solved is None:
+            solved = placement.solve(
+                problem,
+                max_plans=PLACEMENT_MAX_PLANS,
+                node_budget=PLACEMENT_NODE_BUDGET,
+            )
+            self.placement_solution_cache[problem] = solved
         self.placement_results[template] = solved
+        candidates: list[tuple[str, placement.Plan]] = []
         for index, plan in enumerate(solved.plans):
             layout = f"unified:{template}:{index:02d}"
+            candidates.append((layout, plan))
             line_by_no = dict(fixed_assignments)
             slot_by_no: dict[str, tuple[str, int]] = {}
             for no, atom in plan.assignments:
@@ -602,6 +702,7 @@ class Stage3Solver:
                 if atom.position is not None:
                     slot_by_no[no] = (atom.line, atom.position)
             self.assignment_cache[(template, layout)] = (line_by_no, slot_by_no, ())
+        self.placement_candidates[template] = tuple(candidates)
         return solved
 
     def build_assigned_line_by_no(self, template: str, layout: str) -> dict[str, str]:
@@ -636,6 +737,33 @@ class Stage3Solver:
         car = self.meta.get(no, {})
         targets = set(car.get("TargetLines") or [])
         return bool(targets & STAGE4_DEFER_TARGETS) and not (targets & set(DEPOT_TARGETS))
+
+    def has_flexible_outer_terminal(self, no: str) -> bool:
+        """Return whether any allowed outer target is an equivalent terminal."""
+
+        return (
+            no not in self.restoration_nos
+            and self.assigned_slot_by_no.get(no) is None
+            and not tuple(self.meta[no].get("_ForcePositions") or ())
+            and not self.inner_target_lines(no)
+            and len(self.outer_target_lines(no)) > 1
+        )
+
+    def assignment_line_satisfied(self, no: str, line: str) -> bool:
+        """Return whether ``line`` satisfies the placement equivalence class."""
+
+        assigned = self.assigned_line_by_no.get(no, "")
+        if not assigned:
+            return False
+        if line == assigned:
+            return True
+        if no not in getattr(self, "meta", {}):
+            return False
+        if self.is_stage4_deferred(no):
+            return line in set(STAGE4_STAGING_LINES)
+        if self.has_flexible_outer_terminal(no):
+            return line in self.outer_target_lines(no)
+        return False
 
     def deferred_stage4_target(self, no: str) -> str:
         targets = set(self.meta[no].get("TargetLines") or []) & STAGE4_DEFER_TARGETS
@@ -680,6 +808,7 @@ class Stage3Solver:
             return self.result(failed, [failed])
 
         if not self.active_nos:
+            self.placement_operation_lower_bound = 0
             empty = SearchResult(
                 status="complete",
                 template="none",
@@ -696,8 +825,20 @@ class Stage3Solver:
 
         placement_specs: list[PlacementSpec] = []
         placement_reasons: list[str] = []
-        for template in ("B", "A"):
+        placement_operation_bounds: list[int] = []
+        pickup_get_lower_bound = len(self.initial_source_pickup_map())
+        templates = (
+            ("B", "A")
+            if self.initial_source_pickup_map().get(TEMPLATE_A_SECOND_LINE)
+            else ("B",)
+        )
+        for template in templates:
             solved = self.unified_placements(template)
+            if solved.lower_bound is not None:
+                placement_operation_bounds.append(
+                    pickup_get_lower_bound
+                    + solved.lower_bound[0]
+                )
             if not solved.complete or solved.frontier_truncated:
                 self.search_space_evaluation_incomplete = True
             if not solved.plans:
@@ -721,8 +862,7 @@ class Stage3Solver:
                 else:
                     placement_reasons.append(f"{solved.reason}:{template}")
                 continue
-            for index, plan in enumerate(solved.plans):
-                layout = f"unified:{template}:{index:02d}"
+            for layout, plan in self.placement_candidates[template]:
                 self.assigned_line_by_no = self.build_assigned_line_by_no(
                     template,
                     layout,
@@ -733,7 +873,7 @@ class Stage3Solver:
                 placement_specs.append(PlacementSpec(
                     operation_lower_bound=lower_bound,
                     placement_score=plan.score,
-                    signature=plan.signature,
+                    signature=plan.execution_signature,
                     template=template,
                     layout=layout,
                 ))
@@ -746,7 +886,6 @@ class Stage3Solver:
                 item.layout,
             )
         )
-
         if not placement_specs:
             failed = SearchResult(
                 status="partial",
@@ -764,20 +903,49 @@ class Stage3Solver:
             )
             return self.result(failed, [failed])
 
+        self.placement_operation_lower_bound = min(
+            placement_operation_bounds,
+            default=None,
+        )
+        retained_operation_lower_bound = min(
+            spec.operation_lower_bound for spec in placement_specs
+        )
         results_by_spec: dict[tuple[str, str], SearchResult] = {}
         self.deadline = self.global_deadline
+        bounded_target_reached = False
+
+        def fully_evaluated(spec: PlacementSpec) -> bool:
+            result = results_by_spec.get((spec.template, spec.layout))
+            return bool(
+                result is not None
+                and result.search_spec_evaluated
+            )
+
+        def global_candidate_can_improve(incumbent_hooks: int) -> bool:
+            return any(
+                not fully_evaluated(spec)
+                and self.finalist_lower_bound_can_improve(
+                    spec,
+                    incumbent_hooks,
+                )
+                for spec in placement_specs
+            )
+
         for level_index, expansion_limit in enumerate(TRANSACTION_EXPANSION_LEVELS):
-            completed_group: tuple[int, tuple[int, ...]] | None = None
-            incumbent_cost = min(
+            incumbent_hooks = min(
                 (
-                    item.cost
+                    self.business_hook_count(item.ops)
                     for item in results_by_spec.values()
                     if item.status == "complete"
                 ),
                 default=None,
             )
-            strict_improvement = False
             level_specs = placement_specs
+            if level_index == 0:
+                level_specs = self.template_covered_prefix(
+                    placement_specs,
+                    SCREEN_BASE_PLAN_BUDGET,
+                )
             if level_index > 0:
                 seen_signatures: set[tuple[tuple[str, str, str, int], ...]] = set()
                 diverse: list[PlacementSpec] = []
@@ -797,72 +965,76 @@ class Stage3Solver:
                     placement_specs,
                     results_by_spec,
                 )
-            for spec_index, spec in enumerate(level_specs):
-                if (
-                    level_index == 0
-                    and completed_group is not None
-                    and spec.shallow_group != completed_group
-                ):
-                    break
+            for spec in level_specs:
                 if self.deadline_reached():
                     self.search_space_evaluation_incomplete = True
                     break
                 prior = results_by_spec.get((spec.template, spec.layout))
-                if prior is not None and prior.status == "complete":
+                if (
+                    prior is not None
+                    and prior.status == "complete"
+                    and prior.search_spec_evaluated
+                ):
                     continue
+                candidate_expansion_limit = (
+                    self.finalist_expansion_target(prior, expansion_limit)
+                    if level_index >= 2
+                    else expansion_limit
+                )
                 candidate = self.solve_template(
                     spec.template,
                     layout=spec.layout,
-                    transaction_expansion_limit=expansion_limit,
+                    transaction_expansion_limit=candidate_expansion_limit,
                 )
                 validated = self.validate_candidate(candidate)
                 results_by_spec[(spec.template, spec.layout)] = (
                     validated
                     if prior is None
-                    else self.choose_result([prior, validated])
+                    else self.merge_search_result(prior, validated)
                 )
                 if validated.status == "complete":
-                    if incumbent_cost is not None and validated.cost < incumbent_cost:
-                        strict_improvement = True
-                    if incumbent_cost is None or validated.cost < incumbent_cost:
-                        incumbent_cost = validated.cost
-                if (
-                    level_index == 0
-                    and validated.status == "complete"
-                    and completed_group is None
-                ):
-                    # Complete the whole lower-bound/proxy tie group before deciding
-                    # whether the shallow search has enough independent plans.
-                    completed_group = spec.shallow_group
+                    candidate_hooks = self.business_hook_count(validated.ops)
+                    if incumbent_hooks is None or candidate_hooks < incumbent_hooks:
+                        incumbent_hooks = candidate_hooks
+                    # The retained-layout bound is the tight portfolio target;
+                    # the placement-wide bound keeps the same stop honest even
+                    # when top-k placement enumeration was truncated.
+                    bounded_target_reached = (
+                        level_index >= 1
+                        and self.placement_operation_lower_bound is not None
+                        and incumbent_hooks
+                        <= (
+                            self.placement_operation_lower_bound
+                            + GLOBAL_TARGET_HOOK_GAP
+                        )
+                        and incumbent_hooks
+                        <= (
+                            retained_operation_lower_bound
+                            + RETAINED_TARGET_HOOK_GAP
+                        )
+                    )
                 complete_count = sum(
                     item.status == "complete"
                     for item in results_by_spec.values()
                 )
-                static_pair_evaluated = (
-                    level_index >= 2
-                    and spec_index + 1 >= min(
-                        STATIC_FINALIST_PLAN_BUDGET,
-                        len(level_specs),
-                    )
+                certified_stop = (
+                    level_index >= 1
+                    and complete_count > 0
+                    and incumbent_hooks is not None
+                    and not global_candidate_can_improve(incumbent_hooks)
                 )
-                deep_complete_after_static_pair = (
-                    static_pair_evaluated and complete_count > 0
-                )
-                if level_index > 0 and (
-                    deep_complete_after_static_pair
-                    or strict_improvement
-                    or complete_count >= SCREEN_COMPLETE_QUORUM
-                ):
+                if bounded_target_reached or certified_stop:
                     break
-            if self.deadline_reached():
+            if bounded_target_reached or self.deadline_reached():
                 break
             complete_count = sum(
                 item.status == "complete" for item in results_by_spec.values()
             )
-            if level_index == 0 and complete_count >= SHALLOW_COMPLETE_QUORUM:
-                break
             if level_index > 0 and complete_count:
-                break
+                if incumbent_hooks is None:
+                    raise RuntimeError("complete_result_missing_business_hook_count")
+                if not global_candidate_can_improve(incumbent_hooks):
+                    break
         results = [
             results_by_spec[(spec.template, spec.layout)]
             for spec in placement_specs
@@ -1076,6 +1248,7 @@ class Stage3Solver:
             tuple(pickup_ops),
             started,
             expansion_limit=transaction_expansion_limit,
+            search_key=(template, layout),
         ))
 
     def stable_closure(
@@ -1097,9 +1270,8 @@ class Stage3Solver:
             for no in self.active_nos - closure:
                 if no in set(state.held):
                     continue
-                assigned = self.assigned_line_by_no.get(no, "")
                 line = line_by_no.get(no, "")
-                if not assigned or line != assigned:
+                if not self.assignment_line_satisfied(no, line):
                     continue
                 slot = self.assigned_slot_by_no.get(no)
                 if slot is not None and position_by_no.get(no) != slot[1]:
@@ -1254,37 +1426,177 @@ class Stage3Solver:
         state: State,
         committed: frozenset[str],
     ) -> tuple[transactions.Transaction[State, Op, str], ...]:
-        """Return one-Put transactions that immediately enlarge stable closure."""
+        """Commit any legal held suffix in one Put."""
 
-        if not state.held:
+        if not isinstance(state, State) or not state.held:
             return ()
         before = self.stable_closure(state, committed)
         before_projection = self.committed_projection(state, before)
-        out: list[transactions.Transaction[State, Op, str]] = []
-        emitted: set[tuple[State, frozenset[str]]] = set()
+        results: dict[
+            tuple[State, frozenset[str]],
+            transactions.Transaction[State, Op, str],
+        ] = {}
         for line, move in self.put_suffixes(state):
             op, end_state, reject = self.apply_put(state, line, move)
             if reject:
                 continue
             after = self.stable_closure(end_state, before)
-            key = (end_state, after)
-            if (
-                not before < after
-                or key in emitted
-                or self.committed_projection(end_state, before) != before_projection
-            ):
+            if not before < after:
                 continue
-            emitted.add(key)
+            if self.committed_projection(end_state, before) != before_projection:
+                continue
             action = replace(op, note=f"transaction_direct_put:{line}")
-            out.append(transactions.Transaction(
+            candidate = transactions.Transaction(
                 start_state=state,
                 end_state=end_state,
                 actions=(action,),
                 committed_before=before,
                 committed_after=after,
                 cost=self.delta(action),
-            ))
-        return tuple(out)
+            )
+            key = (end_state, after)
+            incumbent = results.get(key)
+            if incumbent is None or candidate.cost < incumbent.cost:
+                results[key] = candidate
+        return tuple(results.values())
+
+    def direct_transfer_transactions(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[transactions.Transaction[State, Op, str], ...]:
+        """Move one exposed homogeneous prefix directly to its terminal line."""
+
+        if state.held:
+            return ()
+        before = self.stable_closure(state, committed)
+        before_projection = self.committed_projection(state, before)
+        results: dict[
+            tuple[State, frozenset[str]],
+            transactions.Transaction[State, Op, str],
+        ] = {}
+        for source in (*DEPOT_OUT, UNWHEEL, *DEPOT_IN):
+            ordered = tuple(self.line_map(state).get(source, ()))
+            if not ordered:
+                continue
+            for cut in range(len(ordered), 0, -1):
+                move = ordered[:cut]
+                if set(move).intersection(before):
+                    continue
+                target = self.common_assigned_target(move)
+                if not target or target == source:
+                    continue
+                get_op, working, reject = self.apply_get(state, source, move)
+                if reject:
+                    continue
+                put_op, end_state, reject = self.apply_put(working, target, move)
+                if reject:
+                    continue
+                if self.committed_projection(working, before) != before_projection:
+                    continue
+                if self.committed_projection(end_state, before) != before_projection:
+                    continue
+                after = self.stable_closure(end_state, before)
+                if not before < after:
+                    continue
+                actions = (
+                    replace(
+                        get_op,
+                        note=f"transaction_direct_transfer_get:{source}",
+                    ),
+                    replace(
+                        put_op,
+                        note=f"transaction_direct_transfer_put:{target}",
+                    ),
+                )
+                candidate = transactions.Transaction(
+                    start_state=state,
+                    end_state=end_state,
+                    actions=actions,
+                    committed_before=before,
+                    committed_after=after,
+                    cost=self.ops_cost(actions),
+                )
+                key = (end_state, after)
+                incumbent = results.get(key)
+                if incumbent is None or candidate.cost < incumbent.cost:
+                    results[key] = candidate
+        return tuple(results.values())
+
+    def pickup_merge_transactions(
+        self,
+        state: State,
+        committed: frozenset[str],
+        legal_transitions: tuple[transactions.LegalTransition[State, Op], ...],
+    ) -> tuple[transactions.Transaction[State, Op, str], ...]:
+        """Collect an exposed matching block before one shared terminal Put.
+
+        Humans routinely avoid a later Get/Put pair by collecting an exposed
+        depot car while a suffix with the same target is still on the consist.
+        This shortcut compresses exactly those two already-legal primitive
+        edges; it neither removes the direct Put nor adds new reachability.
+        """
+
+        if not isinstance(state, State) or not state.held:
+            return ()
+        before = self.stable_closure(state, committed)
+        before_projection = self.committed_projection(state, before)
+        results: dict[
+            tuple[State, frozenset[str]],
+            transactions.Transaction[State, Op, str],
+        ] = {}
+        for transition in legal_transitions:
+            get_op = transition.action
+            if get_op.action != "Get" or not get_op.move:
+                continue
+            working = transition.state
+            if self.committed_projection(working, before) != before_projection:
+                continue
+            for start in range(len(state.held)):
+                held_suffix = state.held[start:]
+                combined = (*held_suffix, *get_op.move)
+                for target in (*DEPOT_IN, *STAGE4_STAGING_LINES):
+                    if target == get_op.line or not all(
+                        self.assignment_line_satisfied(no, target)
+                        for no in combined
+                    ):
+                        continue
+                    put_op, end_state, reject = self.apply_put(
+                        working,
+                        target,
+                        combined,
+                    )
+                    if reject:
+                        continue
+                    if (
+                        self.committed_projection(end_state, before)
+                        != before_projection
+                    ):
+                        continue
+                    after = self.stable_closure(end_state, before)
+                    actions = (
+                        replace(
+                            get_op,
+                            note=f"transaction_pickup_merge_get:{get_op.line}",
+                        ),
+                        replace(
+                            put_op,
+                            note=f"transaction_pickup_merge_put:{target}",
+                        ),
+                    )
+                    candidate = transactions.Transaction(
+                        start_state=state,
+                        end_state=end_state,
+                        actions=actions,
+                        committed_before=before,
+                        committed_after=after,
+                        cost=self.ops_cost(actions),
+                    )
+                    key = (end_state, after)
+                    incumbent = results.get(key)
+                    if incumbent is None or candidate.cost < incumbent.cost:
+                        results[key] = candidate
+        return tuple(results.values())
 
     def gate_chain_transactions(
         self,
@@ -1365,150 +1677,210 @@ class Stage3Solver:
             ))
         return tuple(results)
 
-    def alignment_transactions(
+    def mixed_gate_cycle_transactions(
         self,
         state: State,
         committed: frozenset[str],
     ) -> tuple[transactions.Transaction[State, Op, str], ...]:
-        """Enumerate staging sequences that expose and commit a deepest slot."""
+        """Break mixed depot-gate cycles and commit one ready inner block."""
 
-        if not state.held:
-            return ()
         before = self.stable_closure(state, committed)
         before_projection = self.committed_projection(state, before)
-        position_by_no = {
-            no: position
-            for no, (_line, position) in self.assigned_slot_by_no.items()
-        }
-        results: list[transactions.Transaction[State, Op, str]] = []
-        for inner in DEPOT_IN:
-            pending = [
-                no
-                for no, slot in self.assigned_slot_by_no.items()
-                if slot[0] == inner
-                and no not in before
-                and no in set(state.held)
-            ]
-            if not pending:
-                continue
-            deepest = max(pending, key=lambda no: (position_by_no[no], no))
-            index = state.held.index(deepest)
-            if index == len(state.held) - 1:
-                continue
-            serial = itertools.count()
-            staging_frontier: list[
-                tuple[
-                    int,
-                    tuple[int, int, int, int],
-                    int,
-                    State,
-                    tuple[Op, ...],
-                ]
-            ] = [(len(state.held), (0, 0, 0, 0), next(serial), state, ())]
-            best_staging_cost = {state: (0, 0, 0, 0)}
-            expanded = 0
-            while staging_frontier and expanded < ALIGNMENT_STATE_BUDGET:
-                if self.deadline_reached():
-                    self.search_space_evaluation_incomplete = True
-                    break
-                _held_count, staged_cost, _serial, working, staged_ops = heapq.heappop(
-                    staging_frontier
-                )
-                if best_staging_cost.get(working) != staged_cost:
-                    continue
-                expanded += 1
-                if not working.held or deepest not in set(working.held):
-                    continue
-                deepest_index = working.held.index(deepest)
-                if deepest_index == len(working.held) - 1:
-                    for chain in self.gate_chain_transactions(working, before):
-                        if deepest not in chain.newly_committed:
-                            continue
-                        macro_ops = (*staged_ops, *chain.actions)
-                        after = self.stable_closure(chain.end_state, before)
-                        if not before < after:
-                            continue
-                        if (
-                            self.committed_projection(chain.end_state, before)
-                            != before_projection
-                        ):
-                            continue
-                        results.append(transactions.Transaction(
-                            start_state=state,
-                            end_state=chain.end_state,
-                            actions=macro_ops,
-                            committed_before=before,
-                            committed_after=after,
-                            cost=self.ops_cost(macro_ops),
-                        ))
-                    continue
 
-                run_target = self.assigned_line_by_no.get(working.held[-1], "")
-                run_start = len(working.held) - 1
-                while (
-                    run_start > deepest_index + 1
-                    and self.assigned_line_by_no.get(working.held[run_start - 1], "")
-                    == run_target
-                ):
-                    run_start -= 1
-                for chunk_start in range(run_start, len(working.held)):
-                    move = working.held[chunk_start:]
-                    pending_inners = self.pending_inner_targets(
-                        working,
-                        exclude=set(move),
-                    )
-                    candidate_lines = sorted(
-                        STAGE4_STAGING_LINES,
-                        key=lambda line: (
-                            line != UNWHEEL and DEPOT_IN_BY_OUT[line] in pending_inners,
-                            line != run_target,
-                            line != UNWHEEL,
-                            self.line_number(line),
-                        ),
-                    )
-                    for line in candidate_lines:
-                        if not self.put_candidate_allowed(working, line, move):
-                            continue
-                        op, next_state, reject = self.apply_put(working, line, move)
-                        if reject:
-                            continue
-                        if (
-                            self.committed_projection(next_state, before)
-                            != before_projection
-                        ):
-                            continue
-                        next_ops = (*staged_ops, replace(
-                            op,
-                            note=f"transaction_align_stage:{inner}",
-                        ))
-                        next_cost = self.ops_cost(next_ops)
-                        incumbent = best_staging_cost.get(next_state)
-                        if incumbent is not None and incumbent <= next_cost:
-                            continue
-                        best_staging_cost[next_state] = next_cost
-                        heapq.heappush(
-                            staging_frontier,
-                            (
-                                len(next_state.held),
-                                next_cost,
-                                next(serial),
-                                next_state,
-                                next_ops,
-                            ),
-                        )
-            if staging_frontier:
-                self.search_space_evaluation_incomplete = True
+        def projection_preserved(working: State) -> bool:
+            return self.committed_projection(working, before) == before_projection
 
-        best_results: dict[
+        def staged_suffixes(
+            working: State,
+            note: str,
+            *,
+            blocked_line: str,
+        ) -> tuple[tuple[State, tuple[Op, ...]], ...]:
+            variants: dict[State, tuple[Op, ...]] = {}
+            for start in range(len(working.held)):
+                move = working.held[start:]
+                for line in STAGE4_STAGING_LINES:
+                    if (
+                        line == blocked_line
+                        or not self.put_candidate_allowed(working, line, move)
+                    ):
+                        continue
+                    op, next_state, reject = self.apply_put(working, line, move)
+                    if reject or not projection_preserved(next_state):
+                        continue
+                    actions = (replace(op, note=f"{note}:{line}"),)
+                    incumbent = variants.get(next_state)
+                    if incumbent is None or self.ops_cost(actions) < self.ops_cost(incumbent):
+                        variants[next_state] = actions
+            return tuple(variants.items())
+
+        def get_with_required_staging(
+            working: State,
+            line: str,
+            move: tuple[str, ...],
+            note: str,
+            *,
+            blocked_line: str,
+        ) -> tuple[tuple[State, tuple[Op, ...]], ...]:
+            op, next_state, reject = self.apply_get(working, line, move)
+            if not reject and projection_preserved(next_state):
+                return ((next_state, (replace(op, note=note),)),)
+            variants: dict[State, tuple[Op, ...]] = {}
+            for staged_state, staged_ops in staged_suffixes(
+                working,
+                f"{note}_stage",
+                blocked_line=blocked_line,
+            ):
+                op, next_state, reject = self.apply_get(staged_state, line, move)
+                if reject or not projection_preserved(next_state):
+                    continue
+                actions = (*staged_ops, replace(op, note=note))
+                incumbent = variants.get(next_state)
+                if incumbent is None or self.ops_cost(actions) < self.ops_cost(incumbent):
+                    variants[next_state] = actions
+            return tuple(variants.items())
+
+        def ready_suffixes(working: State, target: str) -> tuple[tuple[str, ...], ...]:
+            return tuple(
+                move
+                for start in range(len(working.held))
+                for move in (working.held[start:],)
+                if self.common_assigned_target(move) == target
+                and self.depot_move_is_ready(working, target, move)
+            )
+
+        def could_expose_target(
+            working: State,
+            move: tuple[str, ...],
+            target: str,
+        ) -> bool:
+            held_after = (*working.held, *move)
+            return any(
+                self.common_assigned_target(held_after[start:]) == target
+                for start in range(len(held_after))
+            )
+
+        def retain_variant(
+            variants: dict[State, tuple[Op, ...]],
+            working: State,
+            actions: tuple[Op, ...],
+        ) -> None:
+            incumbent = variants.get(working)
+            if incumbent is None or self.ops_cost(actions) < self.ops_cost(incumbent):
+                variants[working] = actions
+
+        results: dict[
             tuple[State, frozenset[str]],
             transactions.Transaction[State, Op, str],
         ] = {}
-        for candidate in results:
-            key = (candidate.end_state, candidate.committed_after)
-            incumbent = best_results.get(key)
-            if incumbent is None or candidate.cost < incumbent.cost:
-                best_results[key] = candidate
-        return tuple(best_results.values())
+        for target in DEPOT_IN:
+            if not any(
+                self.assigned_line_by_no.get(no) == target and no not in before
+                for no in self.active_nos
+            ):
+                continue
+            outer = DEPOT_OUT_BY_IN[target]
+            gate = tuple(self.line_map(state).get(outer, ()))
+            gate_variants = (
+                get_with_required_staging(
+                    state,
+                    outer,
+                    gate,
+                    f"transaction_mixed_gate_clear:{target}",
+                    blocked_line=outer,
+                )
+                if gate
+                else ((state, ()),)
+            )
+
+            inner_variants: dict[State, tuple[Op, ...]] = {}
+            for gate_state, gate_ops in gate_variants:
+                inner = tuple(self.line_map(gate_state).get(target, ()))
+                retain_variant(inner_variants, gate_state, gate_ops)
+                for cut in range(1, len(inner) + 1):
+                    move = inner[:cut]
+                    for inner_state, inner_ops in get_with_required_staging(
+                        gate_state,
+                        target,
+                        move,
+                        f"transaction_mixed_inner_clear:{target}",
+                        blocked_line=outer,
+                    ):
+                        retain_variant(
+                            inner_variants,
+                            inner_state,
+                            (*gate_ops, *inner_ops),
+                        )
+
+            for inner_state, prefix_ops in inner_variants.items():
+                source_variants: dict[State, tuple[Op, ...]] = {
+                    inner_state: prefix_ops
+                }
+                if not ready_suffixes(inner_state, target):
+                    for staged_state, staged_ops in staged_suffixes(
+                            inner_state,
+                            f"transaction_mixed_ready_stage:{target}",
+                            blocked_line=outer,
+                    ):
+                        if ready_suffixes(staged_state, target):
+                            retain_variant(
+                                source_variants,
+                                staged_state,
+                                (*prefix_ops, *staged_ops),
+                            )
+                    for source in DEPOT_OUT:
+                        ordered = tuple(self.line_map(inner_state).get(source, ()))
+                        for cut in range(1, len(ordered) + 1):
+                            move = ordered[:cut]
+                            if not could_expose_target(inner_state, move, target):
+                                continue
+                            for source_state, source_ops in get_with_required_staging(
+                                inner_state,
+                                source,
+                                move,
+                                f"transaction_mixed_gate_collect:{target}",
+                                blocked_line=outer,
+                            ):
+                                if not ready_suffixes(source_state, target):
+                                    continue
+                                retain_variant(
+                                    source_variants,
+                                    source_state,
+                                    (*prefix_ops, *source_ops),
+                                )
+
+                for source_state, source_ops in source_variants.items():
+                    for move in ready_suffixes(source_state, target):
+                        put_ready, end_state, reject = self.apply_put(
+                            source_state,
+                            target,
+                            move,
+                        )
+                        if reject or not projection_preserved(end_state):
+                            continue
+                        after = self.stable_closure(end_state, before)
+                        if not before < after:
+                            continue
+                        actions = (
+                            *source_ops,
+                            replace(
+                                put_ready,
+                                note=f"transaction_mixed_gate_commit:{target}",
+                            ),
+                        )
+                        candidate = transactions.Transaction(
+                            start_state=state,
+                            end_state=end_state,
+                            actions=actions,
+                            committed_before=before,
+                            committed_after=after,
+                            cost=self.ops_cost(actions),
+                        )
+                        key = (end_state, after)
+                        incumbent = results.get(key)
+                        if incumbent is None or candidate.cost < incumbent.cost:
+                            results[key] = candidate
+        return tuple(results.values())
 
     def transaction_progress_key(
         self,
@@ -1532,9 +1904,13 @@ class Stage3Solver:
             self.assigned_line_by_no.get(no) in set(DEPOT_IN)
             for no in pending
         )
+        held_count = len(state.held)
         misplaced_staged_cars = sum(
             line_by_no.get(no) in set(STAGE4_STAGING_LINES)
-            and line_by_no.get(no) != self.assigned_line_by_no.get(no)
+            and not self.assignment_line_satisfied(
+                no,
+                line_by_no.get(no, ""),
+            )
             for no in pending
         )
         return (
@@ -1542,7 +1918,163 @@ class Stage3Solver:
             trapped_inner_sources,
             pending_inner_slots,
             misplaced_staged_cars,
-            len(state.held),
+            held_count,
+        )
+
+    def staging_affinity_debt(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> int:
+        """Prefer staging lines that can absorb the next matching inner batch."""
+
+        if not isinstance(state, State):
+            return 0
+        line_by_no = {
+            no: line
+            for line, nos in self.line_map(state).items()
+            for no in nos
+        }
+        pending = self.active_nos - committed
+        held_count = len(state.held)
+        inner_exposure_rank: dict[str, int] = {}
+        for rank, no in enumerate(reversed(state.held)):
+            target = self.assigned_line_by_no.get(no, "")
+            if no in pending and target in set(DEPOT_IN):
+                inner_exposure_rank.setdefault(target, rank)
+        occupied_outer_lines = {
+            line_by_no[no]
+            for no in pending
+            if line_by_no.get(no) in set(DEPOT_OUT)
+        }
+        return sum(
+            inner_exposure_rank.get(DEPOT_IN_BY_OUT[line], held_count + 1)
+            for line in occupied_outer_lines
+        )
+
+    def alignment_debt(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> int:
+        """Count held blockers above each deepest pending inner-slot car.
+
+        The value is a pure state potential.  A legal primitive Put that lowers
+        it is useful to the feasibility guide, so multi-step platform alignment
+        no longer needs a nested shortcut search.
+        """
+
+        if not isinstance(state, State) or not state.held:
+            return 0
+        held_index = {no: index for index, no in enumerate(state.held)}
+        debt = 0
+        for inner in DEPOT_IN:
+            pending = [
+                (position, no)
+                for no, (line, position) in self.assigned_slot_by_no.items()
+                if line == inner
+                and no not in committed
+                and no in held_index
+            ]
+            if not pending:
+                continue
+            _position, anchor = max(pending)
+            debt += len(state.held) - held_index[anchor] - 1
+        return debt
+
+    def transaction_hook_lower_bound(
+        self,
+        state: State,
+        committed: frozenset[str],
+    ) -> int:
+        """Admissible remaining-hook bound for one fixed placement.
+
+        A held consist can only be discharged by suffixes.  After flexible
+        Stage4 cars are removed from the word, every run of fixed terminal
+        targets therefore needs a distinct Put.  A pending car outside the
+        consist additionally needs one Get from its current source line when
+        its terminal contract is not already satisfied, and one future Put
+        for each fixed target not already represented in the held word.
+
+        The relaxation ignores capacity, routing, depot-door order and slot
+        exposure, so it can only underestimate the remaining business hooks.
+        """
+
+        pending = self.active_nos - committed
+        held = tuple(no for no in state.held if no in pending)
+        held_set = set(held)
+
+        def fixed_target(no: str) -> str:
+            # Deferred Stage4 cars may finish on any staging line.  Omitting
+            # them from the target word is weaker but keeps the bound
+            # admissible when they can merge with a neighbouring Put.
+            if (
+                self.is_stage4_deferred(no)
+                or self.has_flexible_outer_terminal(no)
+            ):
+                return ""
+            return self.assigned_line_by_no.get(no, "")
+
+        held_targets = tuple(
+            target
+            for no in held
+            if (target := fixed_target(no))
+        )
+        held_runs = sum(1 for _target, _group in itertools.groupby(held_targets))
+        held_target_set = set(held_targets)
+
+        line_map = self.line_map(state)
+        line_by_no = {
+            no: line
+            for line, nos in line_map.items()
+            for no in nos
+        }
+        source_lines: set[str] = set()
+        future_targets: set[str] = set()
+
+        for no in pending - held_set:
+            line = line_by_no.get(no, "")
+            target = fixed_target(no)
+            needs_get = False
+            if no in self.restoration_position_nos:
+                initial_line = self.meta[no]["Line"]
+                # A Put before an untouched restoration car can restore its
+                # ordinal position without retrieving it.  Only a line
+                # mismatch proves that another Get is unavoidable.
+                needs_get = line != initial_line
+            elif self.is_stage4_deferred(no):
+                needs_get = line not in set(STAGE4_STAGING_LINES)
+            else:
+                # A later Put can shift an existing positioned car on the same
+                # line, so slot mismatch alone is not a safe Get lower bound.
+                needs_get = not target or line != target
+
+            if not needs_get:
+                continue
+            if line:
+                source_lines.add(line)
+            if target:
+                future_targets.add(target)
+
+        return (
+            held_runs
+            + len(future_targets - held_target_set)
+            + len(source_lines)
+        )
+
+    def transaction_estimated_cost(
+        self,
+        path_cost: tuple[int, int, int, int],
+        state: State,
+        committed: frozenset[str],
+    ) -> tuple[int, int, int, int]:
+        """Return the lexicographic A* lower bound ``g + h``."""
+
+        return (
+            path_cost[0] + self.transaction_hook_lower_bound(state, committed),
+            path_cost[1],
+            path_cost[2],
+            path_cost[3],
         )
 
     def plan_transactions(
@@ -1553,223 +2085,390 @@ class Stage3Solver:
         started: float,
         *,
         expansion_limit: int,
+        search_key: tuple[str, str] | None = None,
     ) -> SearchResult:
-        initial_committed = self.stable_closure(start, frozenset())
-        initial_cost = self.ops_cost(prefix_ops)
-        initial_progress = self.transaction_progress_key(start, initial_committed)
+        """Search one fixed operation graph with lexicographic A*.
 
-        serial = itertools.count()
-        frontier: list[
-            tuple[
-                int,
-                int,
-                int,
-                int,
-                int,
-                tuple[int, int, int, int],
-                int,
-                State,
-                frozenset[str],
-                tuple[Op, ...],
-            ]
-        ] = [
-            (
-                *initial_progress,
-                initial_cost,
-                next(serial),
+        Primitive legal operations and deterministic structural macros are
+        ordinary edges in the same graph.  The stable closure is used only as
+        an admissible heuristic/progress projection; it never removes physical
+        states or locks a car.  Consequently the expansion budget truncates a
+        fixed graph instead of switching to a smaller post-budget action set.
+        """
+
+        call_started = time.monotonic()
+        search = (
+            self.transaction_searches.get(search_key)
+            if search_key is not None
+            else None
+        )
+        is_new = search is None
+        if search is None:
+            initial_committed = self.stable_closure(start, frozenset())
+            initial_cost = self.ops_cost(prefix_ops)
+            initial_progress = self.transaction_progress_key(
                 start,
                 initial_committed,
-                prefix_ops,
             )
-        ]
-        best_cost: dict[
-            tuple[State, frozenset[str]], tuple[int, int, int, int]
-        ] = {(start, initial_committed): initial_cost}
-        best_partial = (start, initial_committed, prefix_ops)
-        best_budgeted_progress = initial_progress
-        expansions = 0
-        post_budget_states = 0
-        search_complete = True
+            search = TransactionSearch(
+                start=start,
+                prefix_ops=prefix_ops,
+                records=[(start, initial_cost, None, prefix_ops)],
+                anchor=[],
+                feasibility_guide=[],
+                best_record={start: 0},
+                expanded_cost={},
+                serial=itertools.count(),
+                best_partial_record=0,
+                best_budgeted_progress=initial_progress,
+                best_partial_key=(initial_progress, initial_cost),
+            )
+            if search_key is not None:
+                self.transaction_searches[search_key] = search
+        elif search.start != start or search.prefix_ops != prefix_ops:
+            raise RuntimeError("transaction_search_resume_root_mismatch")
+
+        records = search.records
+        anchor = search.anchor
+        feasibility_guide = search.feasibility_guide
+        best_record = search.best_record
+        expanded_cost = search.expanded_cost
+        serial = search.serial
+        best_partial_record = search.best_partial_record
+        best_budgeted_progress = search.best_budgeted_progress
+        best_partial_key = search.best_partial_key
+        expansions = search.expansions
+        incumbent = search.incumbent
+        search_complete = search.finished
         exhaustion_reason = ""
 
-        while frontier:
-            if self.deadline_reached():
-                return SearchResult(
-                    status="partial",
-                    template=template,
-                    state=best_partial[0],
-                    ops=best_partial[2],
-                    cost=(INF_COST, 0, 0, 0),
-                    reasons=("stage3_global_time_budget_exhausted",),
-                    expansions=expansions,
-                    elapsed_seconds=round(time.monotonic() - started, 3),
-                    search_spec_evaluated=False,
-                    committed_count=len(best_partial[1]),
-                    budgeted_progress_key=best_budgeted_progress,
-                )
-            (
-                _remaining,
-                _trapped_inner_sources,
-                _pending_inner_slots,
-                _misplaced_staged_cars,
-                _held_count,
-                path_cost,
-                _serial,
-                state,
-                committed,
-                ops,
-            ) = heapq.heappop(frontier)
-            if best_cost.get((state, committed)) != path_cost:
-                continue
-            if self.complete(state):
-                return SearchResult(
-                    status="complete",
-                    template=template,
-                    state=state,
-                    ops=ops,
-                    cost=self.ops_cost(ops),
-                    reasons=(),
-                    expansions=expansions,
-                    elapsed_seconds=round(time.monotonic() - started, 3),
-                    # This is the first feasible planner goal under a progress
-                    # potential, not an exhausted cost-ordered frontier.
-                    search_spec_evaluated=False,
-                    committed_count=len(committed),
-                    budgeted_progress_key=(0, 0, 0, 0, 0),
-                )
-            search_budget_open = expansions < expansion_limit
-            if not search_budget_open:
-                if post_budget_states >= POST_BUDGET_FRONTIER_WIDTH:
-                    search_complete = False
-                    exhaustion_reason = "transaction_post_budget_frontier_exhausted"
-                    break
-                post_budget_states += 1
-            closed_form = (
-                *self.direct_put_transactions(state, committed),
-                *self.capacity_exchange_transactions(state, committed),
-                *self.gate_chain_transactions(state, committed),
+        def push(
+            record_index: int,
+            committed: frozenset[str],
+            progress: tuple[int, int, int, int, int],
+            *,
+            guide_eligible: bool,
+            estimated_cost: Cost4 | None = None,
+        ) -> None:
+            state, cost, _parent, _actions = records[record_index]
+            estimated = (
+                self.transaction_estimated_cost(cost, state, committed)
+                if estimated_cost is None
+                else estimated_cost
             )
-            structural = (
-                *closed_form,
-                *(
-                    self.alignment_transactions(state, committed)
-                    if search_budget_open
-                    else ()
-                ),
+            heapq.heappush(
+                anchor,
+                (estimated, progress, cost, next(serial), record_index),
             )
-            searched_transactions: tuple[
-                transactions.Transaction[State, Op, str], ...
-            ] = ()
-            if search_budget_open:
-                remaining_expansions = expansion_limit - expansions
-                searched = transactions.enumerate_minimal_transactions(
-                    start_state=state,
-                    committed=committed,
-                    legal_neighbors=lambda current: self.transaction_neighbors(current, template),
-                    stable_closure=self.stable_closure,
-                    committed_projection=self.committed_projection,
-                    action_cost=self.delta,
-                    is_closed=lambda _state: True,
-                    state_key=lambda current: current,
-                    zero_cost=(0, 0, 0, 0),
-                    budget=transactions.SearchBudget(
-                        deadline=self.deadline,
-                        max_expansions=min(
-                            remaining_expansions,
-                            500 if structural else remaining_expansions,
-                        ),
-                    ),
-                )
-                expansions += searched.expansions
-                searched_transactions = searched.transactions
-                if not searched.search_spec_evaluated:
-                    search_complete = False
-                    exhaustion_reason = searched.termination.value
-            else:
-                search_complete = False
-                exhaustion_reason = "transaction_expansion_budget_exhausted"
-            candidates_by_state: dict[
-                tuple[State, frozenset[str]],
-                transactions.Transaction[State, Op, str],
-            ] = {}
-            for candidate in (*structural, *searched_transactions):
-                key = (candidate.end_state, candidate.committed_after)
-                incumbent = candidates_by_state.get(key)
-                if incumbent is None or candidate.cost < incumbent.cost:
-                    candidates_by_state[key] = candidate
-            candidates = tuple(candidates_by_state.values())
-            if not candidates:
-                if expansions >= expansion_limit:
-                    search_complete = False
-                    exhaustion_reason = "transaction_expansion_budget_exhausted"
-                continue
-            ordered = sorted(
-                candidates,
-                key=lambda item: (
-                    -len(item.newly_committed),
-                    self.unsatisfied_active_count(item.end_state),
-                    item.cost,
-                    tuple((op.action, op.line, op.move) for op in item.actions),
-                ),
-            )
-            for candidate in ordered:
-                if not committed < candidate.committed_after:
-                    raise RuntimeError("transaction_did_not_expand_stable_closure")
-                candidate_ops = (*ops, *candidate.actions)
-                candidate_cost = self.ops_cost(candidate_ops)
-                key = (candidate.end_state, candidate.committed_after)
-                incumbent = best_cost.get(key)
-                if incumbent is not None and incumbent <= candidate_cost:
-                    continue
-                best_cost[key] = candidate_cost
-                candidate_remaining = len(
-                    self.active_nos - candidate.committed_after
-                )
-                if (
-                    search_budget_open
-                    and candidate_remaining < len(self.active_nos - best_partial[1])
-                ):
-                    best_partial = (
-                        candidate.end_state,
-                        candidate.committed_after,
-                        candidate_ops,
-                    )
-                candidate_progress = self.transaction_progress_key(
-                    candidate.end_state,
-                    candidate.committed_after,
-                )
-                if search_budget_open:
-                    best_budgeted_progress = min(
-                        best_budgeted_progress,
-                        candidate_progress,
-                    )
+            if guide_eligible:
                 heapq.heappush(
-                    frontier,
+                    feasibility_guide,
                     (
-                        *candidate_progress,
-                        candidate_cost,
+                        cost[0] + FEASIBILITY_COMMIT_VALUE * progress[0],
+                        estimated,
+                        cost,
+                        self.alignment_debt(state, committed),
+                        progress,
+                        self.staging_affinity_debt(state, committed),
                         next(serial),
-                        candidate.end_state,
-                        candidate.committed_after,
-                        candidate_ops,
+                        record_index,
                     ),
                 )
 
+        def valid_top(frontier: list[tuple[Any, ...]]) -> tuple[Any, ...] | None:
+            while frontier:
+                item = frontier[0]
+                record_index = item[-1]
+                state, cost, _parent, _actions = records[record_index]
+                expanded = expanded_cost.get(state)
+                if (
+                    best_record.get(state) != record_index
+                    or (expanded is not None and expanded <= cost)
+                ):
+                    heapq.heappop(frontier)
+                    continue
+                return item
+            return None
+
+        def valid_feasibility_top() -> tuple[Any, ...] | None:
+            while True:
+                item = valid_top(feasibility_guide)
+                if item is None:
+                    return None
+                if incumbent is None or item[1] < incumbent[0]:
+                    return item
+                # The incumbent only improves.  This state can never lead to a
+                # cheaper complete path.  Remove it permanently, then inspect
+                # the next state even though the guide is ordered by potential.
+                heapq.heappop(feasibility_guide)
+
+        def reconstruct(record_index: int) -> tuple[Op, ...]:
+            chunks: list[tuple[Op, ...]] = []
+            while True:
+                _state, _cost, parent, actions = records[record_index]
+                chunks.append(actions)
+                if parent is None:
+                    break
+                record_index = parent
+            return tuple(
+                op
+                for actions in reversed(chunks)
+                for op in actions
+            )
+
+        def retain_complete(cost: Cost4, record_index: int) -> None:
+            nonlocal incumbent
+            if incumbent is None or cost < incumbent[0]:
+                incumbent = (cost, record_index)
+
+        if is_new:
+            push(
+                0,
+                initial_committed,
+                initial_progress,
+                guide_eligible=True,
+            )
+
+        while not search.finished:
+            anchor_top = valid_top(anchor)
+            if anchor_top is None:
+                search.finished = True
+                search_complete = True
+                break
+            if incumbent is not None and anchor_top[0] >= incumbent[0]:
+                search.finished = True
+                search_complete = True
+                break
+            feasibility_top = valid_feasibility_top()
+            if self.deadline_reached():
+                search_complete = False
+                exhaustion_reason = "stage3_global_time_budget_exhausted"
+                break
+            if expansions >= expansion_limit:
+                search_complete = False
+                exhaustion_reason = "transaction_expansion_budget_exhausted"
+                break
+
+            selected = heapq.heappop(
+                feasibility_guide
+                if feasibility_top is not None
+                else anchor
+            )
+            record_index = selected[-1]
+            state, path_cost, _parent, _actions = records[record_index]
+            if best_record.get(state) != record_index:
+                continue
+            prior_expansion = expanded_cost.get(state)
+            if prior_expansion is not None and prior_expansion <= path_cost:
+                continue
+            expanded_cost[state] = path_cost
+            expansions += 1
+
+            committed = self.stable_closure(state, frozenset())
+            remaining_hook_bound = self.transaction_hook_lower_bound(
+                state,
+                committed,
+            )
+            if self.complete(state):
+                retain_complete(path_cost, record_index)
+                continue
+
+            legal_transitions = tuple(
+                self.transaction_neighbors(state, template)
+            )
+            structural = (
+                *self.direct_put_transactions(state, committed),
+                *self.direct_transfer_transactions(state, committed),
+                *self.pickup_merge_transactions(
+                    state,
+                    committed,
+                    legal_transitions,
+                ),
+                *self.capacity_exchange_transactions(state, committed),
+                *self.gate_chain_transactions(state, committed),
+                *self.mixed_gate_cycle_transactions(state, committed),
+            )
+            structural_states = {
+                candidate.end_state for candidate in structural
+            }
+            primitive_items: list[
+                transactions.Transaction[State, Op, str]
+            ] = []
+            for transition in legal_transitions:
+                committed_after = self.stable_closure(
+                    transition.state,
+                    frozenset(),
+                )
+                primitive_items.append(transactions.Transaction(
+                    start_state=state,
+                    end_state=transition.state,
+                    actions=(transition.action,),
+                    committed_before=committed,
+                    committed_after=committed_after,
+                    cost=self.delta(transition.action),
+                ))
+            primitive = tuple(primitive_items)
+            candidates_by_state: dict[
+                State,
+                transactions.Transaction[State, Op, str],
+            ] = {}
+            for candidate in (*structural, *primitive):
+                actual_cost = self.ops_cost(candidate.actions)
+                if actual_cost != candidate.cost:
+                    raise RuntimeError("transaction_shortcut_cost_mismatch")
+                prior = candidates_by_state.get(candidate.end_state)
+                candidate_key = (
+                    candidate.cost,
+                    tuple(
+                        (op.action, op.line, op.move)
+                        for op in candidate.actions
+                    ),
+                )
+                if prior is None or candidate_key < (
+                    prior.cost,
+                    tuple((op.action, op.line, op.move) for op in prior.actions),
+                ):
+                    candidates_by_state[candidate.end_state] = candidate
+
+            for candidate in sorted(
+                candidates_by_state.values(),
+                key=lambda item: (
+                    item.cost,
+                    self.unsatisfied_active_count(item.end_state),
+                    tuple((op.action, op.line, op.move) for op in item.actions),
+                ),
+            ):
+                candidate_cost = tuple(
+                    path_cost[index] + candidate.cost[index]
+                    for index in range(4)
+                )
+                prior_index = best_record.get(candidate.end_state)
+                if (
+                    prior_index is not None
+                    and records[prior_index][1] <= candidate_cost
+                ):
+                    continue
+                candidate_index = len(records)
+                records.append((
+                    candidate.end_state,
+                    candidate_cost,
+                    record_index,
+                    candidate.actions,
+                ))
+                best_record[candidate.end_state] = candidate_index
+                candidate_committed = self.stable_closure(
+                    candidate.end_state,
+                    frozenset(),
+                )
+                candidate_progress = self.transaction_progress_key(
+                    candidate.end_state,
+                    candidate_committed,
+                )
+                clears_held_inner = any(
+                    op.action == "Get"
+                    and op.line in set(DEPOT_IN)
+                    and any(
+                        self.assigned_line_by_no.get(no) == op.line
+                        for no in state.held
+                    )
+                    for op in candidate.actions
+                )
+                candidate_remaining_hook_bound = self.transaction_hook_lower_bound(
+                    candidate.end_state,
+                    candidate_committed,
+                )
+                lowers_hook_bound = (
+                    candidate_remaining_hook_bound < remaining_hook_bound
+                )
+                lowers_alignment_debt = (
+                    self.alignment_debt(
+                        candidate.end_state,
+                        candidate_committed,
+                    )
+                    < self.alignment_debt(state, committed)
+                )
+                guide_eligible = (
+                    candidate.end_state in structural_states
+                    or committed < candidate_committed
+                    or clears_held_inner
+                    or lowers_hook_bound
+                    or lowers_alignment_debt
+                )
+                partial_key = (candidate_progress, candidate_cost)
+                if partial_key < best_partial_key:
+                    best_partial_key = partial_key
+                    best_budgeted_progress = candidate_progress
+                    best_partial_record = candidate_index
+                if self.complete(candidate.end_state):
+                    retain_complete(candidate_cost, candidate_index)
+                    continue
+                candidate_estimated_cost = (
+                    max(
+                        path_cost[0] + remaining_hook_bound,
+                        candidate_cost[0] + candidate_remaining_hook_bound,
+                    ),
+                    candidate_cost[1],
+                    candidate_cost[2],
+                    candidate_cost[3],
+                )
+                if (
+                    incumbent is not None
+                    and candidate_estimated_cost >= incumbent[0]
+                ):
+                    continue
+                push(
+                    candidate_index,
+                    candidate_committed,
+                    candidate_progress,
+                    guide_eligible=guide_eligible,
+                    estimated_cost=candidate_estimated_cost,
+                )
+
+        search.best_partial_record = best_partial_record
+        search.best_budgeted_progress = best_budgeted_progress
+        search.best_partial_key = best_partial_key
+        search.expansions = expansions
+        search.incumbent = incumbent
+        search.active_elapsed_seconds += time.monotonic() - call_started
+        search_complete = search.finished
+
+        if incumbent is not None:
+            incumbent_cost, incumbent_record = incumbent
+            incumbent_state = records[incumbent_record][0]
+            incumbent_ops = reconstruct(incumbent_record)
+            return SearchResult(
+                status="complete",
+                template=template,
+                state=incumbent_state,
+                ops=incumbent_ops,
+                cost=incumbent_cost,
+                reasons=(),
+                expansions=expansions,
+                elapsed_seconds=round(search.active_elapsed_seconds, 3),
+                search_spec_evaluated=search_complete,
+                committed_count=len(
+                    self.stable_closure(incumbent_state, frozenset())
+                ),
+                budgeted_progress_key=(0, 0, 0, 0, 0),
+            )
+
+        partial_state = records[best_partial_record][0]
+        partial_committed = self.stable_closure(partial_state, frozenset())
         return SearchResult(
             status="partial",
             template=template,
-            state=best_partial[0],
-            ops=best_partial[2],
+            state=partial_state,
+            ops=reconstruct(best_partial_record),
             cost=(INF_COST, 0, 0, 0),
             reasons=(
                 exhaustion_reason
                 if not search_complete and exhaustion_reason
-                else "no_strict_progress_transaction",
+                else "no_complete_operation_path",
             ),
             expansions=expansions,
-            elapsed_seconds=round(time.monotonic() - started, 3),
+            elapsed_seconds=round(search.active_elapsed_seconds, 3),
             search_spec_evaluated=search_complete,
-            committed_count=len(best_partial[1]),
+            committed_count=len(partial_committed),
             budgeted_progress_key=best_budgeted_progress,
         )
 
@@ -1803,6 +2502,7 @@ class Stage3Solver:
             and self.inner_target_lines(no)
         }
         inner_puts = len(inner_groups)
+        alignment_rehandle = 0
         for line in used_inner:
             assigned = [
                 no
@@ -1820,7 +2520,8 @@ class Stage3Solver:
                 if self.repair_process(self.meta[no]).startswith("厂")
             ]
             if section_indexes and factory_indexes and min(section_indexes) < max(factory_indexes):
-                inner_puts += 1
+                alignment_rehandle = 1
+                break
 
         non_inner = [
             no
@@ -1865,7 +2566,10 @@ class Stage3Solver:
             "source_gets": source_gets,
             "inner_puts": inner_puts,
             "non_inner_puts": non_inner_puts,
-            "frontier_rehandle": frontier_debt,
+            # Alignment inversions on several inner lines and a blocked outer
+            # frontier can share one staging action.  Their witnesses therefore
+            # combine by max, never by sum.
+            "shared_rehandle": max(alignment_rehandle, frontier_debt),
         }
 
     def minimum_non_inner_terminal_lines(self, nos: list[str]) -> int:
@@ -2201,6 +2905,14 @@ class Stage3Solver:
         )
         domains: dict[str, tuple[int, ...]] = {}
         for no in move:
+            assigned_slot = self.assigned_slot_by_no.get(no)
+            if (
+                no in self.restoration_nos
+                and assigned_slot is not None
+                and assigned_slot[0] == line
+            ):
+                domains[no] = (assigned_slot[1],)
+                continue
             forced = tuple(self.meta[no].get("_ForcePositions") or ())
             if forced and self.terminal_line_satisfied(no, line):
                 domains[no] = tuple(sorted(int(position) for position in forced))
@@ -2243,6 +2955,10 @@ class Stage3Solver:
         has_forced_position = any(
             self.meta[no].get("_ForcePositions")
             and self.terminal_line_satisfied(no, line)
+            for no in managed
+        ) or any(
+            no in self.restoration_nos
+            and self.assigned_slot_by_no.get(no, ("", 0))[0] == line
             for no in managed
         ) or bool(reserved)
         if not has_forced_position:
@@ -2488,12 +3204,6 @@ class Stage3Solver:
         for line in (*DEPOT_OUT, UNWHEEL, *DEPOT_IN):
             ordered = line_map.get(line, ())
             if not ordered:
-                continue
-            if (
-                self.line_can_stay_terminal(state, line, ordered)
-                and not self.outer_blocks_held_inner(state, line)
-                and not self.outer_blocks_held_position(state, line)
-            ):
                 continue
             for cut in range(len(ordered), 0, -1):
                 yield line, ordered[:cut]
@@ -2761,12 +3471,7 @@ class Stage3Solver:
                 reasons.append(f"depot_weigh_pending:{no}")
             if not self.terminal_line_satisfied(no, line):
                 reasons.append(f"active_terminal_line_violation:{no}:{line}")
-            elif (
-                no not in self.restoration_nos
-                and not self.is_stage4_deferred(no)
-                and self.assigned_line_by_no.get(no)
-                and line != self.assigned_line_by_no[no]
-            ):
+            elif not self.assignment_line_satisfied(no, line):
                 reasons.append(
                     "assignment_line_contract_violation:"
                     f"{no}:{line}!={self.assigned_line_by_no[no]}"
@@ -3034,7 +3739,12 @@ class Stage3Solver:
                 candidate.template,
                 candidate.layout,
             )
-        cache_key = (candidate.state, candidate.ops)
+        cache_key = (
+            candidate.template,
+            candidate.layout,
+            candidate.state,
+            candidate.ops,
+        )
         cached = self.candidate_evaluation_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -3148,29 +3858,34 @@ class Stage3Solver:
         specs: list[PlacementSpec],
         limit: int,
     ) -> list[PlacementSpec]:
-        """Return a ranked prefix covering each template when the limit permits."""
+        """Return the ranked prefix while preserving template coverage."""
 
         if limit <= 0:
             raise ValueError("placement_spec_limit_must_be_positive")
-        selected = list(specs[:limit])
-        if len(selected) < limit:
-            return selected
         rank = {spec: index for index, spec in enumerate(specs)}
-        all_templates = {spec.template for spec in specs}
-        if limit < len(all_templates):
-            return selected
-        selected_counts = Counter(spec.template for spec in selected)
-        for template in sorted(all_templates - set(selected_counts)):
-            candidate = next(spec for spec in specs if spec.template == template)
-            replace_index = next(
-                index
-                for index in range(len(selected) - 1, -1, -1)
-                if selected_counts[selected[index].template] > 1
-            )
-            removed = selected[replace_index]
-            selected_counts[removed.template] -= 1
-            selected[replace_index] = candidate
-            selected_counts[template] += 1
+        templates = tuple(dict.fromkeys(spec.template for spec in specs))
+        if limit < len(templates):
+            return list(specs[:limit])
+
+        selected: list[PlacementSpec] = []
+        selected_set: set[PlacementSpec] = set()
+
+        def retain(candidate: PlacementSpec | None) -> None:
+            if (
+                candidate is None
+                or candidate in selected_set
+                or len(selected) >= limit
+            ):
+                return
+            selected.append(candidate)
+            selected_set.add(candidate)
+
+        for template in templates:
+            retain(next(spec for spec in specs if spec.template == template))
+        for spec in specs:
+            retain(spec)
+            if len(selected) >= limit:
+                break
         return sorted(selected, key=rank.__getitem__)
 
     def select_screen_specs(
@@ -3178,40 +3893,15 @@ class Stage3Solver:
         specs: list[PlacementSpec],
         results_by_spec: dict[tuple[str, str], SearchResult],
     ) -> list[PlacementSpec]:
-        """Select a fair screening cohort from rank and shallow progress."""
+        """Select the lowest certified placement bounds with template coverage."""
 
         if not specs:
             return []
-
-        def progress_key(spec: PlacementSpec) -> tuple[Any, ...]:
-            prior = results_by_spec.get((spec.template, spec.layout))
-            progress = self.partial_progress_key(prior) if prior is not None else (
-                INF_COST,
-            ) * 7
-            return (
-                *progress,
-                spec.operation_lower_bound,
-                spec.placement_score,
-                spec.template,
-                spec.layout,
-            )
-
-        base_limit = min(
-            SCREEN_BASE_PLAN_BUDGET,
-            SCREEN_PLAN_BUDGET,
-            len(specs),
+        del results_by_spec
+        return self.template_covered_prefix(
+            specs,
+            min(SCREEN_PLAN_BUDGET, len(specs)),
         )
-        selected = self.template_covered_prefix(specs, base_limit)
-        selected_set = set(selected)
-        for spec in sorted(
-            (item for item in specs if item not in selected_set),
-            key=progress_key,
-        ):
-            if len(selected) >= SCREEN_PLAN_BUDGET:
-                break
-            selected.append(spec)
-            selected_set.add(spec)
-        return sorted(selected, key=progress_key)
 
     def partial_progress_key(self, item: SearchResult) -> tuple[int, ...]:
         progress = item.budgeted_progress_key or (
@@ -3232,44 +3922,131 @@ class Stage3Solver:
         specs: list[PlacementSpec],
         results_by_spec: dict[tuple[str, str], SearchResult],
     ) -> list[PlacementSpec]:
-        """Keep two distinct static leaders and one budgeted-search leader."""
+        """Screen every layout once, then deepen the best hook incumbents.
+
+        The screening floor prevents static top-k starvation.  Once every
+        distinct layout has reached that floor, certified operation bounds and
+        observed complete hook counts drive exploitation.  Partial progress is
+        deliberately absent from this quality scheduler.
+        """
 
         eligible = [
             spec
             for spec in specs
-            if (
-                prior := results_by_spec.get((spec.template, spec.layout))
-            ) is not None
-            and prior.status != "complete"
+            if not (
+                (prior := results_by_spec.get((spec.template, spec.layout)))
+                is not None
+                and prior.status == "complete"
+                and prior.search_spec_evaluated
+            )
         ]
-        if not eligible:
-            return []
-        selected: list[PlacementSpec] = []
+        static_rank = {spec: index for index, spec in enumerate(specs)}
+
+        def prior(spec: PlacementSpec) -> SearchResult | None:
+            return results_by_spec.get((spec.template, spec.layout))
+
+        def reached_expansions(spec: PlacementSpec) -> int:
+            result = prior(spec)
+            return result.expansions if result is not None else 0
+
+        under_screened = any(
+            reached_expansions(spec) < FINALIST_SCREEN_EXPANSIONS
+            for spec in eligible
+        )
+        if under_screened:
+            eligible = [
+                spec
+                for spec in eligible
+                if reached_expansions(spec) < FINALIST_SCREEN_EXPANSIONS
+            ]
+            eligible.sort(key=lambda spec: (
+                reached_expansions(spec),
+                spec.operation_lower_bound,
+                spec.placement_score,
+                static_rank[spec],
+            ))
+        else:
+            eligible.sort(key=lambda spec: (
+                spec.operation_lower_bound,
+                (
+                    self.business_hook_count(result.ops)
+                    if (result := prior(spec)) is not None
+                    and result.status == "complete"
+                    else INF_COST
+                ),
+                spec.placement_score,
+                static_rank[spec],
+            ))
+        distinct: list[PlacementSpec] = []
         signatures: set[tuple[tuple[str, str, str, int], ...]] = set()
         for spec in eligible:
             if spec.signature in signatures:
                 continue
-            selected.append(spec)
+            distinct.append(spec)
             signatures.add(spec.signature)
-            if len(selected) >= STATIC_FINALIST_PLAN_BUDGET:
-                break
-        if len(selected) >= FINALIST_PLAN_BUDGET:
-            return selected[:FINALIST_PLAN_BUDGET]
-        selected_set = set(selected)
-        progress_ranked = sorted(
-            (spec for spec in eligible if spec not in selected_set),
-            key=lambda spec: (
-                *self.partial_progress_key(
-                    results_by_spec[(spec.template, spec.layout)]
-                ),
-                spec.operation_lower_bound,
-                spec.placement_score,
-                spec.template,
-                spec.layout,
+        selected: list[PlacementSpec] = []
+        selected_set: set[PlacementSpec] = set()
+        for template in dict.fromkeys(spec.template for spec in distinct):
+            candidate = next(spec for spec in distinct if spec.template == template)
+            selected.append(candidate)
+            selected_set.add(candidate)
+            if len(selected) >= FINALIST_PLAN_BUDGET:
+                return selected
+        for spec in distinct:
+            if spec in selected_set:
+                continue
+            selected.append(spec)
+            selected_set.add(spec)
+            if len(selected) >= FINALIST_PLAN_BUDGET:
+                return selected
+        selected.extend([
+            spec
+            for spec in eligible
+            if spec not in selected_set
+        ][: FINALIST_PLAN_BUDGET - len(selected)])
+        return selected
+
+    @staticmethod
+    def finalist_expansion_target(
+        prior: SearchResult | None,
+        expansion_limit: int,
+    ) -> int:
+        """Cap a layout's first deepening at the common screening floor."""
+
+        reached = prior.expansions if prior is not None else 0
+        if reached < FINALIST_SCREEN_EXPANSIONS < expansion_limit:
+            return FINALIST_SCREEN_EXPANSIONS
+        return expansion_limit
+
+    def finalist_lower_bound_can_improve(
+        self,
+        spec: PlacementSpec,
+        incumbent_hooks: int,
+    ) -> bool:
+        """Return whether a finalist can still beat the lexicographic incumbent."""
+
+        return spec.operation_lower_bound <= incumbent_hooks
+
+    def merge_search_result(
+        self,
+        prior: SearchResult,
+        current: SearchResult,
+    ) -> SearchResult:
+        """Keep the better record while preserving cumulative search effort."""
+
+        selected = self.choose_result([prior, current])
+        return replace(
+            selected,
+            expansions=max(prior.expansions, current.expansions),
+            elapsed_seconds=max(
+                prior.elapsed_seconds,
+                current.elapsed_seconds,
+            ),
+            search_spec_evaluated=(
+                prior.search_spec_evaluated
+                or current.search_spec_evaluated
             ),
         )
-        selected.extend(progress_ranked[: FINALIST_PLAN_BUDGET - len(selected)])
-        return selected
 
     def choose_result(self, results: list[SearchResult]) -> SearchResult:
         complete = [item for item in results if item.status == "complete"]
@@ -3278,6 +4055,8 @@ class Stage3Solver:
                 complete,
                 key=lambda item: (
                     item.cost,
+                    not item.search_spec_evaluated,
+                    -item.expansions,
                     0 if item.template == "B" else 1,
                     item.layout,
                 ),
@@ -3294,6 +4073,7 @@ class Stage3Solver:
         )
 
     def result(self, chosen: SearchResult, results: list[SearchResult]) -> dict[str, Any]:
+        wall_elapsed_seconds = round(time.monotonic() - self.started_at, 3)
         if chosen.template in {"A", "B"}:
             self.assigned_line_by_no = self.build_assigned_line_by_no(chosen.template, chosen.layout)
         stage3_request = self.stage3_request()
@@ -3348,13 +4128,7 @@ class Stage3Solver:
             if validated_complete and lower_bound is not None
             else None
         )
-        evaluated_bounds = [
-            item.lower_bound for item in results if item.lower_bound is not None
-        ]
-        search_space_lower_bound = min(
-            evaluated_bounds,
-            default=None,
-        )
+        search_space_lower_bound = self.placement_operation_lower_bound
         search_space_gap = (
             executable_hooks - search_space_lower_bound
             if validated_complete and search_space_lower_bound is not None
@@ -3420,6 +4194,7 @@ class Stage3Solver:
         ]
         lower_bound_validation_violations = [
             {
+                "operation_lower_bound_scope": item.lower_bound_scope,
                 "template": item.template,
                 "layout": item.layout,
                 "deferred_clear": item.deferred_clear,
@@ -3433,6 +4208,16 @@ class Stage3Solver:
             and item.lower_bound is not None
             and item.lower_bound > self.business_hook_count(item.ops)
         ]
+        if (
+            validated_complete
+            and search_space_lower_bound is not None
+            and search_space_lower_bound > executable_hooks
+        ):
+            lower_bound_validation_violations.append({
+                "operation_lower_bound_scope": "all_placement_relaxation",
+                "operations": executable_hooks,
+                "operation_lower_bound": search_space_lower_bound,
+            })
         summary = {
             "case_id": self.case_id,
             "status": (
@@ -3461,7 +4246,7 @@ class Stage3Solver:
             "operation_lower_bound": lower_bound,
             "operation_lower_bound_components": lower_bound_components,
             "operation_lower_bound_scope": chosen.lower_bound_scope,
-            "evaluated_search_space_bound_scope": "unified_placement_transaction_specs",
+            "evaluated_search_space_bound_scope": "all_placement_relaxation",
             "operation_lower_bound_gap": optimality_gap,
             "evaluated_search_space_lower_bound": search_space_lower_bound,
             "evaluated_search_space_gap": search_space_gap,
@@ -3476,10 +4261,10 @@ class Stage3Solver:
                 and (optimality_gap is not None and optimality_gap < 0
                      or search_space_gap is not None and search_space_gap < 0
                      or lower_bound_validation_violations)
-                else "search_space_evaluation_incomplete"
-                if validated_complete and not search_space_evaluation_complete
                 else "search_space_lower_bound_reached"
                 if validated_complete and search_space_gap == 0
+                else "search_space_evaluation_incomplete"
+                if validated_complete and not search_space_evaluation_complete
                 else "bounded_improvement_exhausted"
                 if validated_complete and self.optimization_budget_exhausted
                 else "best_known_with_gap"
@@ -3517,7 +4302,9 @@ class Stage3Solver:
                 v.__dict__ for v in combined_residual_business_bad[:20]
             ],
             "expansions": chosen.expansions,
-            "elapsed_seconds": chosen.elapsed_seconds,
+            "chosen_search_seconds": chosen.elapsed_seconds,
+            "wall_elapsed_seconds": wall_elapsed_seconds,
+            "elapsed_seconds": wall_elapsed_seconds,
         }
         trace = [
             {
@@ -3783,6 +4570,8 @@ def diagnostic_summary(
         "combined_replay_violations": [],
         "combined_residual_business_violations": [],
         "expansions": 0,
+        "chosen_search_seconds": 0.0,
+        "wall_elapsed_seconds": 0.0,
         "elapsed_seconds": 0.0,
     }
 
