@@ -40,6 +40,48 @@ STAGE_NAMES = {
     4: "stage4_residual_closure",
 }
 
+# API-only projection from the solver's physical graph to the turnout names in
+# docs/福州调车业务文档.md.  None means the two tracks are directly connected
+# without a turnout (for example, across a shed door or a line boundary).
+_API_TURNOUT_EDGE_GROUPS: dict[str | None, tuple[tuple[str, str], ...]] = {
+    "L1": (("渡1", "联6"), ("渡2", "联6")),
+    "L2": (("存5线北", "渡1"), ("存4线", "渡1")),
+    "L3": (("机北1", "渡2"), ("渡3", "渡2")),
+    "L4": (("存3线", "渡3"), ("存2线", "渡3")),
+    "L5": (("存1线", "机北1"), ("机北2", "机北1")),
+    "L6": (("渡4", "机北2"), ("渡5", "机北2")),
+    "L7": (("机库线", "渡4"), ("调梁线北", "渡4")),
+    "L8": (("机南", "机走棚"), ("洗油北", "机走棚")),
+    "L9": (("洗罐线北", "洗油北"), ("油漆线", "洗油北")),
+    "L12": (("渡8", "存4南"), ("渡8", "存5线南")),
+    "L13": (("渡9", "渡8"), ("渡9", "预修线")),
+    "L14": (("渡10", "渡9"), ("渡10", "机南")),
+    "L15": (("抛丸线", "渡10"), ("联7", "渡10")),
+    "L16": (("渡12", "联7"), ("渡11", "联7")),
+    "L17": (("渡13", "渡12"), ("修2库外", "渡12")),
+    "L18": (("修4库外", "渡13"), ("修3库外", "渡13")),
+    "L19": (("修1库外", "渡11"), ("卸轮线", "渡11")),
+    "Z1": (("机走北", "渡5"), ("渡6", "渡5")),
+    "Z2": (("渡7", "存1线"), ("渡7", "渡6")),
+    "Z3": (("预修线", "存2线"), ("预修线", "渡7")),
+    "Z4": (("存4南", "存4线"), ("存4南", "存3线")),
+    None: (
+        ("修4库内", "修4库外"),
+        ("修3库内", "修3库外"),
+        ("修2库内", "修2库外"),
+        ("修1库内", "修1库外"),
+        ("洗罐站", "洗罐线北"),
+        ("调梁棚", "调梁线北"),
+        ("存5线南", "存5线北"),
+        ("机走棚", "机走北"),
+    ),
+}
+_API_TURNOUT_BY_EDGE = {
+    frozenset(edge): turnout
+    for turnout, edges in _API_TURNOUT_EDGE_GROUPS.items()
+    for edge in edges
+}
+
 
 class PipelineOptionError(ValueError):
     """Raised when a public pipeline option is invalid."""
@@ -748,6 +790,52 @@ def replay_gate(request: dict[str, Any], response: dict[str, Any]) -> dict[str, 
     return {"ok": not rows, "violation_count": len(rows), "violations": rows}
 
 
+def public_operations_with_turnout_paths(
+    request: dict[str, Any],
+    operations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Replace internal route nodes with documented L/Z turnout names."""
+
+    import replay_validator as rv
+
+    public_operations = deepcopy(operations)
+    current_line = rv.norm((request.get("locoNode") or {}).get("Line"))
+    for operation in public_operations:
+        destination = rv.norm(operation.get("Line"))
+        route = [
+            node
+            for raw_node in operation.get("PassbyPath") or []
+            if (node := rv.norm(raw_node))
+        ]
+        if current_line and (not route or route[0] != current_line):
+            route.insert(0, current_line)
+        if destination and (not route or route[-1] != destination):
+            route.append(destination)
+
+        turnouts: list[str] = []
+        for left, right in zip(route, route[1:]):
+            if left == right:
+                continue
+            edge = frozenset((left, right))
+            if edge not in _API_TURNOUT_BY_EDGE:
+                raise ValueError(f"unmapped API route edge: {left}->{right}")
+            turnout = _API_TURNOUT_BY_EDGE[edge]
+            if turnout and (not turnouts or turnouts[-1] != turnout):
+                turnouts.append(turnout)
+
+        public_path: list[str] = []
+        if current_line:
+            public_path.append(current_line)
+        public_path.extend(turnouts)
+        if destination and (destination != current_line or turnouts or not public_path):
+            public_path.append(destination)
+        operation["PassbyPath"] = public_path
+
+        if destination:
+            current_line = destination
+    return public_operations
+
+
 def build_public_response(
     *,
     request: dict[str, Any],
@@ -770,7 +858,8 @@ def build_public_response(
         }
         for car in replayed
     ]
-    data = {"Operations": operations, "GeneratedEndStatus": generated}
+    public_operations = public_operations_with_turnout_paths(request, operations)
+    data = {"Operations": public_operations, "GeneratedEndStatus": generated}
 
     if solve_status == "complete" and not violations:
         return {"Success": True, "Message": "", "StatusCode": 200, "Data": data}

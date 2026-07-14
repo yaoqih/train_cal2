@@ -212,6 +212,157 @@ def test_pipeline_runs_four_stages_in_order_and_returns_combined_response(tmp_pa
     assert all(result["replay_gates"][str(stage)]["ok"] for stage in range(1, 5))
 
 
+def test_api_turnout_mapping_covers_complete_internal_graph() -> None:
+    import replay_validator as rv
+
+    internal_edges = {
+        frozenset((rv.norm(left), rv.norm(right)))
+        for left, right in rv.EDGES
+    }
+
+    assert set(pipeline._API_TURNOUT_BY_EDGE) == internal_edges
+
+
+def test_api_passby_path_uses_documented_turnout_names() -> None:
+    request = _request()
+    request["locoNode"] = {"Line": "抛丸线", "End": "North"}
+    operations = [
+        {
+            "Index": 1,
+            "Action": "Get",
+            "Line": "机走北",
+            "MoveCars": [],
+            "TrainCars": [],
+            "PassbyPath": [
+                "抛丸线",
+                "渡10",
+                "渡9",
+                "渡8",
+                "存4南",
+                "存4线",
+                "渡1",
+                "联6",
+                "渡2",
+                "机北1",
+                "机北2",
+                "渡5",
+                "机走北",
+            ],
+        },
+        {
+            "Index": 2,
+            "Action": "Get",
+            "Line": "机库线",
+            "MoveCars": [],
+            "TrainCars": [],
+            "PassbyPath": ["渡5", "机北2", "渡4", "机库线"],
+        },
+    ]
+
+    public = pipeline.public_operations_with_turnout_paths(request, operations)
+
+    assert public[0]["PassbyPath"] == [
+        "抛丸线",
+        "L15",
+        "L14",
+        "L13",
+        "L12",
+        "Z4",
+        "L2",
+        "L1",
+        "L3",
+        "L5",
+        "L6",
+        "Z1",
+        "机走北",
+    ]
+    assert public[1]["PassbyPath"] == ["机走北", "Z1", "L6", "L7", "机库线"]
+    assert operations[0]["PassbyPath"][4] == "存4南"
+
+
+def test_api_passby_path_handles_south_yard_and_direct_track_boundaries() -> None:
+    request = _request()
+    request["locoNode"] = {"Line": "抛丸线", "End": "North"}
+    operations = [
+        {
+            "Index": 1,
+            "Action": "Get",
+            "Line": "修4库内",
+            "MoveCars": [],
+            "TrainCars": [],
+            "PassbyPath": [
+                "抛丸线",
+                "渡10",
+                "联7",
+                "渡12",
+                "渡13",
+                "修4库外",
+                "修4库内",
+            ],
+        },
+        {
+            "Index": 2,
+            "Action": "Get",
+            "Line": "修4库外",
+            "MoveCars": [],
+            "TrainCars": [],
+            "PassbyPath": ["修4库内", "修4库外"],
+        },
+    ]
+
+    public = pipeline.public_operations_with_turnout_paths(request, operations)
+
+    assert public[0]["PassbyPath"] == [
+        "抛丸线",
+        "L15",
+        "L16",
+        "L17",
+        "L18",
+        "修4库内",
+    ]
+    assert public[1]["PassbyPath"] == ["修4库内", "修4库外"]
+
+
+def test_public_response_replays_full_path_before_api_projection() -> None:
+    request = _request()
+    full_path = ["机库线", "渡4", "机北2", "机北1", "存1线"]
+    response = {
+        "Data": {
+            "Operations": [
+                {
+                    "Index": 1,
+                    "Action": "Get",
+                    "Line": "存1线",
+                    "MoveCars": ["1000001"],
+                    "TrainCars": ["1000001"],
+                    "PassbyPath": full_path,
+                }
+            ]
+        }
+    }
+
+    with patch("replay_validator.replay", return_value=(request["StartStatus"], [])) as replay:
+        public = pipeline.build_public_response(
+            request=request,
+            response=response,
+            solve_status="complete",
+            stage_summaries={},
+            attempted_stage=4,
+            error=None,
+        )
+
+    replay_response = replay.call_args.args[1]
+    assert replay_response["Data"]["Operations"][0]["PassbyPath"] == full_path
+    assert public["Data"]["Operations"][0]["PassbyPath"] == [
+        "机库线",
+        "L7",
+        "L6",
+        "L5",
+        "存1线",
+    ]
+    assert response["Data"]["Operations"][0]["PassbyPath"] == full_path
+
+
 def test_pipeline_stops_at_first_partial_and_returns_latest_safe_plan(tmp_path: Path) -> None:
     result, (_stage1_mock, _stage2_mock, stage3, stage4) = _run_fake_pipeline(
         tmp_path,

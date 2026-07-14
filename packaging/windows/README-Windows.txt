@@ -105,6 +105,33 @@ Authorization 或 X-API-Key 请求头。
 六、完整调用示例
 ----------------
 
+发布包同时附带一个可直接双击执行的真实案例：
+
+  request-real-case-0104W.cmd
+  request-real-case-0104W.ps1
+  request-real-case-0104W.json
+
+先双击 start-server.cmd 启动服务，看到 8000 端口启动成功后，再双击
+request-real-case-0104W.cmd。脚本会提交 truth2 中真实的 0104W 案例并同步等待
+四阶段结果。原始 JSON 响应会按时间戳保存到：
+
+  request-results\0104W-yyyyMMdd-HHmmss-response.json
+
+如果服务未启动、请求被拒绝或求解没有返回 Success=true，错误信息会保存到同目录的
+0104W-yyyyMMdd-HHmmss-error.txt；如果服务器已经返回响应，原始响应仍会保留。
+
+该脚本只依赖 Windows 自带的 Windows PowerShell，不需要安装 curl 或 Python。
+
+PowerShell 脚本默认访问 http://127.0.0.1:8000。需要请求其它地址时，可以在
+PowerShell 中执行：
+
+  .\request-real-case-0104W.ps1 -BaseUrl http://192.168.1.20:8000
+
+如果服务器启用了 API Key，可以执行：
+
+  .\request-real-case-0104W.ps1 -ApiKey your-api-key
+
+
 下面演示将一辆位于“存5线北”的车辆调往“机库线”。
 
 前提：
@@ -173,8 +200,7 @@ Authorization 或 X-API-Key 请求头。
           "MoveCars": ["1000001"],
           "TrainCars": ["1000001"],
           "PassbyPath": [
-            "机库线", "渡4", "机北2", "机北1", "渡2", "联6", "渡1",
-            "存5线北"
+            "机库线", "L7", "L6", "L5", "L3", "L1", "L2", "存5线北"
           ]
         },
         {
@@ -184,8 +210,7 @@ Authorization 或 X-API-Key 请求头。
           "MoveCars": ["1000001"],
           "TrainCars": [],
           "PassbyPath": [
-            "存5线北", "渡1", "联6", "渡2", "机北1", "机北2", "渡4",
-            "机库线"
+            "存5线北", "L2", "L1", "L3", "L5", "L6", "L7", "机库线"
           ]
         }
       ],
@@ -205,7 +230,7 @@ Authorization 或 X-API-Key 请求头。
   Data.Operations            调车作业步骤（勾计划）
   Operations[].Action        Get=取车，Put=放车，Weigh=称重
   Operations[].MoveCars      本次动作涉及的车号
-  Operations[].PassbyPath    本勾经过的线路和节点
+  Operations[].PassbyPath    起始股道、全部经过的 L/Z 道岔、到达股道
   Data.GeneratedEndStatus    所有车辆计算后的最终线路和台位
 
 不要只根据 HTTP 状态码判断求解是否完整完成；收到响应后还应检查 Success。
