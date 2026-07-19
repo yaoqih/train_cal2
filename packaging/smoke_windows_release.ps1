@@ -55,12 +55,20 @@ try {
         throw "Packaged server did not become healthy"
     }
 
+    $openApi = Invoke-RestMethod -Uri "$BaseUrl/api/plan/openapi.json" -TimeoutSec 5
+    $requiredOperationFields = @($openApi.components.schemas.PlanOperation.required)
+    foreach ($field in @("PassbyPath", "ByPassSwitch")) {
+        if ($field -notin $requiredOperationFields) {
+            throw "Packaged OpenAPI is missing required PlanOperation field: $field"
+        }
+    }
+
     $Body = @'
 {
   "case_id": "0101Z",
   "request": {
     "StartStatus": [{
-      "Line": "\u5b581\u7ebf",
+      "Line": "\u673a\u5357",
       "Position": 1,
       "RepairProcess": "\u6bb5",
       "Type": "C70",
@@ -74,7 +82,7 @@ try {
       {"Line": "\u4fee3\u5e93\u5185", "IsInspectionMode": false},
       {"Line": "\u4fee4\u5e93\u5185", "IsInspectionMode": false}
     ],
-    "locoNode": {"Line": "\u673a\u5e93\u7ebf", "End": "North"}
+    "locoNode": {"Line": "\u673a\u8d70\u68da", "End": "North"}
   },
   "options": {
     "stage1": {"time_budget_seconds": 0.2},
@@ -92,6 +100,25 @@ try {
         -TimeoutSec 30
     if ($result.Success -ne $true) {
         throw "Packaged four-stage smoke returned Success=false: $($result.Message)"
+    }
+    $operations = @($result.Data.Operations)
+    if ($operations.Count -lt 2) {
+        throw "Expected a non-empty packaged plan, found $($operations.Count) operations"
+    }
+    foreach ($operation in $operations) {
+        foreach ($field in @("PassbyPath", "ByPassSwitch")) {
+            if ($null -eq $operation.PSObject.Properties[$field]) {
+                throw "Packaged operation is missing field: $field"
+            }
+        }
+    }
+    $firstPath = @($operations[0].PassbyPath)
+    $firstSwitches = @($operations[0].ByPassSwitch)
+    if ($firstPath.Count -ne 2 -or "L8" -in $firstPath) {
+        throw "PassbyPath was not preserved as the physical path"
+    }
+    if ($firstSwitches.Count -ne 1 -or $firstSwitches[0] -ne "L8") {
+        throw "Expected first operation ByPassSwitch to contain only L8"
     }
     $resultFiles = @(Get-ChildItem $env:TRAIN_CAL_API_JOB_ROOT -Recurse -Filter "result.json")
     if ($resultFiles.Count -ne 1) {

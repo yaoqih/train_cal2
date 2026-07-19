@@ -212,6 +212,46 @@ def test_pipeline_runs_four_stages_in_order_and_returns_combined_response(tmp_pa
     assert all(result["replay_gates"][str(stage)]["ok"] for stage in range(1, 5))
 
 
+_EXPECTED_API_TURNOUT_EDGE_GROUPS = {
+    "L1": (("渡1", "联6"), ("渡2", "联6")),
+    "L2": (("存5线北", "渡1"), ("存4线", "渡1")),
+    "L3": (("机北1", "渡2"), ("渡3", "渡2")),
+    "L4": (("存3线", "渡3"), ("存2线", "渡3")),
+    "L5": (("存1线", "机北1"), ("机北2", "机北1")),
+    "L6": (("渡4", "机北2"), ("渡5", "机北2")),
+    "L7": (("机库线", "渡4"), ("调梁线北", "渡4")),
+    "L8": (("机南", "机走棚"), ("洗油北", "机走棚")),
+    "L9": (("洗罐线北", "洗油北"), ("油漆线", "洗油北")),
+    "L12": (("渡8", "存4南"), ("渡8", "存5线南")),
+    "L13": (("渡9", "渡8"), ("渡9", "预修线")),
+    "L14": (("渡10", "渡9"), ("渡10", "机南")),
+    "L15": (("抛丸线", "渡10"), ("联7", "渡10")),
+    "L16": (("渡12", "联7"), ("渡11", "联7")),
+    "L17": (("渡13", "渡12"), ("修2库外", "渡12")),
+    "L18": (("修4库外", "渡13"), ("修3库外", "渡13")),
+    "L19": (("修1库外", "渡11"), ("卸轮线", "渡11")),
+    "Z1": (("机走北", "渡5"), ("渡6", "渡5")),
+    "Z2": (("渡7", "存1线"), ("渡7", "渡6")),
+    "Z3": (("预修线", "存2线"), ("预修线", "渡7")),
+    "Z4": (("存4南", "存4线"), ("存4南", "存3线")),
+    None: (
+        ("修4库内", "修4库外"),
+        ("修3库内", "修3库外"),
+        ("修2库内", "修2库外"),
+        ("修1库内", "修1库外"),
+        ("洗罐站", "洗罐线北"),
+        ("调梁棚", "调梁线北"),
+        ("存5线南", "存5线北"),
+        ("机走棚", "机走北"),
+    ),
+}
+_EXPECTED_API_TURNOUT_BY_EDGE = {
+    frozenset(edge): turnout
+    for turnout, edges in _EXPECTED_API_TURNOUT_EDGE_GROUPS.items()
+    for edge in edges
+}
+
+
 def test_api_turnout_mapping_covers_complete_internal_graph() -> None:
     import replay_validator as rv
 
@@ -221,9 +261,35 @@ def test_api_turnout_mapping_covers_complete_internal_graph() -> None:
     }
 
     assert set(pipeline._API_TURNOUT_BY_EDGE) == internal_edges
+    assert pipeline._API_TURNOUT_BY_EDGE == _EXPECTED_API_TURNOUT_BY_EDGE
 
 
-def test_api_passby_path_uses_documented_turnout_names() -> None:
+def test_api_turnout_projection_covers_every_graph_edge_in_both_directions() -> None:
+    import replay_validator as rv
+
+    for left, right in rv.EDGES:
+        expected = _EXPECTED_API_TURNOUT_BY_EDGE[frozenset((left, right))]
+        for start, destination in ((left, right), (right, left)):
+            request = _request()
+            request["locoNode"] = {"Line": start, "End": "North"}
+            operations = [
+                {
+                    "Index": 1,
+                    "Action": "Get",
+                    "Line": destination,
+                    "MoveCars": [],
+                    "TrainCars": [],
+                    "PassbyPath": [destination],
+                }
+            ]
+
+            public = pipeline.public_operations_with_turnout_paths(request, operations)
+
+            assert public[0]["PassbyPath"] == [destination]
+            assert public[0]["ByPassSwitch"] == ([expected] if expected else [])
+
+
+def test_api_adds_documented_turnouts_without_replacing_passby_path() -> None:
     request = _request()
     request["locoNode"] = {"Line": "抛丸线", "End": "North"}
     operations = [
@@ -261,8 +327,8 @@ def test_api_passby_path_uses_documented_turnout_names() -> None:
 
     public = pipeline.public_operations_with_turnout_paths(request, operations)
 
-    assert public[0]["PassbyPath"] == [
-        "抛丸线",
+    assert public[0]["PassbyPath"] == operations[0]["PassbyPath"]
+    assert public[0]["ByPassSwitch"] == [
         "L15",
         "L14",
         "L13",
@@ -274,13 +340,14 @@ def test_api_passby_path_uses_documented_turnout_names() -> None:
         "L5",
         "L6",
         "Z1",
-        "机走北",
     ]
-    assert public[1]["PassbyPath"] == ["机走北", "Z1", "L6", "L7", "机库线"]
+    assert public[1]["PassbyPath"] == operations[1]["PassbyPath"]
+    assert public[1]["ByPassSwitch"] == ["Z1", "L6", "L7"]
     assert operations[0]["PassbyPath"][4] == "存4南"
+    assert "ByPassSwitch" not in operations[0]
 
 
-def test_api_passby_path_handles_south_yard_and_direct_track_boundaries() -> None:
+def test_api_turnouts_handle_south_yard_and_direct_track_boundaries() -> None:
     request = _request()
     request["locoNode"] = {"Line": "抛丸线", "End": "North"}
     operations = [
@@ -312,15 +379,69 @@ def test_api_passby_path_handles_south_yard_and_direct_track_boundaries() -> Non
 
     public = pipeline.public_operations_with_turnout_paths(request, operations)
 
-    assert public[0]["PassbyPath"] == [
-        "抛丸线",
-        "L15",
-        "L16",
-        "L17",
-        "L18",
-        "修4库内",
-    ]
+    assert public[0]["PassbyPath"] == operations[0]["PassbyPath"]
+    assert public[0]["ByPassSwitch"] == ["L15", "L16", "L17", "L18"]
     assert public[1]["PassbyPath"] == ["修4库内", "修4库外"]
+    assert public[1]["ByPassSwitch"] == []
+
+
+def test_api_turnouts_include_l8_for_machine_south_to_machine_shed() -> None:
+    request = _request()
+    request["locoNode"] = {"Line": "机南", "End": "North"}
+    operations = [
+        {
+            "Index": 1,
+            "Action": "Get",
+            "Line": "机走棚",
+            "MoveCars": [],
+            "TrainCars": [],
+            "PassbyPath": ["机走棚"],
+        },
+        {
+            "Index": 2,
+            "Action": "Get",
+            "Line": "机南",
+            "MoveCars": [],
+            "TrainCars": [],
+            "PassbyPath": ["机南"],
+        },
+    ]
+
+    public = pipeline.public_operations_with_turnout_paths(request, operations)
+
+    assert public[0]["PassbyPath"] == ["机走棚"]
+    assert public[0]["ByPassSwitch"] == ["L8"]
+    assert public[1]["PassbyPath"] == ["机南"]
+    assert public[1]["ByPassSwitch"] == ["L8"]
+
+    through_l8 = pipeline.public_operations_with_turnout_paths(
+        {**request, "locoNode": {"Line": "洗油北", "End": "North"}},
+        [
+            {
+                "Index": 1,
+                "Action": "Get",
+                "Line": "机南",
+                "MoveCars": [],
+                "TrainCars": [],
+                "PassbyPath": ["洗油北", "机走棚", "机南"],
+            }
+        ],
+    )
+    assert through_l8[0]["ByPassSwitch"] == ["L8"]
+
+
+def test_openapi_documents_physical_paths_and_turnout_switches() -> None:
+    schema = server._openapi_schema()
+    operation = schema["components"]["schemas"]["PlanOperation"]
+
+    assert {"PassbyPath", "ByPassSwitch"} <= set(operation["required"])
+    assert operation["properties"]["PassbyPath"]["type"] == "array"
+    assert operation["properties"]["ByPassSwitch"]["type"] == "array"
+    assert (
+        schema["paths"]["/api/plan/generate"]["post"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/PlanResultResponse"
+    )
 
 
 def test_public_response_replays_full_path_before_api_projection() -> None:
@@ -353,14 +474,10 @@ def test_public_response_replays_full_path_before_api_projection() -> None:
 
     replay_response = replay.call_args.args[1]
     assert replay_response["Data"]["Operations"][0]["PassbyPath"] == full_path
-    assert public["Data"]["Operations"][0]["PassbyPath"] == [
-        "机库线",
-        "L7",
-        "L6",
-        "L5",
-        "存1线",
-    ]
+    assert public["Data"]["Operations"][0]["PassbyPath"] == full_path
+    assert public["Data"]["Operations"][0]["ByPassSwitch"] == ["L7", "L6", "L5"]
     assert response["Data"]["Operations"][0]["PassbyPath"] == full_path
+    assert "ByPassSwitch" not in response["Data"]["Operations"][0]
 
 
 def test_pipeline_stops_at_first_partial_and_returns_latest_safe_plan(tmp_path: Path) -> None:

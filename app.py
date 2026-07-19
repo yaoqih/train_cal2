@@ -1442,7 +1442,31 @@ def _fullflow_case_rows(artifact_root: Path, dataset: str) -> list[dict[str, obj
                 "blockingReasons": " | ".join(stage4_summary.get("blocking_reasons") or []),
             }
         )
-    return sorted(rows, key=lambda row: (row["status"] != "complete", str(row["caseId"])))
+    return sorted(rows, key=lambda row: str(row["caseId"]), reverse=True)
+
+
+def _fullflow_latest_case_id(artifact_root: Path, dataset: str) -> str:
+    stage1_dir = artifact_root / dataset / "stage1"
+    case_ids = [
+        path.name[: -len("_summary.json")]
+        for path in stage1_dir.glob("*_summary.json")
+        if path.name != "aggregate_summary.json"
+    ]
+    return max(case_ids, default="")
+
+
+def _fullflow_dataset_options(artifact_root: Path) -> list[str]:
+    datasets = [
+        dataset
+        for dataset in ("truth2", "truth3")
+        if (artifact_root / dataset / "stage1").exists()
+        and (artifact_root / dataset / "stage4").exists()
+    ]
+    return sorted(
+        datasets,
+        key=lambda dataset: (_fullflow_latest_case_id(artifact_root, dataset), dataset),
+        reverse=True,
+    )
 
 
 def _fullflow_stage_boundaries(stage_responses: dict[str, dict]) -> tuple[list[dict[str, object]], list[str]]:
@@ -1497,12 +1521,7 @@ def _render_fullflow_replay_dashboard() -> None:
         key="fullflow-artifact-root",
     )
     artifact_root = Path(artifact_text).expanduser()
-    datasets = [
-        dataset
-        for dataset in ("truth2", "truth3")
-        if (artifact_root / dataset / "stage1").exists()
-        and (artifact_root / dataset / "stage4").exists()
-    ]
+    datasets = _fullflow_dataset_options(artifact_root)
     if not datasets:
         st.warning("结果根目录中没有找到 truth2/truth3 的 stage1 至 stage4 输出。")
         return

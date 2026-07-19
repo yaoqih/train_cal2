@@ -185,7 +185,7 @@ PowerShell 中执行：
   $resultJson | Set-Content -Path ".\plan-result.json" -Encoding UTF8
 
 调用成功后，PowerShell 会显示结果，并在当前目录生成 plan-result.json。
-当前版本的示例结果如下；PassbyPath 等路径细节可能随版本调整：
+当前版本的示例结果如下；PassbyPath 和 ByPassSwitch 会随真实求解路径变化：
 
   {
     "Success": true,
@@ -200,8 +200,9 @@ PowerShell 中执行：
           "MoveCars": ["1000001"],
           "TrainCars": ["1000001"],
           "PassbyPath": [
-            "机库线", "L7", "L6", "L5", "L3", "L1", "L2", "存5线北"
-          ]
+            "机库线", "渡4", "机北2", "机北1", "渡2", "联6", "渡1", "存5线北"
+          ],
+          "ByPassSwitch": ["L7", "L6", "L5", "L3", "L1", "L2"]
         },
         {
           "Index": 2,
@@ -210,8 +211,9 @@ PowerShell 中执行：
           "MoveCars": ["1000001"],
           "TrainCars": [],
           "PassbyPath": [
-            "存5线北", "L2", "L1", "L3", "L5", "L6", "L7", "机库线"
-          ]
+            "存5线北", "渡1", "联6", "渡2", "机北1", "机北2", "渡4", "机库线"
+          ],
+          "ByPassSwitch": ["L2", "L1", "L3", "L5", "L6", "L7"]
         }
       ],
       "GeneratedEndStatus": [
@@ -230,8 +232,13 @@ PowerShell 中执行：
   Data.Operations            调车作业步骤（勾计划）
   Operations[].Action        Get=取车，Put=放车，Weigh=称重
   Operations[].MoveCars      本次动作涉及的车号
-  Operations[].PassbyPath    起始股道、全部经过的 L/Z 道岔、到达股道
+  Operations[].PassbyPath    四阶段求解器生成的完整物理路径
+  Operations[].ByPassSwitch  按顺序经过的 L/Z 道岔，不含起点和终点股道
   Data.GeneratedEndStatus    所有车辆计算后的最终线路和台位
+
+ByPassSwitch 会结合初始调机位置、上一勾线路、当前勾线路和 PassbyPath 补齐首尾。
+例如从“机南”到“机走棚”时返回 ["L8"]；库门、棚门或线路分界不经过道岔时
+返回空数组 []。
 
 不要只根据 HTTP 状态码判断求解是否完整完成；收到响应后还应检查 Success。
 

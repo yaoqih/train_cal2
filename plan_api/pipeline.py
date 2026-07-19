@@ -794,7 +794,7 @@ def public_operations_with_turnout_paths(
     request: dict[str, Any],
     operations: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Replace internal route nodes with documented L/Z turnout names."""
+    """Attach documented L/Z turnouts while preserving physical paths."""
 
     import replay_validator as rv
 
@@ -823,13 +823,7 @@ def public_operations_with_turnout_paths(
             if turnout and (not turnouts or turnouts[-1] != turnout):
                 turnouts.append(turnout)
 
-        public_path: list[str] = []
-        if current_line:
-            public_path.append(current_line)
-        public_path.extend(turnouts)
-        if destination and (destination != current_line or turnouts or not public_path):
-            public_path.append(destination)
-        operation["PassbyPath"] = public_path
+        operation["ByPassSwitch"] = turnouts
 
         if destination:
             current_line = destination

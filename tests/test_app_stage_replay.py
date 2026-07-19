@@ -119,6 +119,30 @@ def test_truth_payload_loader_supports_truth3_cases() -> None:
     assert loaded == payload
 
 
+def test_fullflow_defaults_sort_latest_dataset_and_case_first() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        artifact_root = Path(temp_dir)
+        for dataset, case_ids in {
+            "truth2": ["0331Z"],
+            "truth3": ["0401W", "0429W", "0429Z"],
+        }.items():
+            for stage in ("stage1", "stage4"):
+                stage_dir = artifact_root / dataset / stage
+                stage_dir.mkdir(parents=True)
+            for case_id in case_ids:
+                for stage in ("stage1", "stage2", "stage3", "stage4"):
+                    stage_dir = artifact_root / dataset / stage
+                    stage_dir.mkdir(parents=True, exist_ok=True)
+                    (stage_dir / f"{case_id}_summary.json").write_text(
+                        json.dumps({"status": "complete"}),
+                        encoding="utf-8",
+                    )
+
+        assert app._fullflow_dataset_options(artifact_root) == ["truth3", "truth2"]
+        rows = app._fullflow_case_rows(artifact_root, "truth3")
+        assert [row["caseId"] for row in rows] == ["0429Z", "0429W", "0401W"]
+
+
 def test_stage4_combined_response_builds_full_flow_frames() -> None:
     payload = {
         "StartStatus": [

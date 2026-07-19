@@ -171,3 +171,27 @@ def test_track_graph_covers_all_operational_lines() -> None:
     graph = physical.TrackGraph()
     for line in physical.TRACK_SPECS:
         assert graph.route(line, line) == [line]
+
+
+def test_loco_shed_reversal_rejects_long_consist_when_loco_north_is_occupied() -> None:
+    cars = [car("BLOCK", line="机走北")]
+    reasons = physical.pre_repair_reversal_reasons(
+        ["洗油北", "机走棚", "机南"],
+        cars,
+        moving_nos=set(),
+        train_length_m=158.4,
+    )
+    assert reasons == [
+        "route_reversal_length_violation:"
+        "洗油北/机走棚/机南:机走北:173.4>111.1"
+    ]
+
+
+def test_loco_shed_reversal_allows_long_consist_when_loco_north_is_clear() -> None:
+    reasons = physical.pre_repair_reversal_reasons(
+        ["机南", "机走棚", "洗油北"],
+        [],
+        moving_nos=set(),
+        train_length_m=158.4,
+    )
+    assert reasons == []

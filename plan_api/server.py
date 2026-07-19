@@ -1440,7 +1440,7 @@ def _openapi_schema() -> dict[str, Any]:
                     "responses": {
                         "200": {
                             "description": "同步求解完成；可能是 complete 或合法 partial",
-                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiResponse"}}},
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PlanResultResponse"}}},
                         },
                         "202": {"description": "异步任务已接受"},
                         **standard_responses,
@@ -1484,7 +1484,10 @@ def _openapi_schema() -> dict[str, Any]:
                     "security": security,
                     "parameters": [{"name": "job_id", "in": "path", "required": True, "schema": {"type": "string"}}],
                     "responses": {
-                        "200": {"description": "完整或部分结果"},
+                        "200": {
+                            "description": "完整或部分结果",
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PlanResultResponse"}}},
+                        },
                         "202": {"description": "仍在运行"},
                         "401": standard_responses["401"],
                         "404": {"description": "任务不存在"},
@@ -1510,6 +1513,74 @@ def _openapi_schema() -> dict[str, Any]:
                         "Data": {"type": ["object", "null"]},
                         "Meta": {"type": "object"},
                         "Errors": {},
+                    },
+                },
+                "PlanResultResponse": {
+                    "type": "object",
+                    "required": ["Success", "Message", "StatusCode", "Data"],
+                    "properties": {
+                        "Success": {"type": "boolean"},
+                        "Message": {"type": "string"},
+                        "StatusCode": {"type": "integer"},
+                        "Data": {"$ref": "#/components/schemas/PlanResultData"},
+                        "Meta": {"type": "object"},
+                        "Errors": {},
+                    },
+                },
+                "PlanResultData": {
+                    "type": "object",
+                    "required": ["Operations", "GeneratedEndStatus"],
+                    "properties": {
+                        "Operations": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/PlanOperation"},
+                        },
+                        "GeneratedEndStatus": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/GeneratedEndCar"},
+                        },
+                    },
+                },
+                "PlanOperation": {
+                    "type": "object",
+                    "required": [
+                        "Index",
+                        "Line",
+                        "Action",
+                        "MoveCars",
+                        "TrainCars",
+                        "PassbyPath",
+                        "ByPassSwitch",
+                    ],
+                    "properties": {
+                        "Index": {"type": "integer"},
+                        "Line": {"type": "string"},
+                        "Action": {"type": "string", "enum": ["Get", "Put", "Weigh"]},
+                        "MoveCars": {"type": "array", "items": {"type": "string"}},
+                        "TrainCars": {"type": "array", "items": {"type": "string"}},
+                        "PassbyPath": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "四阶段求解器输出的完整物理路径。",
+                        },
+                        "ByPassSwitch": {
+                            "type": "array",
+                            "items": {"type": "string", "pattern": "^(L([1-9]|1[0-9])|Z[1-4])$"},
+                            "description": "按行进顺序经过的现场 L/Z 道岔；不含起点和终点股道。",
+                        },
+                        "Positions": {
+                            "type": "object",
+                            "additionalProperties": {"type": "integer", "minimum": 1},
+                        },
+                    },
+                },
+                "GeneratedEndCar": {
+                    "type": "object",
+                    "required": ["No", "Line", "Position"],
+                    "properties": {
+                        "No": {"type": "string"},
+                        "Line": {"type": "string"},
+                        "Position": {"type": "integer"},
                     },
                 },
                 "PlanRequest": {
